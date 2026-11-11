@@ -3,3 +3,4 @@
 //! lives in echo-core; this crate is everything that touches the machine.
 
 pub mod config;
+pub mod secrets;
