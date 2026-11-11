@@ -111,6 +111,51 @@ async fn history_log_stays_empty_until_the_first_intent_is_emitted() {
 }
 
 #[tokio::test]
+async fn keep_alive_comments_and_the_handshake_produce_no_intents() {
+    // A server that emits `: keep-alive` every second (protocol §3.4);
+    // assembled by hand because Subscribed::spawn uses default settings.
+    let server = common::TestServer::spawn_with(|config| {
+        config.sse_keepalive_secs = 1;
+    })
+    .await;
+    let client = echo_core::server::ServerClient::new(&server.base_url);
+    let device = client.register_stream_device().await.expect("register");
+    let minted = client
+        .mint_stream_token(&device.device_key, "echo-test-client")
+        .await
+        .expect("mint");
+    let harness = common::Subscribed {
+        server,
+        device_key: device.device_key,
+        stream_token: minted.secret,
+        dir: tempfile::tempdir().expect("temp dir"),
+    };
+
+    let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
+    common::wait_active_streams(&harness.server, 1).await;
+
+    // Two-plus keep-alive comments cross the wire (1 s apart). They are
+    // comments, not events: no intent, no History Log line.
+    assert_no_intent(&mut intents, 2_600).await;
+    assert_eq!(
+        HistoryLog::new(harness.history_path())
+            .entries()
+            .expect("entries")
+            .len(),
+        0
+    );
+
+    // And the stream is still live after them: a push still surfaces.
+    harness.push(serde_json::json!({ "body": "still alive" })).await;
+    let intent = next_intent(&mut intents).await;
+    assert_eq!(intent.body, "still alive");
+
+    handle.stop().await;
+    let common::Subscribed { server, .. } = harness;
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn ext_params_map_to_click_actions_with_url_winning_over_copy() {
     let harness = common::Subscribed::spawn().await;
     let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
