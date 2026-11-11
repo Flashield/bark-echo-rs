@@ -166,22 +166,10 @@ impl PlainFileStore {
             path: self.path.clone(),
             source: std::io::Error::other(source),
         })?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| SecretError::Io {
-                doing: "create directory for",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw).map_err(|source| SecretError::Io {
+        // Atomic, owner-only: the helper restricts the temp file before
+        // the rename, so no plaintext-bearing file ever has wider perms.
+        crate::atomic::write(&self.path, &raw, true).map_err(|source| SecretError::Io {
             doing: "write",
-            path: tmp.clone(),
-            source,
-        })?;
-        restrict_to_owner(&tmp)?;
-        std::fs::rename(&tmp, &self.path).map_err(|source| SecretError::Io {
-            doing: "rename",
             path: self.path.clone(),
             source,
         })
@@ -222,25 +210,6 @@ impl SecretStore for PlainFileStore {
         }
         self.write(&contents)
     }
-}
-
-/// Set owner-only (0600) permissions where the concept exists; other
-/// platforms keep their default per-user ACLs.
-fn restrict_to_owner(path: &Path) -> Result<(), SecretError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |source| SecretError::Io {
-                doing: "restrict",
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 /// The normal secret home (spec story 18): the OS credential store —

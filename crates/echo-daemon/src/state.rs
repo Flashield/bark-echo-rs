@@ -206,21 +206,8 @@ impl StateWriter {
             path: self.path.clone(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         })?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StateError::Io {
-                doing: "create the directory for",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, raw).map_err(|source| StateError::Io {
+        crate::atomic::write(&self.path, &raw, false).map_err(|source| StateError::Io {
             doing: "write",
-            path: tmp.clone(),
-            source,
-        })?;
-        std::fs::rename(&tmp, &self.path).map_err(|source| StateError::Io {
-            doing: "rename",
             path: self.path.clone(),
             source,
         })

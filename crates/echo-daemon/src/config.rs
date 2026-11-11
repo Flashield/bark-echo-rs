@@ -130,21 +130,8 @@ impl Config {
             path: path.to_path_buf(),
             source: std::io::Error::other(source),
         })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
-                doing: "create directory for",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw).map_err(|source| ConfigError::Io {
+        crate::atomic::write(path, &raw, false).map_err(|source| ConfigError::Io {
             doing: "write",
-            path: tmp.clone(),
-            source,
-        })?;
-        std::fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
-            doing: "rename",
             path: path.to_path_buf(),
             source,
         })
