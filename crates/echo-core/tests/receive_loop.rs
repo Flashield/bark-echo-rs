@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use echo_core::history::HistoryLog;
 use echo_core::intent::{ClickAction, NotificationIntent};
@@ -408,6 +408,83 @@ async fn a_server_initiated_close_reconnects_and_recovers_the_gap() {
 
     handle.stop().await;
     server.shutdown().await;
+}
+
+/// A crash-looping wire: accepts connection after connection, records each
+/// arrival instant, and closes without writing a single response byte —
+/// the transport-failure face a reconnecting client must back off against.
+/// Abort the returned task to stop it.
+async fn crash_looping_server() -> (
+    String,
+    tokio::sync::mpsc::Receiver<Instant>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind wire double");
+    let addr = listener.local_addr().expect("local addr");
+    let (arrivals, rx) = tokio::sync::mpsc::channel(64);
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let _ = arrivals.send(Instant::now()).await;
+            drop(socket);
+        }
+    });
+    (format!("http://{addr}"), rx, handle)
+}
+
+#[tokio::test]
+async fn reconnect_backoff_grows_and_jitters() {
+    // The schedule is pinned by timestamps, not internals: the
+    // crash-looping wire puts the loop on the transport-failure path, and
+    // the arrival times at the wire are the reconnect attempt times. With
+    // fast_backoff (base 150 ms, cap 2 s), the gap between arrivals k and
+    // k+1 is min(cap, 150 ms * 2^k) plus up to 30% jitter: 150, 300, 600,
+    // 1200, 2000 (capped) milliseconds.
+    let (base_url, mut arrivals, wire) = crash_looping_server().await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (handle, _intents) = RealtimeStream::spawn(config_for_wire(&base_url, &dir));
+
+    // The first connect plus five reconnects.
+    let mut times = Vec::new();
+    for _ in 0..6 {
+        times.push(
+            tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
+                .await
+                .expect("reconnect attempt within 10s")
+                .expect("wire still accepting"),
+        );
+    }
+    let intervals: Vec<i64> = times
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).as_millis() as i64)
+        .collect();
+
+    let schedule: [i64; 5] = [150, 300, 600, 1200, 2000];
+    for (k, (&gap, &term)) in intervals.iter().zip(schedule.iter()).enumerate() {
+        assert!(
+            gap >= term - 2,
+            "attempt {k}: {gap} ms is shorter than the exponential term {term} ms"
+        );
+        assert!(
+            gap <= (term * 13) / 10 + 15,
+            "attempt {k}: {gap} ms exceeds the exponential term {term} ms plus 30% jitter"
+        );
+    }
+    assert!(
+        intervals.windows(2).all(|pair| pair[1] > pair[0]),
+        "backoff grows between reconnect attempts: {intervals:?}"
+    );
+    assert!(
+        intervals
+            .iter()
+            .zip(schedule.iter())
+            .any(|(gap, term)| gap - term > 5),
+        "jitter draws happen: every interval sat exactly on the exponential term: {intervals:?}"
+    );
+
+    handle.stop().await;
+    wire.abort();
 }
 
 #[tokio::test]
