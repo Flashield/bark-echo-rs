@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use echo_core::history::HistoryLog;
-use echo_core::intent::NotificationIntent;
+use echo_core::intent::{ClickAction, NotificationIntent};
 use echo_core::stream::{BackoffConfig, RealtimeStream, StreamConfig};
 
 /// Backoff fast enough for tests (the default base is a second).
@@ -105,6 +105,86 @@ async fn history_log_stays_empty_until_the_first_intent_is_emitted() {
     harness.push(serde_json::json!({ "body": "one" })).await;
     let intent = next_intent(&mut intents).await;
     assert_eq!(log.entries().expect("entries"), vec![intent]);
+
+    handle.stop().await;
+    harness.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ext_params_map_to_click_actions_with_url_winning_over_copy() {
+    let harness = common::Subscribed::spawn().await;
+    let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
+    common::wait_active_streams(&harness.server, 1).await;
+
+    harness
+        .push(serde_json::json!({ "body": "link", "url": "https://example.com/boarding" }))
+        .await;
+    harness
+        .push(serde_json::json!({ "body": "snippet", "copy": "the text to copy" }))
+        .await;
+    harness
+        .push(serde_json::json!({
+            "body": "both",
+            "url": "https://example.com/wins",
+            "copy": "ignored when url is present",
+        }))
+        .await;
+    harness.push(serde_json::json!({ "body": "neither" })).await;
+
+    let with_url = next_intent(&mut intents).await;
+    let with_copy = next_intent(&mut intents).await;
+    let with_both = next_intent(&mut intents).await;
+    let with_neither = next_intent(&mut intents).await;
+
+    assert_eq!(
+        with_url.click_action,
+        Some(ClickAction::OpenUrl { url: "https://example.com/boarding".to_owned() }),
+        "url → open the default browser"
+    );
+    assert_eq!(
+        with_copy.click_action,
+        Some(ClickAction::Copy { text: "the text to copy".to_owned() }),
+        "copy without url → clipboard"
+    );
+    assert_eq!(
+        with_both.click_action,
+        Some(ClickAction::OpenUrl { url: "https://example.com/wins".to_owned() }),
+        "url wins when both ride along"
+    );
+    assert_eq!(with_neither.click_action, None, "no url, no copy → no action");
+    // The alert text rides unchanged.
+    assert_eq!(with_neither.body, "neither");
+
+    handle.stop().await;
+    harness.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_encrypted_push_renders_the_placeholder_intent_not_ciphertext_noise() {
+    let harness = common::Subscribed::spawn().await;
+    let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
+    common::wait_active_streams(&harness.server, 1).await;
+
+    harness
+        .push(serde_json::json!({
+            "ciphertext": "BASE64CIPHERTEXT",
+            "iv": "BASE64IV",
+        }))
+        .await;
+
+    let intent = next_intent(&mut intents).await;
+
+    // A clear placeholder instead of ciphertext noise (spec user story 13).
+    assert_eq!(intent.title, "Encrypted notification");
+    assert!(
+        !intent.body.contains("BASE64CIPHERTEXT"),
+        "no ciphertext in the rendered body: {}",
+        intent.body
+    );
+    assert_eq!(intent.click_action, None, "no click action to resolve");
+    // The id still rides along: dedup and the History Log cursor stay exact.
+    let log = HistoryLog::new(harness.history_path());
+    assert_eq!(log.cursor().expect("cursor"), Some(intent.id));
 
     handle.stop().await;
     harness.server.shutdown().await;
