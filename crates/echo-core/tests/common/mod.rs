@@ -14,7 +14,9 @@ pub struct TestServer {
     pub base_url: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    _dir: tempfile::TempDir,
+    /// The owned data dir; `None` when the caller owns it (a restart
+    /// scenario keeps the store across server processes).
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl TestServer {
@@ -29,10 +31,26 @@ impl TestServer {
     pub async fn spawn_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().expect("temp data dir");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let mut server = Self::spawn_on(listener, dir.path().to_path_buf(), tweak).await;
+        server._dir = Some(dir);
+        server
+    }
+
+    /// Spawn the server on an already-bound listener with a caller-owned
+    /// data directory: the store outlives [`TestServer::shutdown`], so a
+    /// test can restart the server on the same port and data — the
+    /// server-initiated stream close of a shutdown, then a reconnect
+    /// against the persisted Device, Stream Token, and message ids.
+    #[allow(dead_code)]
+    pub async fn spawn_on(
+        listener: std::net::TcpListener,
+        data_dir: std::path::PathBuf,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Self {
         let addr = listener.local_addr().expect("local addr");
         let mut config = Config {
             addr: addr.to_string(),
-            data_dir: dir.path().to_path_buf(),
+            data_dir,
             ..Config::default()
         };
         tweak(&mut config);
@@ -50,7 +68,7 @@ impl TestServer {
             base_url,
             shutdown: Some(tx),
             handle,
-            _dir: dir,
+            _dir: None,
         }
     }
 

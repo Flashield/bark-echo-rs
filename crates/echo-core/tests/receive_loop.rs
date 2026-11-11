@@ -20,27 +20,31 @@ fn fast_backoff() -> BackoffConfig {
     }
 }
 
-/// A stream config pointing at the harness with its History Log.
-fn config_for(harness: &common::Subscribed) -> StreamConfig {
+/// A stream config for one Subscription assembled from its pieces: the
+/// server URL, the Stream Token secret, and the History Log path.
+fn stream_config(base_url: &str, stream_token: &str, history_path: &std::path::Path) -> StreamConfig {
     StreamConfig {
-        base_url: harness.server.base_url.clone(),
-        stream_token: harness.stream_token.clone(),
+        base_url: base_url.to_owned(),
+        stream_token: stream_token.to_owned(),
         basic_auth: None,
-        history_log: HistoryLog::new(harness.history_path()),
+        history_log: HistoryLog::new(history_path),
         backoff: fast_backoff(),
     }
 }
 
+/// A stream config pointing at the harness with its History Log.
+fn config_for(harness: &common::Subscribed) -> StreamConfig {
+    stream_config(
+        &harness.server.base_url,
+        &harness.stream_token,
+        &harness.history_path(),
+    )
+}
+
 /// A stream config pointing at a hand-rolled wire with a fresh History Log.
 fn config_for_wire(base_url: &str, dir: &tempfile::TempDir) -> StreamConfig {
-    StreamConfig {
-        base_url: base_url.to_owned(),
-        // The wire double ignores request headers; any token shape works.
-        stream_token: "st_wire-double".to_owned(),
-        basic_auth: None,
-        history_log: HistoryLog::new(dir.path().join("history.jsonl")),
-        backoff: fast_backoff(),
-    }
+    // The wire double ignores request headers; any token shape works.
+    stream_config(base_url, "st_wire-double", &dir.path().join("history.jsonl"))
 }
 
 /// One `event: message` frame's `data:` payload for the wire doubles: the
@@ -313,6 +317,97 @@ async fn killing_and_reopening_the_stream_replays_exactly_the_gap() {
 
     handle.stop().await;
     harness.server.shutdown().await;
+}
+
+/// Push one V2 JSON Push carrying `body` to `device_key` and assert the
+/// server took it — the bare push a restart test needs (no harness).
+async fn push_to(server: &common::TestServer, device_key: &str, body: &str) {
+    let response = reqwest::Client::new()
+        .post(format!("{}/push", server.base_url))
+        .json(&serde_json::json!({ "device_key": device_key, "body": body }))
+        .send()
+        .await
+        .expect("POST /push");
+    let status = response.status();
+    let envelope: serde_json::Value = response.json().await.expect("push envelope");
+    assert!(
+        status.is_success() && envelope["code"] == 200,
+        "push failed: {status} {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_initiated_close_reconnects_and_recovers_the_gap() {
+    // Caller-owned scratch and port: the store outlives the first server
+    // process, and the second one rebinds the same address, so the
+    // client's config never changes.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let history_path = dir.path().join("history.jsonl");
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind port")
+        .local_addr()
+        .expect("local addr");
+    let server = common::TestServer::spawn_on(
+        std::net::TcpListener::bind(addr).expect("bind first server"),
+        dir.path().to_path_buf(),
+        |_| {},
+    )
+    .await;
+    let client = echo_core::server::ServerClient::new(&server.base_url);
+    let device = client.register_stream_device().await.expect("register");
+    let minted = client
+        .mint_stream_token(&device.device_key, "echo-test-client")
+        .await
+        .expect("mint");
+    let config = stream_config(&server.base_url, &minted.secret, &history_path);
+
+    let (handle, mut intents) = RealtimeStream::spawn(config);
+    common::wait_active_streams(&server, 1).await;
+    push_to(&server, &device.device_key, "before the close").await;
+    let first = next_intent(&mut intents).await;
+    assert_eq!((first.id, first.body.as_str()), (1, "before the close"));
+
+    // The server shuts down: the open Realtime Stream is closed under the
+    // client (a server-initiated disconnect, §3.5).
+    server.shutdown().await;
+
+    // The restarted server on the same port and store. The loop retries
+    // through the downtime; the pushes below land while no stream is open
+    // and are persisted for replay (§3.7).
+    let server = common::TestServer::spawn_on(
+        std::net::TcpListener::bind(addr).expect("rebind same port"),
+        dir.path().to_path_buf(),
+        |_| {},
+    )
+    .await;
+    push_to(&server, &device.device_key, "replayed one").await;
+    push_to(&server, &device.device_key, "replayed two").await;
+
+    // Reconnect heals the gap: replay first, then the live handoff — no
+    // loss, no duplicate of what was already processed.
+    let second = next_intent(&mut intents).await;
+    let third = next_intent(&mut intents).await;
+    assert_eq!((second.id, second.body.as_str()), (2, "replayed one"));
+    assert_eq!((third.id, third.body.as_str()), (3, "replayed two"));
+    push_to(&server, &device.device_key, "after the reconnect").await;
+    let fourth = next_intent(&mut intents).await;
+    assert_eq!((fourth.id, fourth.body.as_str()), (4, "after the reconnect"));
+    assert_no_intent(&mut intents, 300).await;
+
+    let log = HistoryLog::new(&history_path);
+    assert_eq!(
+        log.entries()
+            .expect("history entries")
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "the whole sequence exactly once, across the server restart"
+    );
+    assert_eq!(log.cursor().expect("cursor"), Some(4));
+
+    handle.stop().await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
