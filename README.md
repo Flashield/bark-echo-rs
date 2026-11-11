@@ -21,10 +21,10 @@ is [`GLOSSARY.md`](GLOSSARY.md).
   disconnect — a flaky network or a server restart never loses a Push.
 - **Desktop notifications from notification intents**: title / subtitle /
   body rendered natively; a `url` Ext Param opens the default browser on
-  click and a `copy` Ext Param writes the clipboard (Linux and macOS; on
-  Windows the toast fires and click actions land with the tray work); an
-  end-to-end-encrypted Push renders a readable placeholder instead of
-  ciphertext noise.
+  click and a `copy` Ext Param writes the clipboard — click actions are
+  supported on macOS and Linux; on Windows the toast fires but the action
+  is dropped until the tray stage (ADR-0002); an end-to-end-encrypted
+  Push renders a readable placeholder instead of ciphertext noise.
 - **Pull** (GLOSSARY): `pull` replays and lands everything the server
   still retains — for a laptop that slept through a day — into the
   History Log, silently, with replay-overlap duplicates suppressed by
