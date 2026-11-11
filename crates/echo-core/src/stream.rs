@@ -68,6 +68,9 @@ pub struct StreamConfig {
     pub history_log: HistoryLog,
     /// Reconnect backoff policy.
     pub backoff: BackoffConfig,
+    /// Where connection-state changes ([`StreamEvent`]) surface, `None`
+    /// when the caller only consumes intents. Sends are best-effort.
+    pub events: Option<mpsc::Sender<StreamEvent>>,
 }
 
 /// Why the receive loop ended.
@@ -76,13 +79,32 @@ pub enum StreamEnd {
     /// Stopped by the owner (`handle.stop()`) or by the intent consumer
     /// going away.
     Stopped,
-    /// The server rejected the credentials (401/418): retrying the same
-    /// credentials would spin, so the loop surfaced the failure —
-    /// re-subscribe or fix the Basic Auth credentials.
+    /// The Stream Token itself was rejected as unknown-or-revoked (401
+    /// `stream token invalid`, protocol §5): the credential cannot heal
+    /// by retrying — re-subscribe this Subscription (spec story 21).
+    TokenInvalid,
+    /// The server rejected the credentials (401/418) in some other way —
+    /// a missing token header, a Basic Auth teapot (§1.4): retrying the
+    /// same credentials would spin, so the loop surfaced the failure —
+    /// fix the credentials it names.
     AuthRejected { status: u16, message: String },
     /// The History Log could not be written; durability is broken, so the
     /// loop stopped rather than emit unlogged intents.
     HistoryWriteFailed(String),
+}
+
+/// A live connection-state change the receive loop surfaces between
+/// intents (ticket #5): the daemon reports per-Subscription stream state
+/// from these. Best-effort — a gone or lagging observer never disturbs
+/// the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// The `: connected` handshake completed: pushes published from here
+    /// on are guaranteed delivery (protocol §3.3).
+    Connected,
+    /// The connection dropped or a connect failed; the loop is retrying
+    /// with backoff (§3.5). The detail names what happened.
+    Disconnected { detail: String },
 }
 
 /// A running receive loop. Stop it with [`StreamHandle::stop`]; the intent
@@ -155,8 +177,15 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
 
         let mut response = match request.send().await {
             Ok(response) => response,
-            // Transport failure: retry after backoff.
-            Err(_) => {
+            // Transport failure: surface it, retry after backoff.
+            Err(err) => {
+                emit(
+                    &config.events,
+                    StreamEvent::Disconnected {
+                        detail: format!("connect failed: {err}"),
+                    },
+                )
+                .await;
                 sleep_backoff(&config.backoff, attempt).await;
                 attempt += 1;
                 continue;
@@ -165,13 +194,25 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
         let status = response.status().as_u16();
         if status == 401 || status == 418 {
             // A rejection never becomes a token-validity oracle (§3.3) and
-            // never heals by retrying: stop and surface it.
-            return StreamEnd::AuthRejected {
-                status,
-                message: response.text().await.unwrap_or_default(),
-            };
+            // never heals by retrying: stop and surface it. The envelope's
+            // message (§1.1) decides the classification — `stream token
+            // invalid` is the re-subscribe case (§5, spec story 21);
+            // everything else stays a generic rejection.
+            let body = response.text().await.unwrap_or_default();
+            let message = envelope_message(&body).unwrap_or(body);
+            if message == "stream token invalid" {
+                return StreamEnd::TokenInvalid;
+            }
+            return StreamEnd::AuthRejected { status, message };
         }
         if !response.status().is_success() {
+            emit(
+                &config.events,
+                StreamEvent::Disconnected {
+                    detail: format!("server answered {status}"),
+                },
+            )
+            .await;
             sleep_backoff(&config.backoff, attempt).await;
             attempt += 1;
             continue;
@@ -184,8 +225,17 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
         loop {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
-                // EOF or transport error: any disconnect reconnects.
-                _ => break,
+                // EOF or transport error: surface it, reconnect.
+                _ => {
+                    emit(
+                        &config.events,
+                        StreamEvent::Disconnected {
+                            detail: "connection closed by the server".to_owned(),
+                        },
+                    )
+                    .await;
+                    break;
+                }
             };
             for frame in parser.push(&chunk) {
                 match frame {
@@ -195,6 +245,7 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
                             // guaranteed every push published from here on.
                             handshake_seen = true;
                             attempt = 0;
+                            emit(&config.events, StreamEvent::Connected).await;
                         }
                         // Keep-alive comments and anything else: ignored.
                     }
@@ -244,6 +295,25 @@ async fn sleep_backoff(config: &BackoffConfig, attempt: u32) {
     let jitter_span = (exponential.as_millis() as u64 * 3) / 10; // ≤ 30%
     let jitter = Duration::from_millis(rand::rng().random_range(0..=jitter_span.max(1)));
     tokio::time::sleep(exponential + jitter).await;
+}
+
+/// Best-effort event delivery: a gone or lagging observer (channel full
+/// or dropped) never disturbs the receive loop.
+async fn emit(events: &Option<mpsc::Sender<StreamEvent>>, event: StreamEvent) {
+    if let Some(sender) = events {
+        let _ = sender.send(event).await;
+    }
+}
+
+/// The `message` field of a response-body envelope (protocol §1.1) — the
+/// error table's actionable text. `None` when the body is not an envelope
+/// (a plain-text 418 teapot, say): the raw body is surfaced then.
+fn envelope_message(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// One SSE frame off the wire: a comment, or an event with its fields.
