@@ -1,5 +1,5 @@
 //! The secret store: Stream Token and Device Key secrets (ADR-0001 —
-//! keyed by server + device, one of each per Subscription). The OS
+//! keyed by server + token_id, one of each per Subscription). The OS
 //! keyring is the normal home (spec story 18); the plain-file fallback is
 //! the explicit opt-in for headless machines (story 19). The trait is the
 //! seam; every CLI test runs against [`PlainFileStore`].
@@ -223,7 +223,8 @@ fn restrict_to_owner(path: &Path) -> Result<(), SecretError> {
 /// keychain on macOS, Credential Manager on Windows, Secret Service on
 /// Linux. One keyring entry per secret, addressed
 /// `service = "echo-daemon"`, `account = "<kind>::<server>::<token_id>"`
-/// (ADR-0001: keyed by server + device).
+/// (ADR-0001: keyed by server + token_id — the fresh-per-add `token_id`
+/// keeps two Subscriptions on one Device from sharing a key).
 #[derive(Debug, Clone, Default)]
 pub struct KeyringStore {
     service: &'static str,
