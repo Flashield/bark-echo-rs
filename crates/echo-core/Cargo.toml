@@ -20,3 +20,9 @@ bark-server-rs = { git = "https://github.com/Flashield/bark-server-rs.git", rev 
 tokio = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+# The APNs stand-in (tests/common/apns.rs), mirroring the server repo's
+# own stub: versions unify with bark-server-rs's dependency set.
+axum = "0.8"
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

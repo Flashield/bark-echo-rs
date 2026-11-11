@@ -4,6 +4,9 @@
 //! listener itself to `run_server_on_listener`, poll `/ping` until ready,
 //! shut down via a oneshot. No Docker, no subprocess.
 
+pub mod apns;
+pub mod sse;
+
 use bark_server_rs::config::Config;
 
 /// An embedded bark server bound to an ephemeral port with its own
@@ -24,6 +27,31 @@ impl TestServer {
     /// task, and wait until `/ping` answers, with default settings.
     pub async fn spawn() -> Self {
         Self::spawn_with(|_| {}).await
+    }
+
+    /// [`TestServer::spawn`] with operator Basic Auth enabled (protocol
+    /// §1.4): every path except `/ping`, `/register` and `/healthz`
+    /// demands the credentials.
+    // common/ is compiled into every test target; these constructors are
+    // shared per target, not used everywhere.
+    #[allow(dead_code)]
+    pub async fn spawn_with_basic_auth(user: &str, password: &str) -> Self {
+        Self::spawn_with(|config| {
+            config.basic_auth_user = user.to_string();
+            config.basic_auth_password = password.to_string();
+        })
+        .await
+    }
+
+    /// [`TestServer::spawn`] with the APNs endpoint pointed at `endpoint`
+    /// (TLS verification off) — the stub route for iOS-type Devices.
+    #[allow(dead_code)]
+    pub async fn spawn_with_apns(endpoint: &str) -> Self {
+        Self::spawn_with(|config| {
+            config.apns_endpoint = endpoint.to_string();
+            config.apns_insecure_skip_tls_verify = true;
+        })
+        .await
     }
 
     /// Like [`TestServer::spawn`], with a tweak applied to the server
@@ -83,6 +111,9 @@ impl TestServer {
 
 /// A Subscription's server-side identity plus a scratch directory for its
 /// History Log: one registered Stream Device, one minted Stream Token.
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
 pub struct Subscribed {
     /// The embedded server.
     pub server: TestServer,
@@ -94,6 +125,7 @@ pub struct Subscribed {
     pub dir: tempfile::TempDir,
 }
 
+#[allow(dead_code)]
 impl Subscribed {
     /// Register a Stream Device, mint it a token, and hand back the harness.
     pub async fn spawn() -> Self {
@@ -144,6 +176,9 @@ impl Subscribed {
 /// Wait until the server's `/info` reports exactly `n` open Realtime
 /// Streams (protocol §2.3) — the external observation that a client's
 /// stream connection is established before a test pushes.
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
 pub async fn wait_active_streams(server: &TestServer, n: u64) {
     wait_active_streams_with(server, n, None).await
 }
