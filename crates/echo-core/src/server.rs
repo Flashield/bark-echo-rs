@@ -38,6 +38,23 @@ pub struct StreamDevice {
     pub device_key: String,
 }
 
+/// A freshly minted Stream Token. The full `secret` appears in a server
+/// response exactly once — here (protocol §3.2) — and must be stored
+/// immediately; later responses identify the token by `token_id` and
+/// `token_hint` only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedStreamToken {
+    /// `st_` + 43 unpadded base64url chars. The read credential.
+    pub secret: String,
+    /// 16 lowercase hex chars — the public handle for list/revoke.
+    pub token_id: String,
+    /// First 12 characters of the secret + `...` — matches a stored
+    /// secret to a list entry without re-exposing it.
+    pub token_hint: String,
+    /// The free-form label naming the Realtime Client this token is for.
+    pub client_label: String,
+}
+
 /// A client of one bark server's Device/Token plane.
 #[derive(Debug, Clone)]
 pub struct ServerClient {
@@ -73,6 +90,42 @@ impl ServerClient {
             "device_key": device_key,
         }))
         .await
+    }
+
+    /// Mint a Stream Token for a Device (protocol §3.2): one revocable
+    /// read credential per Realtime Client, labelled `client_label`.
+    pub async fn mint_stream_token(
+        &self,
+        device_key: &str,
+        client_label: &str,
+    ) -> Result<MintedStreamToken, ServerError> {
+        let url = format!("{}/realtime/v1/devices/{device_key}/streams", self.base_url);
+        let envelope = self
+            .post_envelope(
+                url,
+                Some(device_key),
+                &serde_json::json!({ "client_label": client_label }),
+            )
+            .await?;
+        let data = envelope.data.expect("mint success carries data");
+        Ok(MintedStreamToken {
+            secret: data["token"]
+                .as_str()
+                .expect("token is a string")
+                .to_owned(),
+            token_id: data["token_id"]
+                .as_str()
+                .expect("token_id is a string")
+                .to_owned(),
+            token_hint: data["token_hint"]
+                .as_str()
+                .expect("token_hint is a string")
+                .to_owned(),
+            client_label: data["client_label"]
+                .as_str()
+                .expect("client_label is a string")
+                .to_owned(),
+        })
     }
 
     /// Shared `POST /register` flow for both registration flavors.
