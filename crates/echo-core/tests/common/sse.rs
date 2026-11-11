@@ -4,6 +4,10 @@
 //! (`\n\n`-terminated blocks); comment lines (`: connected`,
 //! `: keep-alive`) are skipped per §3.4.
 
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use serde_json::Value;
