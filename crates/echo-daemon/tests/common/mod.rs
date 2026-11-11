@@ -1,8 +1,8 @@
-//! The embedded-server seam for the CLI tests (spec Testing Decisions):
-//! the same TestServer shape echo-core's suites use — bind
-//! `127.0.0.1:0`, hand the listener to `run_server_on_listener`, poll
-//! `/ping` until ready, shut down via a oneshot. Trimmed to the
-//! constructors the CLI suites need. No Docker, no subprocess.
+//! The one test seam: the real bark-server-rs, embedded in-process on a
+//! random port (spec Testing Decisions). Mirrors echo-core's
+//! `tests/common/mod.rs` TestServer — bind `127.0.0.1:0` and hand the
+//! listener itself to `run_server_on_listener`, poll `/ping` until ready,
+//! shut down via a oneshot. No Docker, no subprocess.
 
 pub mod sse;
 
@@ -29,6 +29,9 @@ impl TestServer {
     /// [`TestServer::spawn`] with operator Basic Auth enabled (protocol
     /// §1.4): every path except `/ping`, `/register` and `/healthz`
     /// demands the credentials.
+    // common/ is compiled into every test target; these constructors are
+    // shared per target, not used everywhere.
+    #[allow(dead_code)]
     pub async fn spawn_with_basic_auth(user: &str, password: &str) -> Self {
         Self::spawn_configuring(|config| {
             config.basic_auth_user = user.to_string();
