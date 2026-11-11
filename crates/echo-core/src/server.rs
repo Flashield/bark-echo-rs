@@ -103,6 +103,12 @@ impl ServerClient {
         }
     }
 
+    /// The canonical server base URL (no trailing slash) this client
+    /// talks to — the string config and secret keys address it by.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Register a fresh Stream Device (protocol §3.1): `device_type:
     /// "stream"`, no Device Token by invariant. Returns the minted
     /// Device Key.

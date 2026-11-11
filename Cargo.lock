@@ -683,10 +683,15 @@ dependencies = [
 name = "echo-daemon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bark-server-rs",
+ "echo-core",
  "keyring",
+ "reqwest",
  "serde",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

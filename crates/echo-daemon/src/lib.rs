@@ -5,3 +5,4 @@
 pub mod config;
 pub mod paths;
 pub mod secrets;
+pub mod subscribe;
