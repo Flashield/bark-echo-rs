@@ -21,13 +21,14 @@ is [`GLOSSARY.md`](GLOSSARY.md).
   disconnect — a flaky network or a server restart never loses a Push.
 - **Desktop notifications from notification intents**: title / subtitle /
   body rendered natively; a `url` Ext Param opens the default browser on
-  click and a `copy` Ext Param writes the clipboard (Linux and macOS; on
-  Windows the toast fires and click actions land with the tray work); an
-  end-to-end-encrypted Push renders a readable placeholder instead of
-  ciphertext noise.
-- **Pull** (GLOSSARY): `pull` backfills everything the server still
-  retains — for a laptop that slept through a day — into the History Log,
-  silently, with replay-overlap duplicates suppressed by dedup.
+  click and a `copy` Ext Param writes the clipboard — click actions are
+  supported on macOS and Linux; on Windows the toast fires but the action
+  is dropped until the tray stage (ADR-0002); an end-to-end-encrypted
+  Push renders a readable placeholder instead of ciphertext noise.
+- **Pull** (GLOSSARY): `pull` replays and lands everything the server
+  still retains — for a laptop that slept through a day — into the
+  History Log, silently, with replay-overlap duplicates suppressed by
+  dedup.
 - **History Log** (GLOSSARY): one append-only JSONL file per Subscription;
   it doubles as the reconnect cursor, and `log` tails and filters it.
 - **Push from scripts**: `push` sends through the server's V2 JSON route;
@@ -43,7 +44,10 @@ is [`GLOSSARY.md`](GLOSSARY.md).
   notifications never double-display; autostart samples live in
   [`docs/autostart.md`](docs/autostart.md).
 - **Basic Auth per server** (protocol §1.4) sent alongside the Stream
-  Token on streams and `/info` observations.
+  Token on streams, pushes, pulls, `/info` observations, and the token
+  commands — laid in once with `subscribe add --auth-user U
+  --auth-password P`: the password lands in the secret store, and every
+  later connection rides it without flags (explicit flags still win).
 
 ## Quickstart
 
@@ -79,7 +83,7 @@ Missed time (the laptop was closed, the server restarted) is recoverable,
 and the History Log answers "did it reach my desktop?":
 
 ```sh
-# 4. Backfill everything the server still retains, silently:
+# 4. Pull (replay) everything the server still retains, silently:
 $ bark-echo pull
 
 # 5. Audit recent reminders, or stream them live while the daemon runs:
@@ -91,19 +95,22 @@ $ bark-echo log --follow
 
 | Command | Effect |
 |---|---|
-| `bark-echo subscribe add --own --server URL` | Register a fresh Stream Device for this desktop and persist the Subscription; prints the Device Key |
-| `bark-echo subscribe add --device-key KEY --server URL` | Mirror an existing Device (an iPhone, another machine) instead |
+| `bark-echo subscribe add --own --server URL [--auth-user U --auth-password P]` | Register a fresh Stream Device for this desktop and persist the Subscription; prints the Device Key. The auth flags lay in a protected server's Basic Auth credentials |
+| `bark-echo subscribe add --device-key KEY --server URL [--auth-user U --auth-password P]` | Mirror an existing Device (an iPhone, another machine) instead |
 | `bark-echo subscribe list` | List Subscriptions (id, server, label, token hint) |
 | `bark-echo subscribe rm ID` | Remove one Subscription and delete its secrets |
 | `bark-echo run` | The daemon: hold every stream open, render notifications (Ctrl-C stops; a second run refuses on the single-instance lock) |
 | `bark-echo status` | Per-Subscription stream state plus the server's live `/info` statistics |
 | `bark-echo log [--tail N] [--follow] [--sub LABEL]` | Read a Subscription's History Log; `--follow` streams new lines live |
-| `bark-echo pull [--cursor 0] [--sub LABEL]` | One-shot replay of retained Messages into the History Log, silently; `--cursor 0` replays everything retained |
+| `bark-echo pull [--cursor 0] [--sub LABEL] [--user U --password P]` | One-shot replay of retained Messages into the History Log, silently; `--cursor 0` replays everything retained |
 | `bark-echo push --server URL --device-key KEY --title T [--subtitle S] [--body B] [--key value …]` | Send one Push; unknown `--key value` pairs ride through as Ext Params, exactly like the server's V2 JSON route |
+| `bark-echo token list --server URL --device-key KEY [--user U --password P]` | List a Device's Stream Tokens (id, hint, label, revoked state) — never the secrets |
+| `bark-echo token revoke --server URL --device-key KEY --token-id ID [--user U --password P]` | Revoke one Stream Token by its public id; takes effect immediately |
 | `bark-echo --plain-secrets <command>` | Run with secrets in a 0600 plain file instead of the OS keyring |
 
-With several Subscriptions held, `--sub LABEL` picks one on `pull` and
-`log`. More Ext Params for `push`:
+With several Subscriptions held, `--sub LABEL` (long form
+`--subscription`) picks one on `pull` and `log`. More Ext Params for
+`push`:
 
 ```sh
 $ bark-echo push --server http://192.168.1.10:8080 \
@@ -119,20 +126,22 @@ Everything lives under one per-OS config directory:
 
 | Platform | Config directory |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/echo-daemon`, else `~/.config/echo-daemon` |
-| macOS | `~/Library/Application Support/echo-daemon` |
-| Windows | `%APPDATA%\echo-daemon` |
+| Linux | `$XDG_CONFIG_HOME/bark-echo`, else `~/.config/bark-echo` |
+| macOS | `~/Library/Application Support/bark-echo` |
+| Windows | `%APPDATA%\bark-echo` |
 
 Inside it:
 
 - `config.toml` — the Subscription list (ADR-0001): per Subscription the
   server URL, label, token id, and the non-secret token/device hints, plus
-  optional per-server Basic Auth entries. No secrets here.
-- Stream Tokens and Device Keys — the OS keyring under the service name
-  `echo-daemon` (macOS Keychain / Windows Credential Manager / Linux
-  Secret Service). With `--plain-secrets` they live in `secrets.toml`
-  instead, written 0600 — the explicit opt-in for headless machines
-  without a secret service.
+  optional per-server Basic Auth entries holding the user and a
+  stored-password marker only. No secrets here.
+- Stream Tokens, Device Keys, and Basic Auth passwords — the OS keyring
+  under the service name `bark-echo` (macOS Keychain / Windows Credential
+  Manager / Linux Secret Service); Basic Auth passwords are keyed by
+  server, the Subscription secrets by server + token id. With
+  `--plain-secrets` they live in `secrets.toml` instead, written 0600 —
+  the explicit opt-in for headless machines without a secret service.
 - `history/<subscription-id>.jsonl` — the Subscription's History Log
   (GLOSSARY), appended by both the daemon and `pull`.
 - `daemon.lock` — the single-instance lock (ADR-0002); the OS releases it

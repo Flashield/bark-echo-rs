@@ -92,7 +92,7 @@ impl Paths {
     /// The History Log directory (GLOSSARY): one append-only JSONL file
     /// per Subscription, named by the Subscription's id. One file for
     /// every writer — the daemon's receive loop appends live, `pull`
-    /// backfills into it, `log` reads it back.
+    /// lands replay into it, `log` reads it back.
     pub fn history_dir(&self) -> PathBuf {
         self.config_dir.join("history")
     }
@@ -110,14 +110,14 @@ impl Paths {
         let root = xdg
             .map(PathBuf::from)
             .or_else(|| home.map(|home| home.join(".config")));
-        root.map(|root| root.join("echo-daemon"))
+        root.map(|root| root.join("bark-echo"))
             .ok_or(PathsError::NoConfigRoot)
     }
 
     #[cfg(windows)]
     fn from_windows_root(appdata: Option<&Path>) -> Result<PathBuf, PathsError> {
         appdata
-            .map(|root| root.join("echo-daemon"))
+            .map(|root| root.join("bark-echo"))
             .ok_or(PathsError::NoConfigRoot)
     }
 }

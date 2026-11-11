@@ -22,6 +22,9 @@ pub struct TestServer {
 impl TestServer {
     /// Bind a random port, start the server on the listener's runtime
     /// task, and wait until `/ping` answers.
+    // common/ is compiled into every test target; helpers are shared per
+    // target, not all used everywhere.
+    #[allow(dead_code)]
     pub async fn spawn() -> Self {
         Self::spawn_configuring(|_| {}).await
     }

@@ -63,11 +63,13 @@ impl NotificationRenderer for DesktopRenderer {
             });
         }
         #[cfg(target_os = "windows")]
-        if let Some(click) = intent.click_action.clone() {
+        if intent.click_action.is_some() {
             // Windows toasts deliver activations outside notify-rust's
-            // event model — the MVP fires the notification; the click
-            // action lands with the tray work (ADR-0002).
-            let _ = click;
+            // event model — the tray stage owns click actions (ADR-0002).
+            // The action is dropped, loudly enough to debug.
+            eprintln!(
+                "click action: dropped — windows toast activations need the tray stage (ADR-0002)"
+            );
         }
         Ok(())
     }

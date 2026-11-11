@@ -1,5 +1,5 @@
 //! The secret store: Stream Token and Device Key secrets (ADR-0001 —
-//! keyed by server + device, one of each per Subscription). The OS
+//! keyed by server + token_id, one of each per Subscription). The OS
 //! keyring is the normal home (spec story 18); the plain-file fallback is
 //! the explicit opt-in for headless machines (story 19). The trait is the
 //! seam; every CLI test runs against [`PlainFileStore`].
@@ -7,13 +7,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Which of a Subscription's two secrets is being addressed.
+/// Which secret is being addressed: a Subscription's two (Device Key,
+/// Stream Token) or the operator's per-server Basic Auth password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The Device Key — authorizes pushing and token minting (§3.2).
     DeviceKey,
     /// The Stream Token — authorizes reading the Realtime Stream (§3.2).
     StreamToken,
+    /// The operator Basic Auth password for one server (§1.4, story 18)
+    /// — keyed by server alone, shared by every Subscription on it.
+    BasicAuthPassword,
 }
 
 impl SecretKind {
@@ -22,6 +26,7 @@ impl SecretKind {
         match self {
             SecretKind::DeviceKey => "device-key",
             SecretKind::StreamToken => "stream-token",
+            SecretKind::BasicAuthPassword => "basic-auth-password",
         }
     }
 }
@@ -39,6 +44,25 @@ pub struct SecretKey {
 }
 
 impl SecretKey {
+    /// The key for one Subscription's secrets: the server plus its Stream
+    /// Token's `token_id` (the Subscription's id, ADR-0001).
+    pub fn for_subscription(server: impl Into<String>, token_id: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            token_id: token_id.into(),
+        }
+    }
+
+    /// The per-server key the operator's Basic Auth password lives under
+    /// (§1.4, story 18): one credential per server, shared by every
+    /// Subscription on it.
+    pub fn for_server(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            token_id: String::new(),
+        }
+    }
+
     /// The human-readable address of one secret — what NotFound errors
     /// quote and what the keyring account line looks like.
     fn account(&self, kind: SecretKind) -> String {
@@ -142,22 +166,10 @@ impl PlainFileStore {
             path: self.path.clone(),
             source: std::io::Error::other(source),
         })?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| SecretError::Io {
-                doing: "create directory for",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw).map_err(|source| SecretError::Io {
+        // Atomic, owner-only: the helper restricts the temp file before
+        // the rename, so no plaintext-bearing file ever has wider perms.
+        crate::atomic::write(&self.path, &raw, true).map_err(|source| SecretError::Io {
             doing: "write",
-            path: tmp.clone(),
-            source,
-        })?;
-        restrict_to_owner(&tmp)?;
-        std::fs::rename(&tmp, &self.path).map_err(|source| SecretError::Io {
-            doing: "rename",
             path: self.path.clone(),
             source,
         })
@@ -200,30 +212,12 @@ impl SecretStore for PlainFileStore {
     }
 }
 
-/// Set owner-only (0600) permissions where the concept exists; other
-/// platforms keep their default per-user ACLs.
-fn restrict_to_owner(path: &Path) -> Result<(), SecretError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |source| SecretError::Io {
-                doing: "restrict",
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
 /// The normal secret home (spec story 18): the OS credential store —
 /// keychain on macOS, Credential Manager on Windows, Secret Service on
 /// Linux. One keyring entry per secret, addressed
-/// `service = "echo-daemon"`, `account = "<kind>::<server>::<token_id>"`
-/// (ADR-0001: keyed by server + device).
+/// `service = "bark-echo"`, `account = "<kind>::<server>::<token_id>"`
+/// (ADR-0001: keyed by server + token_id — the fresh-per-add `token_id`
+/// keeps two Subscriptions on one Device from sharing a key).
 #[derive(Debug, Clone, Default)]
 pub struct KeyringStore {
     service: &'static str,
@@ -233,7 +227,7 @@ impl KeyringStore {
     /// A store in the OS keyring under this application's service name.
     pub fn new() -> Self {
         Self {
-            service: "echo-daemon",
+            service: "bark-echo",
         }
     }
 

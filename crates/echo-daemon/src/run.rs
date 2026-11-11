@@ -113,10 +113,7 @@ pub async fn run(
         fences.push(fence_tx);
 
         let secret = match spec.store.get(
-            &SecretKey {
-                server: subscription.server.clone(),
-                token_id: subscription.id.clone(),
-            },
+            &SecretKey::for_subscription(&subscription.server, &subscription.id),
             SecretKind::StreamToken,
         ) {
             Ok(secret) => secret,
@@ -133,14 +130,39 @@ pub async fn run(
                 continue;
             }
         };
+        // The operator Basic Auth credentials (§1.4) out of the store
+        // (story 18): an unreachable store is this Subscription's failure
+        // to record, not the run's.
+        let basic_auth = match crate::auth::resolve(
+            &spec.config,
+            spec.store.as_ref(),
+            &subscription.server,
+            None,
+            None,
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                record(
+                    &state,
+                    &subscription.id,
+                    StreamState::Failed {
+                        detail: err.to_string(),
+                    },
+                );
+                continue;
+            }
+        };
 
         let (events_tx, events_rx) = mpsc::channel(64);
         let config = StreamConfig {
             base_url: subscription.server.clone(),
             stream_token: secret,
-            basic_auth: spec.config.basic_auth(&subscription.server),
+            basic_auth,
             history_log: HistoryLog::new(spec.paths.history_log(&subscription.id)),
             backoff: Default::default(),
+            // The server's default keep-alive interval (§3.4): the idle
+            // watchdog declares a silent connection dead at 45 s.
+            keepalive_interval: Some(std::time::Duration::from_secs(15)),
             events: Some(events_tx),
         };
         let (handle, intents) = RealtimeStream::spawn(config);
@@ -203,9 +225,12 @@ async fn supervise(
                     if let Err(err) = renderer.render(&intent) {
                         eprintln!("notification render failed: {err}");
                     }
-                    // The History Log line exists by now (the core
-                    // appends before the intent is handed over), so the
-                    // cursor follows it regardless of render success.
+                    // The core hands the intent over first and appends the
+                    // History Log line right after, so this state-file
+                    // cursor can land a beat before the log line does.
+                    // That is safe: the History Log — not this file — is
+                    // the reconnect cursor (GLOSSARY) and the durability
+                    // anchor; this id only feeds `status`'s display.
                     if let Err(err) = state.set_last_message_id(&id, intent.id) {
                         eprintln!("state file update failed: {err}");
                     }

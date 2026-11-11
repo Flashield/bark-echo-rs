@@ -11,14 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
-
-/// The upstream response envelope (bark protocol §1.1), decode side only.
-#[derive(Deserialize)]
-struct Envelope {
-    code: u16,
-    message: String,
-}
+use crate::envelope::Envelope;
 
 /// Failures of the Push sender: transport problems, the Basic Auth
 /// refusal (§1.4), or a non-200 envelope answer carrying the server's

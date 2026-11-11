@@ -49,6 +49,7 @@ async fn adding_an_own_subscription_registers_mints_and_persists_everything() {
         &client,
         AddSource::Own,
         "workstation",
+        None,
     )
     .await
     .expect("add --own");
@@ -118,6 +119,7 @@ async fn adding_with_a_device_key_mirrors_the_existing_device() {
         &client,
         AddSource::DeviceKey(device.device_key.clone()),
         "family-ipad",
+        None,
     )
     .await
     .expect("add --device-key");
@@ -167,6 +169,7 @@ async fn a_failed_add_leaves_no_partial_state_behind() {
         &ServerClient::new(&server.base_url),
         AddSource::DeviceKey("itu4irzixECYJ5Ftd9UygX".to_owned()),
         "ghost",
+        None,
     )
     .await
     .expect_err("unknown device key");
@@ -202,6 +205,7 @@ async fn two_subscriptions_to_the_same_device_each_hold_their_own_secrets() {
         &client,
         source.clone(),
         "desk",
+        None,
     )
     .await
     .expect("first add");
@@ -211,6 +215,7 @@ async fn two_subscriptions_to_the_same_device_each_hold_their_own_secrets() {
         &client,
         source,
         "laptop",
+        None,
     )
     .await
     .expect("second add");
@@ -251,6 +256,7 @@ async fn removing_a_subscription_deletes_its_config_entry_and_both_secrets() {
         &client,
         AddSource::Own,
         "workstation",
+        None,
     )
     .await
     .expect("add --own");

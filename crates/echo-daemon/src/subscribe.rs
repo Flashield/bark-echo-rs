@@ -50,15 +50,18 @@ pub enum SubscribeError {
 
 /// Register (or reuse) a Device, mint a labelled Stream Token, and
 /// persist everything: both secrets under the fresh Subscription id, the
+/// operator Basic Auth credentials (§1.4, story 18) when given, the
 /// non-secret Subscription into the config. Secrets are stored before the
 /// config is touched, so a failed store never leaves an entry pointing at
-/// nothing.
+/// nothing. The `client` must already carry the Basic Auth credentials
+/// when the server demands them for minting.
 pub async fn add(
     config: &mut Config,
     store: &dyn SecretStore,
     client: &ServerClient,
     source: AddSource,
     label: &str,
+    auth: Option<echo_core::stream::BasicAuth>,
 ) -> Result<Added, SubscribeError> {
     let device_key = match source {
         AddSource::Own => client.register_stream_device().await?.device_key,
@@ -71,12 +74,14 @@ pub async fn add(
     let minted = client.mint_stream_token(&device_key, label).await?;
 
     let server = client.base_url().to_owned();
-    let key = SecretKey {
-        server: server.clone(),
-        token_id: minted.token_id.clone(),
-    };
+    let key = SecretKey::for_subscription(server.clone(), minted.token_id.clone());
     store.set(&key, SecretKind::DeviceKey, &device_key)?;
     store.set(&key, SecretKind::StreamToken, &minted.secret)?;
+    // The operator credentials ride in once here and every later
+    // connection rides them out of the store (story 18).
+    if let Some(auth) = &auth {
+        crate::auth::store(config, store, &server, auth)?;
+    }
 
     let subscription = Subscription {
         id: minted.token_id,
@@ -111,10 +116,7 @@ pub fn remove(
         .ok_or_else(|| SubscribeError::UnknownSubscription(id.to_owned()))?;
     let subscription = config.subscriptions.remove(position);
 
-    let key = SecretKey {
-        server: subscription.server.clone(),
-        token_id: subscription.id.clone(),
-    };
+    let key = SecretKey::for_subscription(&subscription.server, &subscription.id);
     store.delete(&key, SecretKind::DeviceKey)?;
     store.delete(&key, SecretKind::StreamToken)?;
     Ok(subscription)

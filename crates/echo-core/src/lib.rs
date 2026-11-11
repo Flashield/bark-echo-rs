@@ -3,6 +3,7 @@
 //! Platform I/O (keyring, notifications, config files) lives in
 //! echo-daemon, never here.
 
+mod envelope;
 pub mod history;
 pub mod intent;
 pub mod pull;
