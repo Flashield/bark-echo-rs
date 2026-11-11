@@ -7,16 +7,7 @@
 //! timestamp[, data]}` with `code` mirroring the HTTP status — success is
 //! `code == 200`, anything else is mapped onto [`ServerError`].
 
-use serde::Deserialize;
-
-/// The upstream response envelope (bark protocol §1).
-#[derive(Deserialize)]
-struct Envelope {
-    code: u16,
-    message: String,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-}
+use crate::envelope::Envelope;
 
 /// Failures of the server client face: transport problems, or a response
 /// the protocol's error table does not (yet) model for this call.
