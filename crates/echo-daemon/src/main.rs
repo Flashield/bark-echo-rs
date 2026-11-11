@@ -76,10 +76,11 @@ async fn run_push(args: &[String]) {
         push = push.ext_param(key, value);
     }
 
-    PushClient::new(&server)
-        .send(&push)
-        .await
-        .expect("push accepted");
+    // Failures surface the server's message and code (issue #6): the
+    // send module's error display is verbatim, the exit is non-zero.
+    if let Err(err) = PushClient::new(&server).send(&push).await {
+        die(&err.to_string());
+    }
 }
 
 /// Print a usage failure and exit non-zero.

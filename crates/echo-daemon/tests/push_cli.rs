@@ -114,3 +114,40 @@ async fn cli_extra_flags_ride_through_as_ext_params() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() {
+    let server = common::TestServer::spawn().await;
+    // A never-registered 22-char key (same shape as the unknown-key
+    // probes elsewhere).
+    let unknown_key = "zzzzzzzzzzzzzzzzzzzzzz";
+
+    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+        .args([
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            unknown_key,
+            "--body",
+            "anyone?",
+        ])
+        .output()
+        .await
+        .expect("spawn echo-daemon push");
+
+    assert!(
+        !output.status.success(),
+        "an unknown Device Key must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The server's error message and code surface verbatim (§2.2:
+    // unknown device_key quotes the key back).
+    assert_eq!(
+        stderr.trim(),
+        "push rejected by the bark server (code 400): failed to get device token: failed to get [zzzzzzzzzzzzzzzzzzzzzz] device token from database",
+        "the server's message surfaces verbatim: {stderr}"
+    );
+
+    server.shutdown().await;
+}
