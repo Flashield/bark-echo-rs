@@ -1,4 +1,4 @@
-//! The one-shot Pull (GLOSSARY): fetch a Subscription's retained Messages
+//! The one-shot Pull (GLOSSARY): recover a Subscription's retained Messages
 //! from the server's store-and-forward store — one stream connection with
 //! an explicit cursor (`0` = everything retained, protocol §3.5) — and
 //! land every replayed Message **silently** in the Subscription's History

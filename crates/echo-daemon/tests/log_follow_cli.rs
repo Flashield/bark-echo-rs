@@ -90,7 +90,7 @@ async fn log_follow_streams_lines_as_a_concurrent_pull_lands_them() {
         .expect("spawn log --follow");
     let mut stdout = child.stdout.take().expect("piped stdout");
 
-    // The pull backfills the three; the follow child streams them as they
+    // The pull lands the three; the follow child streams them as they
     // land — the daemon-running-live shape of the same append path.
     harness.run(&["--plain-secrets", "pull"]).await;
     let seen = read_until(&mut stdout, &["#1", "#2", "#3", "first", "second", "third"]).await;

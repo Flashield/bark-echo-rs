@@ -228,7 +228,7 @@ async fn run_pull(
 /// The `log` subcommand: read the Subscription's History Log back
 /// (GLOSSARY), newest last; `--tail N` prints only the last N entries and
 /// `--follow` keeps streaming new lines as they land (the daemon's live
-/// appends and pulled backfills alike).
+/// appends and pulled Messages alike).
 async fn run_log(
     paths: &Paths,
     config: &Config,
