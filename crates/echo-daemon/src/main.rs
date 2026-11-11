@@ -83,6 +83,12 @@ enum Command {
         #[command(subcommand)]
         command: SubscribeCommand,
     },
+    /// Inspect and revoke a Device's Stream Tokens on the server (protocol
+    /// §3.2) — the lifecycle face of the tokens `subscribe add` mints.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     /// Hold every Subscription's Realtime Stream open and render each
     /// Push as a desktop notification — the daemon runtime (ADR-0002).
     /// Stops on ctrl-C; a second run refuses on the single-instance lock.
@@ -130,6 +136,66 @@ struct AddSourceArgs {
     /// another family machine (spec story 4).
     #[arg(long)]
     device_key: Option<String>,
+}
+
+/// The `token` subcommands (protocol §3.2). Both address one Device by
+/// its Device Key and present the operator Basic Auth credentials (§1.4)
+/// when the server demands them.
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// List a Device's Stream Token summaries: token id, hint, label, and
+    /// revoked state — the secret is structurally absent (§3.2).
+    List {
+        /// The bark server base URL, e.g. `http://127.0.0.1:8080`.
+        #[arg(long)]
+        server: String,
+        /// The Device Key whose Stream Tokens are listed.
+        #[arg(long)]
+        device_key: String,
+        #[command(flatten)]
+        auth: BasicAuthArgs,
+    },
+    /// Revoke one Stream Token by its public token id (§3.2): takes
+    /// effect immediately — its connect attempts fail auth from here on.
+    /// Deliberately not idempotent (§3.2): revoking a revoked token is an
+    /// error.
+    Revoke {
+        /// The bark server base URL, e.g. `http://127.0.0.1:8080`.
+        #[arg(long)]
+        server: String,
+        /// The Device Key the token was minted for.
+        #[arg(long)]
+        device_key: String,
+        /// The Stream Token's public id (16 hex chars, as `token list`
+        /// shows).
+        #[arg(long)]
+        token_id: String,
+        #[command(flatten)]
+        auth: BasicAuthArgs,
+    },
+}
+
+/// The operator Basic Auth credentials (protocol §1.4) a server may
+/// demand on its token plane.
+#[derive(Args)]
+struct BasicAuthArgs {
+    /// The operator Basic Auth user.
+    #[arg(long)]
+    user: Option<String>,
+    /// The operator Basic Auth password.
+    #[arg(long)]
+    password: Option<String>,
+}
+
+impl BasicAuthArgs {
+    /// The credentials as the server face takes them, `None` when neither
+    /// flag is given.
+    fn into_basic_auth(self) -> Option<(String, String)> {
+        match (self.user, self.password) {
+            (None, None) => None,
+            (user, password) => Some((user.unwrap_or_default(), password.unwrap_or_default())),
+        }
+    }
 }
 
 #[tokio::main]
@@ -205,6 +271,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "subscription {} removed (label: {})",
                     removed.id, removed.label
+                );
+            }
+        },
+        Command::Token { command } => match command {
+            TokenCommand::List {
+                server,
+                device_key,
+                auth,
+            } => {
+                let client = token_client(&server, auth)?;
+                let tokens = client.list_stream_tokens(&device_key).await?;
+                if tokens.is_empty() {
+                    println!("no stream tokens");
+                }
+                for token in tokens {
+                    let state = if token.revoked { "  revoked" } else { "" };
+                    println!(
+                        "{}  {}  {}{}",
+                        token.token_id, token.token_hint, token.client_label, state
+                    );
+                }
+            }
+            TokenCommand::Revoke {
+                server,
+                device_key,
+                token_id,
+                auth,
+            } => {
+                let client = token_client(&server, auth)?;
+                let token = client.revoke_stream_token(&device_key, &token_id).await?;
+                println!(
+                    "stream token {} revoked (label: {})",
+                    token.token_id, token.client_label
                 );
             }
         },
@@ -350,6 +449,19 @@ async fn run_push(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     client.send(&push).await?;
     Ok(())
+}
+
+/// The server client the `token` subcommands talk through, carrying the
+/// operator Basic Auth credentials (§1.4) when the flags name them.
+fn token_client(
+    server: &str,
+    auth: BasicAuthArgs,
+) -> Result<ServerClient, Box<dyn std::error::Error>> {
+    let client = ServerClient::new(server);
+    Ok(match auth.into_basic_auth() {
+        Some((user, password)) => client.with_basic_auth(user, password),
+        None => client,
+    })
 }
 
 /// The default client label: this machine's name (spec story 3), from
