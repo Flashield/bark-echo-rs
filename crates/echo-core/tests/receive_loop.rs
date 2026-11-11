@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use echo_core::history::HistoryLog;
 use echo_core::intent::{ClickAction, NotificationIntent};
-use echo_core::stream::{BackoffConfig, BasicAuth, RealtimeStream, StreamConfig, StreamEnd};
+use echo_core::stream::{
+    BackoffConfig, BasicAuth, RealtimeStream, StreamConfig, StreamEnd, StreamEvent,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Backoff fast enough for tests (the default base is a second).
@@ -33,6 +35,7 @@ fn stream_config(
         basic_auth: None,
         history_log: HistoryLog::new(history_path),
         backoff: fast_backoff(),
+        keepalive_interval: None,
         events: None,
     }
 }
@@ -54,6 +57,17 @@ fn config_for_wire(base_url: &str, dir: &tempfile::TempDir) -> StreamConfig {
         "st_wire-double",
         &dir.path().join("history.jsonl"),
     )
+}
+
+/// The next connection-state event on the channel, within a generous test
+/// timeout.
+async fn next_event(
+    events: &mut tokio::sync::mpsc::Receiver<echo_core::stream::StreamEvent>,
+) -> echo_core::stream::StreamEvent {
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("stream event within 5s")
+        .expect("receive loop still running")
 }
 
 /// One `event: message` frame's `data:` payload for the wire doubles: the
@@ -244,6 +258,75 @@ async fn keep_alive_comments_and_the_handshake_produce_no_intents() {
     handle.stop().await;
     let common::Subscribed { server, .. } = harness;
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_silent_connection_is_declared_dead_and_reconnected_by_the_idle_watchdog() {
+    // A peer that stops sending without hanging up — the misbehavior a
+    // crashed-and-stuck intermediary produces. A conforming server cannot
+    // do this with keep-alives on (§3.4: a keep-alive comment crosses the
+    // wire every interval), so three silent intervals mean the connection
+    // is dead: the watchdog must surface Disconnected and reconnect.
+    let frames = vec![(": connected\n\n".to_owned(), 0)];
+    let (base_url, wire) = scripted_sse_server(frames).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (events_tx, mut events) = tokio::sync::mpsc::channel(64);
+    let config = StreamConfig {
+        keepalive_interval: Some(Duration::from_millis(100)),
+        events: Some(events_tx),
+        ..config_for_wire(&base_url, &dir)
+    };
+    let started = Instant::now();
+    let (handle, _intents) = RealtimeStream::spawn(config);
+
+    // Connected on the first connection, then the watchdog fires — well
+    // inside three times the interval plus backoff, far under any hang —
+    // and the reconnect completes the handshake again.
+    assert_eq!(next_event(&mut events).await, StreamEvent::Connected);
+    let disconnected = next_event(&mut events).await;
+    let idle = match &disconnected {
+        StreamEvent::Disconnected { detail } => detail.clone(),
+        other => panic!("the silence must surface as Disconnected: {other:?}"),
+    };
+    assert!(
+        idle.contains("idle"),
+        "the detail names the watchdog's verdict: {idle}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the watchdog fired within three intervals: {idle}"
+    );
+    assert_eq!(next_event(&mut events).await, StreamEvent::Connected);
+
+    handle.stop().await;
+    wire.abort();
+}
+
+#[tokio::test]
+async fn with_keepalives_disabled_no_watchdog_runs_and_silence_is_tolerated() {
+    // Keep-alives disabled server-side means the protocol promises no
+    // traffic at all (§3.4's interval is off): a watchdog there would
+    // disconnect healthy streams, so silence must be tolerated.
+    let frames = vec![(": connected\n\n".to_owned(), 0)];
+    let (base_url, wire) = scripted_sse_server(frames).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (events_tx, mut events) = tokio::sync::mpsc::channel(64);
+    let config = StreamConfig {
+        keepalive_interval: None,
+        events: Some(events_tx),
+        ..config_for_wire(&base_url, &dir)
+    };
+    let (handle, _intents) = RealtimeStream::spawn(config);
+
+    assert_eq!(next_event(&mut events).await, StreamEvent::Connected);
+    // A watchdog tuned like the test above (3 × 100 ms) would long since
+    // have fired; 1.5 s of silence stays connected.
+    if let Ok(event) = tokio::time::timeout(Duration::from_millis(1_500), events.recv()).await {
+        panic!("no watchdog runs with keep-alives disabled, yet: {event:?}");
+    }
+
+    handle.stop().await;
+    wire.abort();
 }
 
 #[tokio::test]
@@ -596,6 +679,7 @@ async fn basic_auth_credentials_ride_alongside_the_stream_token() {
         }),
         history_log: HistoryLog::new(dir.path().join("history.jsonl")),
         backoff: fast_backoff(),
+        keepalive_interval: None,
         events: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
@@ -629,6 +713,7 @@ async fn a_basic_auth_rejection_ends_the_loop_instead_of_spin_retrying() {
         }),
         history_log: HistoryLog::new(dir.path().join("history.jsonl")),
         backoff: fast_backoff(),
+        keepalive_interval: None,
         events: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);

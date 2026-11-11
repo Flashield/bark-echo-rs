@@ -48,6 +48,7 @@ async fn info_reports_the_live_statistics_the_status_face_needs() {
                 .join("history.jsonl"),
         ),
         backoff: echo_core::stream::BackoffConfig::default(),
+        keepalive_interval: None,
         events: None,
     };
     let (_handle, _intents) = echo_core::stream::RealtimeStream::spawn(config);

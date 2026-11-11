@@ -141,6 +141,9 @@ pub async fn run(
             basic_auth: spec.config.basic_auth(&subscription.server),
             history_log: HistoryLog::new(spec.paths.history_log(&subscription.id)),
             backoff: Default::default(),
+            // The server's default keep-alive interval (§3.4): the idle
+            // watchdog declares a silent connection dead at 45 s.
+            keepalive_interval: Some(std::time::Duration::from_secs(15)),
             events: Some(events_tx),
         };
         let (handle, intents) = RealtimeStream::spawn(config);

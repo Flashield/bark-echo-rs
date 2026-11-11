@@ -11,6 +11,11 @@
 //!   (§1.4) ride along when configured.
 //! - The first body bytes are the `: connected` comment — the liveness
 //!   handshake. Keep-alive comments are ignored. Neither produces intents.
+//! - A connection that stays silent for three keep-alive intervals (§3.4;
+//!   the server's default interval of 15 s puts the watchdog at 45 s) is
+//!   dead: the idle watchdog drops it into the reconnect path. With
+//!   keep-alives disabled server-side there is no traffic guarantee, so
+//!   no watchdog runs.
 //! - The per-Device monotonic `id:` line is the dedup key and the cursor:
 //!   ids at or below the cursor never emit.
 //! - Events other than `message` are ignored until known.
@@ -130,6 +135,12 @@ pub struct StreamConfig {
     pub history_log: HistoryLog,
     /// Reconnect backoff policy.
     pub backoff: BackoffConfig,
+    /// The server's keep-alive interval (§3.4) — the receive loop's idle
+    /// watchdog is three times it (the server's default 15 s interval
+    /// declares a silent connection dead at 45 s). `None` for a server
+    /// with keep-alives disabled: the protocol then guarantees no
+    /// traffic, so no watchdog runs.
+    pub keepalive_interval: Option<Duration>,
     /// Where connection-state changes ([`StreamEvent`]) surface, `None`
     /// when the caller only consumes intents. Sends are best-effort.
     pub events: Option<mpsc::Sender<StreamEvent>>,
@@ -208,6 +219,9 @@ impl RealtimeStream {
 async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) -> StreamEnd {
     let url = stream_url(&config.base_url);
     let http = reqwest::Client::new();
+    // The idle watchdog horizon: three keep-alive intervals. A conforming
+    // server with keep-alives on cannot stay silent half that long (§3.4).
+    let idle_timeout = config.keepalive_interval.map(|interval| interval * 3);
     // Consecutive failed attempts since the last completed handshake.
     let mut attempt: u32 = 0;
     // The highest id whose intent was emitted in this session (ids are
@@ -282,19 +296,58 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
         let mut parser = SseParser::default();
         let mut handshake_seen = false;
         loop {
-            let chunk = match response.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                // EOF or transport error: surface it, reconnect.
-                _ => {
-                    emit(
-                        &config.events,
-                        StreamEvent::Disconnected {
-                            detail: "connection closed by the server".to_owned(),
-                        },
-                    )
-                    .await;
-                    break;
+            // One guarded body read. `chunk()` is cancel-safe, so a fired
+            // timeout loses no bytes. EOF or a transport error reads as
+            // the server hanging up; a fired watchdog as a dead
+            // connection — both take the same reconnect path below.
+            let read = async {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => Ok(chunk),
+                    Ok(None) | Err(_) => Err("connection closed by the server"),
                 }
+            };
+            let chunk = match idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, read).await {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(detail)) => {
+                        emit(
+                            &config.events,
+                            StreamEvent::Disconnected {
+                                detail: detail.to_owned(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        emit(
+                            &config.events,
+                            StreamEvent::Disconnected {
+                                detail: format!(
+                                    "connection idle for {}s — treating it as dead",
+                                    idle.as_secs()
+                                ),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                },
+                // No watchdog (keep-alives disabled, no traffic guarantee):
+                // reads block until the server hangs up.
+                None => match read.await {
+                    Ok(chunk) => chunk,
+                    Err(detail) => {
+                        emit(
+                            &config.events,
+                            StreamEvent::Disconnected {
+                                detail: detail.to_owned(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                },
             };
             for frame in parser.push(&chunk) {
                 match frame {
