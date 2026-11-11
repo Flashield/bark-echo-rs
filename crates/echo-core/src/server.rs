@@ -28,6 +28,10 @@ pub enum ServerError {
     /// A non-200 envelope answer without a typed mapping.
     #[error("bark server answered {status}: {message}")]
     Unexpected { status: u16, message: String },
+    /// 409 `stream token already revoked` — revoking twice (§3.2,
+    /// deliberately not idempotent).
+    #[error("stream token already revoked")]
+    StreamTokenAlreadyRevoked,
 }
 
 /// A Stream Device registration (GLOSSARY.md: a Device without a Device
@@ -161,23 +165,32 @@ impl ServerClient {
             .as_array()
             .expect("list data is an array")
             .iter()
-            .map(|entry| StreamTokenSummary {
-                token_id: entry["token_id"]
-                    .as_str()
-                    .expect("token_id is a string")
-                    .to_owned(),
-                token_hint: entry["token_hint"]
-                    .as_str()
-                    .expect("token_hint is a string")
-                    .to_owned(),
-                client_label: entry["client_label"]
-                    .as_str()
-                    .expect("client_label is a string")
-                    .to_owned(),
-                revoked: entry["revoked"].as_bool().expect("revoked is a bool"),
-            })
+            .map(summary_from)
             .collect();
         Ok(summaries)
+    }
+
+    /// Revoke a Stream Token by its public `token_id` (protocol §3.2):
+    /// takes effect immediately — the secret's connect attempts fail
+    /// auth from here on.
+    pub async fn revoke_stream_token(
+        &self,
+        device_key: &str,
+        token_id: &str,
+    ) -> Result<StreamTokenSummary, ServerError> {
+        let url = format!(
+            "{}/realtime/v1/devices/{device_key}/streams/{token_id}",
+            self.base_url
+        );
+        let response = self
+            .http
+            .delete(&url)
+            .header("X-Device-Key", device_key)
+            .send()
+            .await?;
+        let envelope = Self::decode(response).await?;
+        let data = envelope.data.expect("revoke success carries data");
+        Ok(summary_from(&data))
     }
 
     /// Shared `POST /register` flow for both registration flavors.
@@ -225,6 +238,28 @@ impl ServerClient {
     /// Map a non-200 answer onto the error surface. Protocol §3.2's typed
     /// errors grow here as the faces that surface them land.
     fn map_error(status: u16, message: String) -> ServerError {
-        ServerError::Unexpected { status, message }
+        match (status, message.as_str()) {
+            (409, "stream token already revoked") => ServerError::StreamTokenAlreadyRevoked,
+            _ => ServerError::Unexpected { status, message },
+        }
+    }
+}
+
+/// Parse one list/revoke `data` entry into a [`StreamTokenSummary`].
+fn summary_from(entry: &serde_json::Value) -> StreamTokenSummary {
+    StreamTokenSummary {
+        token_id: entry["token_id"]
+            .as_str()
+            .expect("token_id is a string")
+            .to_owned(),
+        token_hint: entry["token_hint"]
+            .as_str()
+            .expect("token_hint is a string")
+            .to_owned(),
+        client_label: entry["client_label"]
+            .as_str()
+            .expect("client_label is a string")
+            .to_owned(),
+        revoked: entry["revoked"].as_bool().expect("revoked is a bool"),
     }
 }

@@ -3,7 +3,19 @@
 
 mod common;
 
-use echo_core::server::ServerClient;
+use echo_core::server::{ServerClient, ServerError};
+
+/// A stream connect attempt with a Stream Token secret (§3.3): the
+/// status alone — reading the stream itself is a later ticket's client.
+async fn stream_connect_status(server: &common::TestServer, secret: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{}/realtime/v1/stream", server.base_url))
+        .header("X-Stream-Token", secret)
+        .send()
+        .await
+        .expect("connect attempt")
+        .status()
+}
 
 #[tokio::test]
 async fn registering_a_stream_device_returns_a_fresh_device_key() {
@@ -101,6 +113,49 @@ async fn listing_stream_tokens_returns_creation_order_summaries_with_hints() {
     assert_eq!(tokens[1].client_label, "android-phone");
     assert_eq!(tokens[1].token_hint, second.token_hint);
     assert!(!tokens[0].revoked, "freshly minted token is live");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoking_a_stream_token_kills_connects_and_double_revoke_answers_409() {
+    let server = common::TestServer::spawn().await;
+    let client = ServerClient::new(&server.base_url);
+    let device = client.register_stream_device().await.expect("register");
+    let minted = client
+        .mint_stream_token(&device.device_key, "macbook-reminder")
+        .await
+        .expect("mint");
+
+    // The live secret may hold a Realtime Stream (protocol §3.3).
+    assert_eq!(
+        stream_connect_status(&server, &minted.secret).await,
+        reqwest::StatusCode::OK
+    );
+
+    let revoked = client
+        .revoke_stream_token(&device.device_key, &minted.token_id)
+        .await
+        .expect("revoke");
+    assert!(revoked.revoked, "revocation takes effect immediately");
+    assert_eq!(revoked.token_id, minted.token_id);
+    assert_eq!(revoked.token_hint, minted.token_hint);
+
+    // The same secret's subsequent connect attempts fail auth (§3.2).
+    assert_eq!(
+        stream_connect_status(&server, &minted.secret).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    // Revoking an already-revoked token is refused with 409 (§3.2).
+    let err = client
+        .revoke_stream_token(&device.device_key, &minted.token_id)
+        .await
+        .expect_err("double revoke must fail");
+    assert!(
+        matches!(err, ServerError::StreamTokenAlreadyRevoked),
+        "wrong error: {err}"
+    );
 
     server.shutdown().await;
 }
