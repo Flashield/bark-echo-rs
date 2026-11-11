@@ -8,82 +8,28 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use tokio::process::Command;
-
-/// One CLI run's observable surface.
-struct Run {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-/// A hermetic run environment: a temp `HOME` (config and plain secrets
-/// land nowhere else) and the daemon subprocess inside it.
-struct Harness {
-    home: tempfile::TempDir,
-}
-
-impl Harness {
-    fn new() -> Self {
-        Harness {
-            home: tempfile::tempdir().expect("temp home"),
-        }
-    }
-
-    #[cfg(unix)]
-    fn spawn(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
-        command
-            .args(args)
-            .env("HOME", self.home.path())
-            .env("XDG_CONFIG_HOME", self.home.path().join(".config"));
-        command
-    }
-
-    #[cfg(windows)]
-    fn spawn(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
-        command.env("APPDATA", self.home.path().join("AppData/Roaming"));
-        command
-    }
-
-    async fn run(&self, args: &[&str]) -> Run {
-        let output = self.spawn(args).output().await.expect("spawn echo-daemon");
-        Run {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
-    }
-
-    /// Add one Subscription to this machine (`--own`), asserting it took
-    /// and returning the Device Key (the push target `add` prints).
-    async fn subscribe_own(&self, server: &str) -> String {
-        let output = self
-            .run(&[
-                "--plain-secrets",
-                "subscribe",
-                "add",
-                "--server",
-                server,
-                "--own",
-                "--label",
-                "status-test",
-            ])
-            .await;
-        assert!(
-            output.success,
-            "subscribe add must exit 0: {} {}",
-            output.stderr, output.stdout
-        );
-        output
-            .stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("device key: "))
-            .expect("the device key is printed first")
-            .trim()
-            .to_owned()
-    }
+/// Add one Subscription to this machine (`--own`), asserting it took and
+/// returning the Device Key (the push target `add` prints).
+async fn subscribe_own(harness: &common::Harness, server: &str) -> String {
+    let output = harness
+        .run(&[
+            "--plain-secrets",
+            "subscribe",
+            "add",
+            "--server",
+            server,
+            "--own",
+            "--label",
+            "status-test",
+        ])
+        .await;
+    let stdout = output.stdout_or_die("subscribe add");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("device key: "))
+        .expect("the device key is printed first")
+        .trim()
+        .to_owned()
 }
 
 /// Push one V2 JSON Push carrying `body` to `device_key`.
@@ -103,7 +49,7 @@ async fn push(server: &common::TestServer, device_key: &str, body: &str) {
 }
 
 /// Poll `status` until `needle` shows up in its stdout.
-async fn wait_for_status(harness: &Harness, needle: &str) -> String {
+async fn wait_for_status(harness: &common::Harness, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let output = harness.run(&["status"]).await;
@@ -127,8 +73,8 @@ async fn wait_for_status(harness: &Harness, needle: &str) -> String {
 #[tokio::test]
 async fn status_without_a_daemon_reports_not_running_with_the_server_stats() {
     let server = common::TestServer::spawn().await;
-    let harness = Harness::new();
-    let device_key = harness.subscribe_own(&server.base_url).await;
+    let harness = common::Harness::new();
+    let device_key = subscribe_own(&harness, &server.base_url).await;
 
     // Pushes with no daemon connected are retained for replay (§3.7) —
     // exactly what the pending count must show.
@@ -168,8 +114,8 @@ async fn status_without_a_daemon_reports_not_running_with_the_server_stats() {
 #[tokio::test]
 async fn status_follows_a_running_daemons_stream_state_and_shuts_down_clean() {
     let server = common::TestServer::spawn().await;
-    let harness = Harness::new();
-    let device_key = harness.subscribe_own(&server.base_url).await;
+    let harness = common::Harness::new();
+    let device_key = subscribe_own(&harness, &server.base_url).await;
 
     // The daemon runs as a real subprocess: it must connect on its own.
     let mut daemon = harness

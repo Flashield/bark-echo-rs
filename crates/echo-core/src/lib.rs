@@ -5,6 +5,7 @@
 
 pub mod history;
 pub mod intent;
+pub mod pull;
 pub mod push;
 pub mod server;
 pub mod stream;

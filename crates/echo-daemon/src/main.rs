@@ -7,10 +7,12 @@
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use echo_core::pull::PullConfig;
 use echo_core::push::{Push, PushClient};
 use echo_core::server::ServerClient;
 
 use echo_daemon::config::Config;
+use echo_daemon::history;
 use echo_daemon::notify::DesktopRenderer;
 use echo_daemon::paths::Paths;
 use echo_daemon::run::{self, DaemonSpec};
@@ -46,6 +48,34 @@ enum Command {
         /// route (protocol §2.2).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Recover Messages missed while offline: one-shot replay from the
+    /// server's store-and-forward store, landed silently in the
+    /// Subscription's History Log (GLOSSARY: Pull) — no notifications.
+    Pull {
+        /// The Subscription's label; omitted when exactly one Subscription
+        /// is held.
+        #[arg(long)]
+        sub: Option<String>,
+        /// The replay cursor: 0 replays everything the server still
+        /// retains (protocol §3.5); ids the History Log already holds are
+        /// suppressed by dedup.
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+    },
+    /// Read a Subscription's History Log back for auditing (GLOSSARY).
+    Log {
+        /// The Subscription's label; omitted when exactly one Subscription
+        /// is held.
+        #[arg(long)]
+        sub: Option<String>,
+        /// Keep streaming new lines as they land — visible live while the
+        /// daemon runs. Stops on Ctrl-C.
+        #[arg(long)]
+        follow: bool,
+        /// Print only the last N entries instead of the whole log.
+        #[arg(long)]
+        tail: Option<usize>,
     },
     /// Manage this machine's Subscriptions.
     Subscribe {
@@ -121,6 +151,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Push { args } => run_push(&args).await?,
+        Command::Pull { sub, cursor } => {
+            run_pull(&paths, &config, store.as_ref(), sub.as_deref(), cursor).await?
+        }
+        Command::Log { sub, follow, tail } => {
+            run_log(&paths, &config, sub.as_deref(), follow, tail).await?
+        }
         Command::Subscribe { command } => match command {
             SubscribeCommand::Add {
                 server,
@@ -186,6 +222,60 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status => {
             let report = status::report(&paths, &config).await?;
             print!("{}", report.render());
+        }
+    }
+    Ok(())
+}
+
+/// The `pull` subcommand: one-shot replay of the Subscription's retained
+/// Messages into its History Log (GLOSSARY: Pull) — silent, no intents,
+/// no notifications — reporting the ingested count. The Stream Token comes
+/// from the secret store; the per-server Basic Auth credentials (§1.4)
+/// ride along when the config carries them.
+async fn run_pull(
+    paths: &Paths,
+    config: &Config,
+    store: &dyn SecretStore,
+    label: Option<&str>,
+    cursor: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = history::resolve_subscription(config, label)?;
+    let token = history::stream_token(store, &subscription)?;
+    let mut pull_config = PullConfig::new(
+        subscription.server.clone(),
+        token,
+        history::history_log(paths, &subscription),
+    );
+    pull_config.cursor = cursor as i64;
+    pull_config.basic_auth = history::basic_auth(config, &subscription);
+    let report = echo_core::pull::pull(pull_config).await?;
+    println!("pulled {} messages", report.ingested);
+    Ok(())
+}
+
+/// The `log` subcommand: read the Subscription's History Log back
+/// (GLOSSARY), newest last; `--tail N` prints only the last N entries and
+/// `--follow` keeps streaming new lines as they land (the daemon's live
+/// appends and pulled Messages alike).
+async fn run_log(
+    paths: &Paths,
+    config: &Config,
+    label: Option<&str>,
+    follow: bool,
+    tail: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = history::resolve_subscription(config, label)?;
+    let log = history::history_log(paths, &subscription);
+    let entries = log.entries()?;
+    let start = entries.len().saturating_sub(tail.unwrap_or(entries.len()));
+    for entry in &entries[start..] {
+        println!("{}", history::format_entry(entry));
+    }
+    if follow {
+        let mut seen = entries.len();
+        loop {
+            seen = history::print_new_entries(&log, seen)?;
+            tokio::time::sleep(history::FOLLOW_POLL).await;
         }
     }
     Ok(())

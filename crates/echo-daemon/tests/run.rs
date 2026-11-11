@@ -195,9 +195,7 @@ async fn pushed_messages_render_through_the_injected_renderer_and_reach_the_hist
 
     // The History Log holds one line per processed Push — evidence the
     // notification reached the desktop (GLOSSARY).
-    let log = echo_core::history::HistoryLog::new(
-        env.paths.history_dir().join(format!("{token_id}.jsonl")),
-    );
+    let log = echo_core::history::HistoryLog::new(env.paths.history_log(&token_id));
     let entries = log.entries().expect("history entries");
     assert_eq!(
         entries
@@ -308,9 +306,7 @@ async fn the_daemon_rides_out_a_server_restart() {
         &echo_daemon::state::StreamState::Running,
     )
     .await;
-    let log = echo_core::history::HistoryLog::new(
-        env.paths.history_dir().join(format!("{token_id}.jsonl")),
-    );
+    let log = echo_core::history::HistoryLog::new(env.paths.history_log(&token_id));
     assert_eq!(
         log.entries()
             .expect("history entries")

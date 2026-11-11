@@ -16,6 +16,11 @@
 //! - Events other than `message` are ignored until known.
 //! - An auth rejection (401/418) is terminal: the credential will not heal
 //!   by retrying, so the loop stops instead of spin-retrying.
+//!
+//! The connection, parsing, and dedup machinery below is shared with the
+//! one-shot Pull ([`crate::pull`]) — the same SSE client with notification
+//! output off (spec: Pull lands replayed Messages silently in the History
+//! Log).
 
 use std::time::Duration;
 
@@ -25,6 +30,63 @@ use tokio::sync::mpsc;
 
 use crate::history::HistoryLog;
 use crate::intent::NotificationIntent;
+
+/// The Realtime Stream's URL for one server base (`GET /realtime/v1/stream`,
+/// protocol §3.3). Shared by the receive loop and the one-shot
+/// [`crate::pull`] — the same SSE client face.
+pub(crate) fn stream_url(base_url: &str) -> String {
+    format!("{}/realtime/v1/stream", base_url.trim_end_matches('/'))
+}
+
+/// Why opening one stream connection failed: a transport problem, a
+/// credential rejection (§3.3: 401/418 — retrying cannot heal a bad
+/// credential), or another non-success status for the caller to classify.
+pub(crate) enum ConnectFailure {
+    /// The request never completed (connection refused, DNS, timeout).
+    Transport(reqwest::Error),
+    /// The server rejected the credentials (401/418).
+    AuthRejected { status: u16, message: String },
+    /// Any other non-success status.
+    Unexpected { status: u16, message: String },
+}
+
+/// Open one Realtime Stream connection: `X-Stream-Token` authorizes the
+/// read (§3.3), operator Basic Auth rides along when given (§1.4), and a
+/// presented replay cursor rides as `Last-Event-ID` (§3.5) — `Some(0)`
+/// replays everything retained, `None` opens a fresh stream. Shared by the
+/// receive loop and the one-shot [`crate::pull`]: replayed and live events
+/// are indistinguishable on the wire (§3.4), so both read the same way.
+pub(crate) async fn connect_stream(
+    http: &reqwest::Client,
+    url: &str,
+    stream_token: &str,
+    basic_auth: Option<&BasicAuth>,
+    cursor: Option<i64>,
+) -> Result<reqwest::Response, ConnectFailure> {
+    let mut request = http.get(url).header("X-Stream-Token", stream_token);
+    if let Some(auth) = basic_auth {
+        request = request.basic_auth(&auth.user, Some(&auth.password));
+    }
+    if let Some(cursor) = cursor {
+        request = request.header("Last-Event-ID", cursor.to_string());
+    }
+    let response = request.send().await.map_err(ConnectFailure::Transport)?;
+    let status = response.status().as_u16();
+    if status == 401 || status == 418 {
+        // A rejection never becomes a token-validity oracle (§3.3).
+        return Err(ConnectFailure::AuthRejected {
+            status,
+            message: response.text().await.unwrap_or_default(),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(ConnectFailure::Unexpected {
+            status,
+            message: response.text().await.unwrap_or_default(),
+        });
+    }
+    Ok(response)
+}
 
 /// One Subscription's read credentials for the receive loop.
 #[derive(Debug, Clone)]
@@ -144,10 +206,7 @@ impl RealtimeStream {
 
 /// The receive loop proper.
 async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) -> StreamEnd {
-    let url = format!(
-        "{}/realtime/v1/stream",
-        config.base_url.trim_end_matches('/')
-    );
+    let url = stream_url(&config.base_url);
     let http = reqwest::Client::new();
     // Consecutive failed attempts since the last completed handshake.
     let mut attempt: u32 = 0;
@@ -165,20 +224,21 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
             .unwrap_or(0)
             .max(processed);
 
-        let mut request = http
-            .get(&url)
-            .header("X-Stream-Token", &config.stream_token);
-        if let Some(auth) = &config.basic_auth {
-            request = request.basic_auth(&auth.user, Some(&auth.password));
-        }
-        if cursor > 0 {
-            request = request.header("Last-Event-ID", cursor.to_string());
-        }
-
-        let mut response = match request.send().await {
+        // A cursor of 0 means "nothing processed yet": a fresh stream, no
+        // replay header — the daemon's first connect must not storm the
+        // user with the server's whole retained backlog as notifications.
+        let mut response = match connect_stream(
+            &http,
+            &url,
+            &config.stream_token,
+            config.basic_auth.as_ref(),
+            (cursor > 0).then_some(cursor),
+        )
+        .await
+        {
             Ok(response) => response,
             // Transport failure: surface it, retry after backoff.
-            Err(err) => {
+            Err(ConnectFailure::Transport(err)) => {
                 emit(
                     &config.events,
                     StreamEvent::Disconnected {
@@ -190,33 +250,32 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
                 attempt += 1;
                 continue;
             }
-        };
-        let status = response.status().as_u16();
-        if status == 401 || status == 418 {
-            // A rejection never becomes a token-validity oracle (§3.3) and
-            // never heals by retrying: stop and surface it. The envelope's
-            // message (§1.1) decides the classification — `stream token
-            // invalid` is the re-subscribe case (§5, spec story 21);
-            // everything else stays a generic rejection.
-            let body = response.text().await.unwrap_or_default();
-            let message = envelope_message(&body).unwrap_or(body);
-            if message == "stream token invalid" {
-                return StreamEnd::TokenInvalid;
+            // A rejection never heals by retrying: stop and surface it.
+            // The envelope's message (§1.1) decides the classification —
+            // `stream token invalid` is the re-subscribe case (§5, spec
+            // story 21); everything else stays a generic rejection.
+            Err(ConnectFailure::AuthRejected { status, message }) => {
+                let message = envelope_message(&message).unwrap_or(message);
+                if message == "stream token invalid" {
+                    return StreamEnd::TokenInvalid;
+                }
+                return StreamEnd::AuthRejected { status, message };
             }
-            return StreamEnd::AuthRejected { status, message };
-        }
-        if !response.status().is_success() {
-            emit(
-                &config.events,
-                StreamEvent::Disconnected {
-                    detail: format!("server answered {status}"),
-                },
-            )
-            .await;
-            sleep_backoff(&config.backoff, attempt).await;
-            attempt += 1;
-            continue;
-        }
+            // Any other non-success status: surface it, retry after
+            // backoff.
+            Err(ConnectFailure::Unexpected { status, .. }) => {
+                emit(
+                    &config.events,
+                    StreamEvent::Disconnected {
+                        detail: format!("server answered {status}"),
+                    },
+                )
+                .await;
+                sleep_backoff(&config.backoff, attempt).await;
+                attempt += 1;
+                continue;
+            }
+        };
 
         // Read the body: handshake comment, then replay and live events —
         // indistinguishable on the wire (§3.4).
@@ -317,8 +376,9 @@ fn envelope_message(body: &str) -> Option<String> {
 }
 
 /// One SSE frame off the wire: a comment, or an event with its fields.
+// Shared with the one-shot Pull's read loop (crate::pull).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Frame {
+pub(crate) enum Frame {
     /// A `:`-prefixed line (handshake, keep-alive): never an event.
     Comment(String),
     /// An event frame: `event`, `id`, `data` fields (any may be absent).
@@ -331,8 +391,9 @@ enum Frame {
 
 /// Incremental SSE byte-stream parser: feed chunks, get complete frames.
 /// Tolerant of `\n` and `\r\n` line endings (SSE spec).
+// Shared with the one-shot Pull's read loop (crate::pull).
 #[derive(Debug, Default)]
-struct SseParser {
+pub(crate) struct SseParser {
     buffer: Vec<u8>,
     event: Option<String>,
     id: Option<i64>,
@@ -342,7 +403,7 @@ struct SseParser {
 
 impl SseParser {
     /// Feed one body chunk; return every frame it completed.
-    fn push(&mut self, chunk: &[u8]) -> Vec<Frame> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<Frame> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
         while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
@@ -404,7 +465,7 @@ impl SseParser {
 /// The `data:` JSON of a push event, exactly as the server writes it
 /// (protocol §3.4).
 #[derive(Debug, Deserialize)]
-struct PushEventWire {
+pub(crate) struct PushEventWire {
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -421,7 +482,7 @@ impl PushEventWire {
     /// spec'd at the core seam): alert text plus the click action from Ext
     /// Params — `url` wins, `copy` applies only without `url`, a
     /// `ciphertext` push renders the encrypted placeholder.
-    fn into_intent(self, id: i64) -> NotificationIntent {
+    pub(crate) fn into_intent(self, id: i64) -> NotificationIntent {
         NotificationIntent::from_push_fields(
             id,
             self.title,

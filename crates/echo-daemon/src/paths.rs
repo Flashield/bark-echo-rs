@@ -90,9 +90,16 @@ impl Paths {
     }
 
     /// The History Log directory (GLOSSARY): one append-only JSONL file
-    /// per Subscription, named by the Subscription's id.
+    /// per Subscription, named by the Subscription's id. One file for
+    /// every writer — the daemon's receive loop appends live, `pull`
+    /// backfills into it, `log` reads it back.
     pub fn history_dir(&self) -> PathBuf {
         self.config_dir.join("history")
+    }
+
+    /// One Subscription's History Log path inside [`Paths::history_dir`].
+    pub fn history_log(&self, subscription_id: &str) -> PathBuf {
+        self.history_dir().join(format!("{subscription_id}.jsonl"))
     }
 
     #[cfg(unix)]

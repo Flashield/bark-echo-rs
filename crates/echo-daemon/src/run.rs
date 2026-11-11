@@ -139,11 +139,7 @@ pub async fn run(
             base_url: subscription.server.clone(),
             stream_token: secret,
             basic_auth: spec.config.basic_auth(&subscription.server),
-            history_log: HistoryLog::new(
-                spec.paths
-                    .history_dir()
-                    .join(format!("{}.jsonl", subscription.id)),
-            ),
+            history_log: HistoryLog::new(spec.paths.history_log(&subscription.id)),
             backoff: Default::default(),
             events: Some(events_tx),
         };
