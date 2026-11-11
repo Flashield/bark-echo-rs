@@ -83,6 +83,18 @@ impl Paths {
         self.config_dir.join("daemon.lock")
     }
 
+    /// The runtime state file (ADR-0002 MVP): what `status` reads while
+    /// the daemon runs.
+    pub fn state_file(&self) -> PathBuf {
+        self.config_dir.join("daemon-state.json")
+    }
+
+    /// The History Log directory (GLOSSARY): one append-only JSONL file
+    /// per Subscription, named by the Subscription's id.
+    pub fn history_dir(&self) -> PathBuf {
+        self.config_dir.join("history")
+    }
+
     #[cfg(unix)]
     fn from_unix_roots(home: Option<&Path>, xdg: Option<&Path>) -> Result<PathBuf, PathsError> {
         #[cfg(target_os = "macos")]

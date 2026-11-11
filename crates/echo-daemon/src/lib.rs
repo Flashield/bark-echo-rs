@@ -6,6 +6,7 @@ pub mod config;
 pub mod lock;
 pub mod notify;
 pub mod paths;
+pub mod run;
 pub mod secrets;
 pub mod state;
 pub mod subscribe;
