@@ -28,7 +28,7 @@ fn a_second_acquire_is_refused_while_the_first_holds_the_lock() {
                 "the message says another instance holds it: {message}"
             );
             assert!(
-                message.contains(&path.to_string_lossy().as_ref()),
+                message.contains(path.to_string_lossy().as_ref()),
                 "the message names where: {message}"
             );
         }

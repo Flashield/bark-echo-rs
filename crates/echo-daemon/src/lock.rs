@@ -56,6 +56,9 @@ impl DaemonLock {
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            // Never truncate on open: the file may belong to a live
+            // holder; content is replaced only after the lock is ours.
+            .truncate(false)
             .write(true)
             .open(&path)
             .map_err(|source| LockError::Io {

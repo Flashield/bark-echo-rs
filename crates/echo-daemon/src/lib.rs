@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod lock;
+pub mod notify;
 pub mod paths;
 pub mod secrets;
 pub mod state;
