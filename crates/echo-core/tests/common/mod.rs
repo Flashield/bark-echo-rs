@@ -23,14 +23,32 @@ impl TestServer {
     /// Bind a random port, start the server on the listener's runtime
     /// task, and wait until `/ping` answers.
     pub async fn spawn() -> Self {
+        Self::spawn_configuring(|_| {}).await
+    }
+
+    /// [`TestServer::spawn`] with operator Basic Auth enabled (protocol
+    /// §1.4): every path except `/ping`, `/register` and `/healthz`
+    /// demands the credentials.
+    pub async fn spawn_with_basic_auth(user: &str, password: &str) -> Self {
+        Self::spawn_configuring(|config| {
+            config.basic_auth_user = user.to_string();
+            config.basic_auth_password = password.to_string();
+        })
+        .await
+    }
+
+    /// [`TestServer::spawn`] with per-test `Config` overrides applied on
+    /// top of the ephemeral-port, temp-data-dir defaults.
+    pub async fn spawn_configuring(configure: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().expect("temp data dir");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
-        let config = Config {
+        let mut config = Config {
             addr: addr.to_string(),
             data_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
+        configure(&mut config);
         let base_url = format!("http://{addr}");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(bark_server_rs::run_server_on_listener(

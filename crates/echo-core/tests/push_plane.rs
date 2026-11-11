@@ -109,3 +109,49 @@ async fn pushing_to_an_unknown_device_key_reports_the_server_message_and_code() 
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn basic_auth_credentials_are_sent_and_the_push_is_accepted() {
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    // /register is Basic-Auth-exempt (protocol §1.4), so setup needs no
+    // credentials; /push is not.
+    let device = ServerClient::new(&server.base_url)
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+
+    PushClient::new(&server.base_url)
+        .with_basic_auth("operator", "hunter2")
+        .send(&Push::to(&device.device_key).body("behind auth"))
+        .await
+        .expect("push accepted with credentials");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_or_wrong_basic_auth_credentials_answer_teapot() {
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    let device = ServerClient::new(&server.base_url)
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+    let push = Push::to(&device.device_key).body("behind auth");
+
+    // No credentials at all.
+    let err = PushClient::new(&server.base_url)
+        .send(&push)
+        .await
+        .expect_err("missing credentials must fail");
+    assert!(matches!(err, PushError::Teapot), "wrong error: {err}");
+
+    // Right user, wrong password.
+    let err = PushClient::new(&server.base_url)
+        .with_basic_auth("operator", "wrong-password")
+        .send(&push)
+        .await
+        .expect_err("wrong credentials must fail");
+    assert!(matches!(err, PushError::Teapot), "wrong error: {err}");
+
+    server.shutdown().await;
+}
