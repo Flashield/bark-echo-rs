@@ -74,10 +74,7 @@ pub async fn add(
     let minted = client.mint_stream_token(&device_key, label).await?;
 
     let server = client.base_url().to_owned();
-    let key = SecretKey {
-        server: server.clone(),
-        token_id: minted.token_id.clone(),
-    };
+    let key = SecretKey::for_subscription(server.clone(), minted.token_id.clone());
     store.set(&key, SecretKind::DeviceKey, &device_key)?;
     store.set(&key, SecretKind::StreamToken, &minted.secret)?;
     // The operator credentials ride in once here and every later
@@ -119,10 +116,7 @@ pub fn remove(
         .ok_or_else(|| SubscribeError::UnknownSubscription(id.to_owned()))?;
     let subscription = config.subscriptions.remove(position);
 
-    let key = SecretKey {
-        server: subscription.server.clone(),
-        token_id: subscription.id.clone(),
-    };
+    let key = SecretKey::for_subscription(&subscription.server, &subscription.id);
     store.delete(&key, SecretKind::DeviceKey)?;
     store.delete(&key, SecretKind::StreamToken)?;
     Ok(subscription)

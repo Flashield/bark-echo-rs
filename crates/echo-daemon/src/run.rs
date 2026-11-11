@@ -113,10 +113,7 @@ pub async fn run(
         fences.push(fence_tx);
 
         let secret = match spec.store.get(
-            &SecretKey {
-                server: subscription.server.clone(),
-                token_id: subscription.id.clone(),
-            },
+            &SecretKey::for_subscription(&subscription.server, &subscription.id),
             SecretKind::StreamToken,
         ) {
             Ok(secret) => secret,

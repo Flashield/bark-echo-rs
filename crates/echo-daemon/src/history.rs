@@ -66,10 +66,7 @@ pub fn stream_token(
     store: &dyn SecretStore,
     subscription: &Subscription,
 ) -> Result<String, HistoryError> {
-    let key = SecretKey {
-        server: subscription.server.clone(),
-        token_id: subscription.id.clone(),
-    };
+    let key = SecretKey::for_subscription(&subscription.server, &subscription.id);
     Ok(store.get(&key, SecretKind::StreamToken)?)
 }
 
