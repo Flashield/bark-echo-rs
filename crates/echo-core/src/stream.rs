@@ -113,12 +113,7 @@ pub struct RealtimeStream;
 impl RealtimeStream {
     /// Start the loop. Returns the handle plus the channel every processed
     /// Push's [`NotificationIntent`] surfaces on, in delivery order.
-    pub fn spawn(
-        config: StreamConfig,
-    ) -> (
-        StreamHandle,
-        mpsc::Receiver<NotificationIntent>,
-    ) {
+    pub fn spawn(config: StreamConfig) -> (StreamHandle, mpsc::Receiver<NotificationIntent>) {
         let (tx, rx) = mpsc::channel(256);
         let task = tokio::spawn(run(config, tx));
         (StreamHandle { task }, rx)
@@ -127,7 +122,10 @@ impl RealtimeStream {
 
 /// The receive loop proper.
 async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) -> StreamEnd {
-    let url = format!("{}/realtime/v1/stream", config.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/realtime/v1/stream",
+        config.base_url.trim_end_matches('/')
+    );
     let http = reqwest::Client::new();
     // Consecutive failed attempts since the last completed handshake.
     let mut attempt: u32 = 0;
@@ -170,10 +168,7 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
             // never heals by retrying: stop and surface it.
             return StreamEnd::AuthRejected {
                 status,
-                message: response
-                    .text()
-                    .await
-                    .unwrap_or_default(),
+                message: response.text().await.unwrap_or_default(),
             };
         }
         if !response.status().is_success() {

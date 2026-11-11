@@ -22,7 +22,11 @@ fn fast_backoff() -> BackoffConfig {
 
 /// A stream config for one Subscription assembled from its pieces: the
 /// server URL, the Stream Token secret, and the History Log path.
-fn stream_config(base_url: &str, stream_token: &str, history_path: &std::path::Path) -> StreamConfig {
+fn stream_config(
+    base_url: &str,
+    stream_token: &str,
+    history_path: &std::path::Path,
+) -> StreamConfig {
     StreamConfig {
         base_url: base_url.to_owned(),
         stream_token: stream_token.to_owned(),
@@ -44,7 +48,11 @@ fn config_for(harness: &common::Subscribed) -> StreamConfig {
 /// A stream config pointing at a hand-rolled wire with a fresh History Log.
 fn config_for_wire(base_url: &str, dir: &tempfile::TempDir) -> StreamConfig {
     // The wire double ignores request headers; any token shape works.
-    stream_config(base_url, "st_wire-double", &dir.path().join("history.jsonl"))
+    stream_config(
+        base_url,
+        "st_wire-double",
+        &dir.path().join("history.jsonl"),
+    )
 }
 
 /// One `event: message` frame's `data:` payload for the wire doubles: the
@@ -92,7 +100,9 @@ async fn scripted_sse_server(frames: Vec<(String, u64)>) -> (String, tokio::task
 }
 
 /// The next intent on the channel, within a generous test timeout.
-async fn next_intent(intents: &mut tokio::sync::mpsc::Receiver<NotificationIntent>) -> NotificationIntent {
+async fn next_intent(
+    intents: &mut tokio::sync::mpsc::Receiver<NotificationIntent>,
+) -> NotificationIntent {
     tokio::time::timeout(Duration::from_secs(5), intents.recv())
         .await
         .expect("intent within 5s")
@@ -100,13 +110,10 @@ async fn next_intent(intents: &mut tokio::sync::mpsc::Receiver<NotificationInten
 }
 
 /// Assert no further intent arrives for `ms`.
-async fn assert_no_intent(
-    intents: &mut tokio::sync::mpsc::Receiver<NotificationIntent>,
-    ms: u64,
-) {
-    match tokio::time::timeout(Duration::from_millis(ms), intents.recv()).await {
-        Ok(intent) => panic!("unexpected intent: {intent:?}"),
-        Err(_) => {}
+async fn assert_no_intent(intents: &mut tokio::sync::mpsc::Receiver<NotificationIntent>, ms: u64) {
+    if let Ok(Some(intent)) = tokio::time::timeout(Duration::from_millis(ms), intents.recv()).await
+    {
+        panic!("unexpected intent: {intent:?}");
     }
 }
 
@@ -122,13 +129,29 @@ async fn pushing_to_the_device_surfaces_the_matching_intent_in_order() {
     harness
         .push(serde_json::json!({ "title": "Flight", "subtitle": "SFO", "body": "Gate 7" }))
         .await;
-    harness.push(serde_json::json!({ "title": "Second", "body": "rows 12-14" })).await;
+    harness
+        .push(serde_json::json!({ "title": "Second", "body": "rows 12-14" }))
+        .await;
 
     let first = next_intent(&mut intents).await;
     let second = next_intent(&mut intents).await;
 
-    assert_eq!((first.title.as_str(), first.subtitle.as_str(), first.body.as_str()), ("Flight", "SFO", "Gate 7"));
-    assert_eq!((second.title.as_str(), second.subtitle.as_str(), second.body.as_str()), ("Second", "", "rows 12-14"));
+    assert_eq!(
+        (
+            first.title.as_str(),
+            first.subtitle.as_str(),
+            first.body.as_str()
+        ),
+        ("Flight", "SFO", "Gate 7")
+    );
+    assert_eq!(
+        (
+            second.title.as_str(),
+            second.subtitle.as_str(),
+            second.body.as_str()
+        ),
+        ("Second", "", "rows 12-14")
+    );
     // Per-Device monotonic ids, in push order (protocol §3.4).
     assert_eq!(first.id, 1);
     assert_eq!(second.id, 2);
@@ -161,7 +184,11 @@ async fn history_log_stays_empty_until_the_first_intent_is_emitted() {
     // Connected and idle: handshake and keep-alive territory, no intents,
     // no History Log lines.
     assert_no_intent(&mut intents, 300).await;
-    assert_eq!(log.entries().expect("entries").len(), 0, "no lines before any intent");
+    assert_eq!(
+        log.entries().expect("entries").len(),
+        0,
+        "no lines before any intent"
+    );
 
     harness.push(serde_json::json!({ "body": "one" })).await;
     let intent = next_intent(&mut intents).await;
@@ -207,7 +234,9 @@ async fn keep_alive_comments_and_the_handshake_produce_no_intents() {
     );
 
     // And the stream is still live after them: a push still surfaces.
-    harness.push(serde_json::json!({ "body": "still alive" })).await;
+    harness
+        .push(serde_json::json!({ "body": "still alive" }))
+        .await;
     let intent = next_intent(&mut intents).await;
     assert_eq!(intent.body, "still alive");
 
@@ -223,9 +252,8 @@ async fn duplicate_ids_at_or_below_the_cursor_never_emit_intents() {
     // script: events 1 and 2, then id 2 again (a duplicate at the cursor),
     // then id 1 again (below the cursor), and — only after the suppression
     // window has passed — the genuinely new id 3.
-    let frame = |id: i64, body: &str| {
-        format!("event: message\nid: {id}\ndata: {}\n\n", push_event(body))
-    };
+    let frame =
+        |id: i64, body: &str| format!("event: message\nid: {id}\ndata: {}\n\n", push_event(body));
     let frames = vec![
         (": connected\n\n".to_owned(), 50),
         (frame(1, "first"), 50),
@@ -391,7 +419,10 @@ async fn a_server_initiated_close_reconnects_and_recovers_the_gap() {
     assert_eq!((third.id, third.body.as_str()), (3, "replayed two"));
     push_to(&server, &device.device_key, "after the reconnect").await;
     let fourth = next_intent(&mut intents).await;
-    assert_eq!((fourth.id, fourth.body.as_str()), (4, "after the reconnect"));
+    assert_eq!(
+        (fourth.id, fourth.body.as_str()),
+        (4, "after the reconnect")
+    );
     assert_no_intent(&mut intents, 300).await;
 
     let log = HistoryLog::new(&history_path);
@@ -524,7 +555,12 @@ async fn spawn_basic_auth_server() -> (common::TestServer, String, String, tempf
         .as_str()
         .expect("token secret")
         .to_owned();
-    (server, device.device_key, secret, tempfile::tempdir().expect("temp dir"))
+    (
+        server,
+        device.device_key,
+        secret,
+        tempfile::tempdir().expect("temp dir"),
+    )
 }
 
 /// Push one V2 JSON Push carrying `body` — Basic Auth demands the operator
@@ -643,20 +679,29 @@ async fn ext_params_map_to_click_actions_with_url_winning_over_copy() {
 
     assert_eq!(
         with_url.click_action,
-        Some(ClickAction::OpenUrl { url: "https://example.com/boarding".to_owned() }),
+        Some(ClickAction::OpenUrl {
+            url: "https://example.com/boarding".to_owned()
+        }),
         "url → open the default browser"
     );
     assert_eq!(
         with_copy.click_action,
-        Some(ClickAction::Copy { text: "the text to copy".to_owned() }),
+        Some(ClickAction::Copy {
+            text: "the text to copy".to_owned()
+        }),
         "copy without url → clipboard"
     );
     assert_eq!(
         with_both.click_action,
-        Some(ClickAction::OpenUrl { url: "https://example.com/wins".to_owned() }),
+        Some(ClickAction::OpenUrl {
+            url: "https://example.com/wins".to_owned()
+        }),
         "url wins when both ride along"
     );
-    assert_eq!(with_neither.click_action, None, "no url, no copy → no action");
+    assert_eq!(
+        with_neither.click_action, None,
+        "no url, no copy → no action"
+    );
     // The alert text rides unchanged.
     assert_eq!(with_neither.body, "neither");
 

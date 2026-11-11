@@ -24,12 +24,20 @@ fn a_missing_or_empty_log_has_no_cursor() {
     let dir = tempfile::tempdir().expect("temp dir");
     let log = HistoryLog::new(dir.path().join("history.jsonl"));
 
-    assert_eq!(log.cursor().expect("read cursor"), None, "no file, no cursor");
+    assert_eq!(
+        log.cursor().expect("read cursor"),
+        None,
+        "no file, no cursor"
+    );
     assert_eq!(log.entries().expect("read entries").len(), 0);
 
     // An empty file is equally cursor-less.
     std::fs::write(log.path(), b"").expect("create empty log");
-    assert_eq!(log.cursor().expect("read cursor"), None, "empty file, no cursor");
+    assert_eq!(
+        log.cursor().expect("read cursor"),
+        None,
+        "empty file, no cursor"
+    );
 
     drop(dir);
 }
