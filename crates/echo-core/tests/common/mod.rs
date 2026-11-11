@@ -4,6 +4,8 @@
 //! listener itself to `run_server_on_listener`, poll `/ping` until ready,
 //! shut down via a oneshot. No Docker, no subprocess.
 
+pub mod sse;
+
 use bark_server_rs::config::Config;
 
 /// An embedded bark server bound to an ephemeral port with its own

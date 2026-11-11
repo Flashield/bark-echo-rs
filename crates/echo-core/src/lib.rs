@@ -3,4 +3,5 @@
 //! Platform I/O (keyring, notifications, config files) lives in
 //! echo-daemon, never here.
 
+pub mod push;
 pub mod server;
