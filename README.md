@@ -108,8 +108,9 @@ $ bark-echo log --follow
 | `bark-echo token revoke --server URL --device-key KEY --token-id ID [--user U --password P]` | Revoke one Stream Token by its public id; takes effect immediately |
 | `bark-echo --plain-secrets <command>` | Run with secrets in a 0600 plain file instead of the OS keyring |
 
-With several Subscriptions held, `--sub LABEL` picks one on `pull` and
-`log`. More Ext Params for `push`:
+With several Subscriptions held, `--sub LABEL` (long form
+`--subscription`) picks one on `pull` and `log`. More Ext Params for
+`push`:
 
 ```sh
 $ bark-echo push --server http://192.168.1.10:8080 \

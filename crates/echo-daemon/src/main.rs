@@ -57,7 +57,7 @@ enum Command {
     Pull {
         /// The Subscription's label; omitted when exactly one Subscription
         /// is held.
-        #[arg(long)]
+        #[arg(long, visible_alias = "subscription")]
         sub: Option<String>,
         /// The replay cursor: 0 replays everything the server still
         /// retains (protocol §3.5); ids the History Log already holds are
@@ -77,7 +77,7 @@ enum Command {
     Log {
         /// The Subscription's label; omitted when exactly one Subscription
         /// is held.
-        #[arg(long)]
+        #[arg(long, visible_alias = "subscription")]
         sub: Option<String>,
         /// Keep streaming new lines as they land — visible live while the
         /// daemon runs. Stops on Ctrl-C.
