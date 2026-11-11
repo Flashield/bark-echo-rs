@@ -216,3 +216,60 @@ fn restrict_to_owner(path: &Path) -> Result<(), SecretError> {
     let _ = path;
     Ok(())
 }
+
+/// The normal secret home (spec story 18): the OS credential store —
+/// keychain on macOS, Credential Manager on Windows, Secret Service on
+/// Linux. One keyring entry per secret, addressed
+/// `service = "echo-daemon"`, `account = "<kind>::<server>::<token_id>"`
+/// (ADR-0001: keyed by server + device).
+#[derive(Debug, Clone, Default)]
+pub struct KeyringStore {
+    service: &'static str,
+}
+
+impl KeyringStore {
+    /// A store in the OS keyring under this application's service name.
+    pub fn new() -> Self {
+        Self {
+            service: "echo-daemon",
+        }
+    }
+
+    fn entry(&self, key: &SecretKey, kind: SecretKind) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(self.service, &key.account(kind)).map_err(map_keyring_error)
+    }
+}
+
+impl SecretStore for KeyringStore {
+    fn set(&self, key: &SecretKey, kind: SecretKind, secret: &str) -> Result<(), SecretError> {
+        self.entry(key, kind)?
+            .set_password(secret)
+            .map_err(map_keyring_error)
+    }
+
+    fn get(&self, key: &SecretKey, kind: SecretKind) -> Result<String, SecretError> {
+        self.entry(key, kind)?
+            .get_password()
+            .map_err(|err| match err {
+                keyring::Error::NoEntry => SecretError::NotFound(key.account(kind)),
+                other => map_keyring_error(other),
+            })
+    }
+
+    fn delete(&self, key: &SecretKey, kind: SecretKind) -> Result<(), SecretError> {
+        self.entry(key, kind)?
+            .delete_credential()
+            .map(|_| ())
+            .or_else(|err| match err {
+                // Absent counts as deleted: rm must not strand on leftovers.
+                keyring::Error::NoEntry => Ok(()),
+                other => Err(map_keyring_error(other)),
+            })
+    }
+}
+
+/// Fold every keyring failure into the actionable surface: unreachable
+/// stores point at the `--plain-secrets` fallback (see [`SecretError::Unavailable`]).
+fn map_keyring_error(err: keyring::Error) -> SecretError {
+    SecretError::Unavailable(err.to_string())
+}
