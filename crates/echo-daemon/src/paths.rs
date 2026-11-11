@@ -77,6 +77,12 @@ impl Paths {
         self.config_dir.join("secrets.toml")
     }
 
+    /// The single-instance lock file (ADR-0002): an advisory lock the
+    /// runtime holds for its lifetime.
+    pub fn lock_file(&self) -> PathBuf {
+        self.config_dir.join("daemon.lock")
+    }
+
     #[cfg(unix)]
     fn from_unix_roots(home: Option<&Path>, xdg: Option<&Path>) -> Result<PathBuf, PathsError> {
         #[cfg(target_os = "macos")]
