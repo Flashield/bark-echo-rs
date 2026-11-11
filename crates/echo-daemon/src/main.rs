@@ -1,15 +1,83 @@
-//! echo-daemon: the desktop Realtime Client binary. An empty shell until
-//! its first functional ticket; the version flag is the whole CLI surface.
+//! echo-daemon: the desktop Realtime Client binary. Its first functional
+//! ticket is the `push` subcommand — the CLI face of echo-core's Push
+//! send module (issue #6); receiving subcommands arrive with later
+//! tickets.
+
+use echo_core::push::{Push, PushClient};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run());
+}
+
+async fn run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("echo-daemon {}", env!("CARGO_PKG_VERSION"));
         }
+        Some("push") => run_push(&args[1..]).await,
         _ => {
             eprintln!("nothing to do yet; try --version");
             std::process::exit(1);
         }
     }
+}
+
+/// The `push` subcommand: `push --server URL --device-key KEY --title …`
+/// targets any Device, mapping its flags onto the send module's Push
+/// (protocol §2.2). Failures exit non-zero.
+async fn run_push(args: &[String]) {
+    let mut server = None;
+    let mut device_key = None;
+    let mut title = None;
+    let mut subtitle = None;
+    let mut body = None;
+
+    let mut fields = args.iter();
+    while let Some(flag) = fields.next() {
+        let value = fields.next().unwrap_or_else(|| {
+            die(&format!("push: flag {flag} needs a value"));
+        });
+        match flag.as_str() {
+            "--server" => server = Some(value.clone()),
+            "--device-key" => device_key = Some(value.clone()),
+            "--title" => title = Some(value.clone()),
+            "--subtitle" => subtitle = Some(value.clone()),
+            "--body" => body = Some(value.clone()),
+            other => die(&format!("push: unknown flag {other}")),
+        }
+    }
+
+    let Some(server) = server else {
+        die("push: --server URL is required");
+    };
+    let Some(device_key) = device_key else {
+        die("push: --device-key KEY is required");
+    };
+
+    let mut push = Push::to(device_key);
+    if let Some(title) = title {
+        push = push.title(title);
+    }
+    if let Some(subtitle) = subtitle {
+        push = push.subtitle(subtitle);
+    }
+    if let Some(body) = body {
+        push = push.body(body);
+    }
+
+    PushClient::new(&server)
+        .send(&push)
+        .await
+        .expect("push accepted");
+}
+
+/// Print a usage failure and exit non-zero.
+fn die(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
 }

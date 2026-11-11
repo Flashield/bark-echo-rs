@@ -550,6 +550,15 @@ dependencies = [
 [[package]]
 name = "echo-daemon"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bark-server-rs",
+ "echo-core",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "either"
