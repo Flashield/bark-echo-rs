@@ -10,6 +10,7 @@ use std::time::Duration;
 use echo_core::history::HistoryLog;
 use echo_core::intent::{ClickAction, NotificationIntent};
 use echo_core::stream::{BackoffConfig, RealtimeStream, StreamConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Backoff fast enough for tests (the default base is a second).
 fn fast_backoff() -> BackoffConfig {
@@ -28,6 +29,62 @@ fn config_for(harness: &common::Subscribed) -> StreamConfig {
         history_log: HistoryLog::new(harness.history_path()),
         backoff: fast_backoff(),
     }
+}
+
+/// A stream config pointing at a hand-rolled wire with a fresh History Log.
+fn config_for_wire(base_url: &str, dir: &tempfile::TempDir) -> StreamConfig {
+    StreamConfig {
+        base_url: base_url.to_owned(),
+        // The wire double ignores request headers; any token shape works.
+        stream_token: "st_wire-double".to_owned(),
+        basic_auth: None,
+        history_log: HistoryLog::new(dir.path().join("history.jsonl")),
+        backoff: fast_backoff(),
+    }
+}
+
+/// One `event: message` frame's `data:` payload for the wire doubles: the
+/// push JSON the server writes (protocol §3.4), minus fields the doubles
+/// don't exercise.
+fn push_event(body: &str) -> String {
+    format!(
+        r#"{{"title":"","subtitle":"","body":"{body}","ext_params":{{}},"created_at":1760000000}}"#
+    )
+}
+
+/// A stand-in wire for misbehavior the embedded real server cannot produce
+/// on demand: the conforming server never resends an id at or below the
+/// presented `Last-Event-ID` (§3.5), so the at-least-once duplicate of §3.7
+/// exists only on a misbehaving wire. Accepts connection after connection;
+/// each is served an HTTP/1.1 response head followed by its `frames` —
+/// every frame followed by its pause in milliseconds, so a test scripts
+/// the wire's timing — and then held open until the client goes away.
+/// Abort the returned task to stop it.
+async fn scripted_sse_server(frames: Vec<(String, u64)>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind wire double");
+    let addr = listener.local_addr().expect("local addr");
+    let head =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            for (frame, pause_ms) in &frames {
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(*pause_ms)).await;
+            }
+            // Hold the connection open — the client must stay connected —
+            // draining whatever the peer sends until it hangs up.
+            let mut scratch = [0u8; 512];
+            while socket.read(&mut scratch).await.is_ok_and(|n| n > 0) {}
+        }
+    });
+    (format!("http://{addr}"), handle)
 }
 
 /// The next intent on the channel, within a generous test timeout.
@@ -153,6 +210,54 @@ async fn keep_alive_comments_and_the_handshake_produce_no_intents() {
     handle.stop().await;
     let common::Subscribed { server, .. } = harness;
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_ids_at_or_below_the_cursor_never_emit_intents() {
+    // §3.7: delivery is at-least-once, and the client owns exactly-once —
+    // a wire that resends already-processed ids must not re-notify. The
+    // script: events 1 and 2, then id 2 again (a duplicate at the cursor),
+    // then id 1 again (below the cursor), and — only after the suppression
+    // window has passed — the genuinely new id 3.
+    let frame = |id: i64, body: &str| {
+        format!("event: message\nid: {id}\ndata: {}\n\n", push_event(body))
+    };
+    let frames = vec![
+        (": connected\n\n".to_owned(), 50),
+        (frame(1, "first"), 50),
+        (frame(2, "second"), 50),
+        (frame(2, "duplicate at the cursor"), 50),
+        (frame(1, "below the cursor"), 500),
+        (frame(3, "third"), 50),
+    ];
+    let (base_url, wire) = scripted_sse_server(frames).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (handle, mut intents) = RealtimeStream::spawn(config_for_wire(&base_url, &dir));
+
+    let first = next_intent(&mut intents).await;
+    let second = next_intent(&mut intents).await;
+    assert_eq!((first.id, first.body.as_str()), (1, "first"));
+    assert_eq!((second.id, second.body.as_str()), (2, "second"));
+
+    // The resent 2 and the below-cursor 1 cross the wire (both land well
+    // inside this window) but surface nothing.
+    assert_no_intent(&mut intents, 300).await;
+
+    let third = next_intent(&mut intents).await;
+    assert_eq!((third.id, third.body.as_str()), (3, "third"));
+
+    // The cursor never went backwards: the log holds exactly one line per
+    // emitted intent, in id order.
+    let log = HistoryLog::new(dir.path().join("history.jsonl"));
+    assert_eq!(
+        log.entries().expect("history entries"),
+        vec![first, second, third],
+        "duplicates never reached the History Log either"
+    );
+    assert_eq!(log.cursor().expect("cursor"), Some(3));
+
+    handle.stop().await;
+    wire.abort();
 }
 
 #[tokio::test]
