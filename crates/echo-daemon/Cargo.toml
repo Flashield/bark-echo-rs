@@ -12,6 +12,7 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 keyring = { workspace = true }
 tokio = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 # The one test seam (spec Testing Decisions): the real server, embedded
