@@ -145,10 +145,22 @@ impl Subscribed {
 /// Streams (protocol §2.3) — the external observation that a client's
 /// stream connection is established before a test pushes.
 pub async fn wait_active_streams(server: &TestServer, n: u64) {
+    wait_active_streams_with(server, n, None).await
+}
+
+/// [`wait_active_streams`] with operator Basic Auth credentials riding on
+/// `/info` — behind Basic Auth every observation needs them (§1.4).
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
+pub async fn wait_active_streams_with(server: &TestServer, n: u64, auth: Option<(&str, &str)>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let info: serde_json::Value = reqwest::Client::new()
-            .get(format!("{}/info", server.base_url))
+        let mut request = reqwest::Client::new().get(format!("{}/info", server.base_url));
+        if let Some((user, password)) = auth {
+            request = request.basic_auth(user, Some(password));
+        }
+        let info: serde_json::Value = request
             .send()
             .await
             .expect("GET /info")

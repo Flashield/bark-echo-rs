@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use echo_core::history::HistoryLog;
 use echo_core::intent::{ClickAction, NotificationIntent};
-use echo_core::stream::{BackoffConfig, RealtimeStream, StreamConfig};
+use echo_core::stream::{BackoffConfig, BasicAuth, RealtimeStream, StreamConfig, StreamEnd};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Backoff fast enough for tests (the default base is a second).
@@ -485,6 +485,134 @@ async fn reconnect_backoff_grows_and_jitters() {
 
     handle.stop().await;
     wire.abort();
+}
+
+/// The operator credentials a Basic Auth server demands (protocol §1.4).
+const OPERATOR_USER: &str = "operator";
+const OPERATOR_PASSWORD: &str = "s3cret";
+
+/// A server with operator Basic Auth on, plus a registered Stream Device's
+/// Device Key and its minted Stream Token secret. `/register` is exempt
+/// from Basic Auth (§1.4); minting is not, so the mint goes over raw HTTP
+/// with the operator credentials — exactly what the daemon would send.
+async fn spawn_basic_auth_server() -> (common::TestServer, String, String, tempfile::TempDir) {
+    let server = common::TestServer::spawn_with(|config| {
+        config.basic_auth_user = OPERATOR_USER.to_owned();
+        config.basic_auth_password = OPERATOR_PASSWORD.to_owned();
+    })
+    .await;
+    let client = echo_core::server::ServerClient::new(&server.base_url);
+    let device = client.register_stream_device().await.expect("register");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/realtime/v1/devices/{}/streams",
+            server.base_url, device.device_key
+        ))
+        .header("X-Device-Key", &device.device_key)
+        .basic_auth(OPERATOR_USER, Some(OPERATOR_PASSWORD))
+        .json(&serde_json::json!({ "client_label": "echo-test-client" }))
+        .send()
+        .await
+        .expect("mint request");
+    let status = response.status();
+    let envelope: serde_json::Value = response.json().await.expect("mint envelope");
+    assert!(
+        status.is_success() && envelope["code"] == 200,
+        "mint failed: {status} {envelope}"
+    );
+    let secret = envelope["data"]["token"]
+        .as_str()
+        .expect("token secret")
+        .to_owned();
+    (server, device.device_key, secret, tempfile::tempdir().expect("temp dir"))
+}
+
+/// Push one V2 JSON Push carrying `body` — Basic Auth demands the operator
+/// credentials on `/push` too (§1.4).
+async fn push_with_basic_auth(server: &common::TestServer, device_key: &str, body: &str) {
+    let response = reqwest::Client::new()
+        .post(format!("{}/push", server.base_url))
+        .basic_auth(OPERATOR_USER, Some(OPERATOR_PASSWORD))
+        .json(&serde_json::json!({ "device_key": device_key, "body": body }))
+        .send()
+        .await
+        .expect("POST /push");
+    let status = response.status();
+    let envelope: serde_json::Value = response.json().await.expect("push envelope");
+    assert!(
+        status.is_success() && envelope["code"] == 200,
+        "push failed: {status} {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn basic_auth_credentials_ride_alongside_the_stream_token() {
+    // Behind operator Basic Auth, the stream connect must present the
+    // Authorization header alongside X-Stream-Token (§1.4).
+    let (server, device_key, secret, dir) = spawn_basic_auth_server().await;
+    let config = StreamConfig {
+        base_url: server.base_url.clone(),
+        stream_token: secret,
+        basic_auth: Some(BasicAuth {
+            user: OPERATOR_USER.to_owned(),
+            password: OPERATOR_PASSWORD.to_owned(),
+        }),
+        history_log: HistoryLog::new(dir.path().join("history.jsonl")),
+        backoff: fast_backoff(),
+    };
+    let (handle, mut intents) = RealtimeStream::spawn(config);
+    common::wait_active_streams_with(&server, 1, Some((OPERATOR_USER, OPERATOR_PASSWORD))).await;
+
+    push_with_basic_auth(&server, &device_key, "behind Basic Auth").await;
+    let intent = next_intent(&mut intents).await;
+    assert_eq!((intent.id, intent.body.as_str()), (1, "behind Basic Auth"));
+    // Basic Auth changed nothing downstream: the log records the intent
+    // and its id is the cursor, as always.
+    assert_eq!(
+        HistoryLog::new(dir.path().join("history.jsonl"))
+            .cursor()
+            .expect("cursor"),
+        Some(1)
+    );
+
+    handle.stop().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_basic_auth_rejection_ends_the_loop_instead_of_spin_retrying() {
+    let (server, _device_key, secret, dir) = spawn_basic_auth_server().await;
+    let config = StreamConfig {
+        base_url: server.base_url.clone(),
+        stream_token: secret,
+        basic_auth: Some(BasicAuth {
+            user: OPERATOR_USER.to_owned(),
+            password: "not the password".to_owned(),
+        }),
+        history_log: HistoryLog::new(dir.path().join("history.jsonl")),
+        backoff: fast_backoff(),
+    };
+    let (handle, mut intents) = RealtimeStream::spawn(config);
+
+    // The 418 teapot (§1.4) is terminal — retrying the same credentials
+    // would spin forever, so the loop ends on its own and no intent ever
+    // surfaces (§3.3: a rejection never becomes a validity oracle).
+    let ended = tokio::time::timeout(Duration::from_secs(5), intents.recv())
+        .await
+        .expect("loop ends within 5s");
+    assert!(ended.is_none(), "no intent can surface without credentials");
+
+    // stop() on an already-ended loop reports how it ended.
+    let end = handle.stop().await;
+    assert_eq!(
+        end,
+        StreamEnd::AuthRejected {
+            status: 418,
+            message: "I'm a teapot".to_owned(),
+        }
+    );
+
+    server.shutdown().await;
 }
 
 #[tokio::test]
