@@ -36,6 +36,8 @@ async fn run_push(args: &[String]) {
     let mut title = None;
     let mut subtitle = None;
     let mut body = None;
+    let mut user = None;
+    let mut password = None;
     let mut ext_params: Vec<(String, String)> = Vec::new();
 
     let mut fields = args.iter();
@@ -49,6 +51,11 @@ async fn run_push(args: &[String]) {
             "--title" => title = Some(value.clone()),
             "--subtitle" => subtitle = Some(value.clone()),
             "--body" => body = Some(value.clone()),
+            // Per-server Basic Auth credentials (protocol §1.4) — either
+            // field alone is enough; servers enable the check on each
+            // independently.
+            "--user" => user = Some(value.clone()),
+            "--password" => password = Some(value.clone()),
             // Anything else is an Ext Param (url, group, sound, …): passed
             // through exactly like the server's V2 JSON route (§2.2).
             _ => ext_params.push((flag.trim_start_matches('-').to_owned(), value.clone())),
@@ -78,7 +85,13 @@ async fn run_push(args: &[String]) {
 
     // Failures surface the server's message and code (issue #6): the
     // send module's error display is verbatim, the exit is non-zero.
-    if let Err(err) = PushClient::new(&server).send(&push).await {
+    let client = PushClient::new(&server);
+    let client = if user.is_some() || password.is_some() {
+        client.with_basic_auth(user.unwrap_or_default(), password.unwrap_or_default())
+    } else {
+        client
+    };
+    if let Err(err) = client.send(&push).await {
         die(&err.to_string());
     }
 }

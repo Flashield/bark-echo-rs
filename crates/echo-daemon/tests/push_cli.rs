@@ -151,3 +151,68 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    // /register is Basic-Auth-exempt (protocol §1.4), so setup needs no
+    // credentials; /push is not.
+    let device = ServerClient::new(&server.base_url)
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+
+    // With the operator's credentials the push is accepted.
+    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+        .args([
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            &device.device_key,
+            "--body",
+            "behind auth",
+            "--user",
+            "operator",
+            "--password",
+            "hunter2",
+        ])
+        .output()
+        .await
+        .expect("spawn echo-daemon push");
+    assert!(
+        output.status.success(),
+        "correct credentials must be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Wrong password: the server answers 418 Teapot (§1.4), non-zero exit.
+    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+        .args([
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            &device.device_key,
+            "--body",
+            "behind auth",
+            "--user",
+            "operator",
+            "--password",
+            "wrong-password",
+        ])
+        .output()
+        .await
+        .expect("spawn echo-daemon push");
+    assert!(
+        !output.status.success(),
+        "wrong credentials must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("418"),
+        "the 418 Teapot refusal surfaces: {stderr}"
+    );
+
+    server.shutdown().await;
+}
