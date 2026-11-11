@@ -28,6 +28,20 @@ pub enum ServerError {
     /// A non-200 envelope answer without a typed mapping.
     #[error("bark server answered {status}: {message}")]
     Unexpected { status: u16, message: String },
+    /// 401 `device key required` — no `X-Device-Key` presented (§3.2).
+    #[error("device key required")]
+    DeviceKeyRequired,
+    /// 401 `device key mismatch` — the presented key is not the addressed
+    /// Device's key (§3.2).
+    #[error("device key mismatch")]
+    DeviceKeyMismatch,
+    /// 404 `device not found` — the addressed Device Key is unknown (§3.2).
+    #[error("device not found")]
+    DeviceNotFound,
+    /// 404 `stream token not found` — unknown `token_id`, or one scoped
+    /// to another Device (§3.2).
+    #[error("stream token not found")]
+    StreamTokenNotFound,
     /// 409 `stream token already revoked` — revoking twice (§3.2,
     /// deliberately not idempotent).
     #[error("stream token already revoked")]
@@ -239,6 +253,10 @@ impl ServerClient {
     /// errors grow here as the faces that surface them land.
     fn map_error(status: u16, message: String) -> ServerError {
         match (status, message.as_str()) {
+            (401, "device key required") => ServerError::DeviceKeyRequired,
+            (401, "device key mismatch") => ServerError::DeviceKeyMismatch,
+            (404, "device not found") => ServerError::DeviceNotFound,
+            (404, "stream token not found") => ServerError::StreamTokenNotFound,
             (409, "stream token already revoked") => ServerError::StreamTokenAlreadyRevoked,
             _ => ServerError::Unexpected { status, message },
         }

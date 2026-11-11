@@ -159,3 +159,66 @@ async fn revoking_a_stream_token_kills_connects_and_double_revoke_answers_409() 
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn operating_on_an_unknown_device_answers_device_not_found() {
+    let server = common::TestServer::spawn().await;
+    let client = ServerClient::new(&server.base_url);
+    // A never-registered 22-char key: auth passes (header == path) but
+    // the Device does not exist — 404 without revealing later facts (§3.2).
+    let unknown_key = "zzzzzzzzzzzzzzzzzzzzzz";
+
+    let err = client
+        .mint_stream_token(unknown_key, "macbook-reminder")
+        .await
+        .expect_err("mint against unknown device");
+    assert!(
+        matches!(err, ServerError::DeviceNotFound),
+        "mint: wrong error: {err}"
+    );
+
+    let err = client
+        .list_stream_tokens(unknown_key)
+        .await
+        .expect_err("list against unknown device");
+    assert!(
+        matches!(err, ServerError::DeviceNotFound),
+        "list: wrong error: {err}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoking_a_stream_token_of_another_device_answers_not_found() {
+    let server = common::TestServer::spawn().await;
+    let client = ServerClient::new(&server.base_url);
+    let home = client.register_stream_device().await.expect("register");
+    let other = client.register_stream_device().await.expect("register");
+    let minted = client
+        .mint_stream_token(&home.device_key, "macbook-reminder")
+        .await
+        .expect("mint");
+
+    // Token ids are Device-scoped (§3.2): presenting another Device's id
+    // answers like an unknown id — no leak.
+    let err = client
+        .revoke_stream_token(&other.device_key, &minted.token_id)
+        .await
+        .expect_err("cross-device revoke");
+    assert!(
+        matches!(err, ServerError::StreamTokenNotFound),
+        "cross-device: wrong error: {err}"
+    );
+
+    let err = client
+        .revoke_stream_token(&home.device_key, "0000000000000000")
+        .await
+        .expect_err("unknown token id");
+    assert!(
+        matches!(err, ServerError::StreamTokenNotFound),
+        "unknown id: wrong error: {err}"
+    );
+
+    server.shutdown().await;
+}
