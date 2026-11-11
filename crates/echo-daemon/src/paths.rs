@@ -110,14 +110,14 @@ impl Paths {
         let root = xdg
             .map(PathBuf::from)
             .or_else(|| home.map(|home| home.join(".config")));
-        root.map(|root| root.join("echo-daemon"))
+        root.map(|root| root.join("bark-echo"))
             .ok_or(PathsError::NoConfigRoot)
     }
 
     #[cfg(windows)]
     fn from_windows_root(appdata: Option<&Path>) -> Result<PathBuf, PathsError> {
         appdata
-            .map(|root| root.join("echo-daemon"))
+            .map(|root| root.join("bark-echo"))
             .ok_or(PathsError::NoConfigRoot)
     }
 }

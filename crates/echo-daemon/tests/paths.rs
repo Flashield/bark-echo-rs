@@ -19,7 +19,7 @@ fn the_config_dir_is_the_standard_per_os_dir_plus_the_app_name() {
         dir,
         std::path::Path::new("/home/ada")
             .join(default_suffix())
-            .join("echo-daemon"),
+            .join("bark-echo"),
         "standard config dir + the app's own directory"
     );
 }
@@ -43,7 +43,7 @@ fn xdg_config_home_overrides_the_home_default() {
 
     let dir = config_dir_from(Some(&home()), Some(xdg)).expect("home present");
 
-    assert_eq!(dir, xdg.join("echo-daemon"), "$XDG_CONFIG_HOME wins");
+    assert_eq!(dir, xdg.join("bark-echo"), "$XDG_CONFIG_HOME wins");
 }
 
 #[cfg(unix)]
@@ -53,7 +53,7 @@ fn xdg_config_home_stands_alone_without_a_home() {
 
     let dir = config_dir_from(None, Some(xdg)).expect("xdg present");
 
-    assert_eq!(dir, xdg.join("echo-daemon"), "$XDG_CONFIG_HOME suffices");
+    assert_eq!(dir, xdg.join("bark-echo"), "$XDG_CONFIG_HOME suffices");
 }
 
 #[cfg(windows)]
@@ -63,7 +63,7 @@ fn the_config_dir_is_roaming_appdata_plus_the_app_name() {
 
     let dir = config_dir_from(Some(appdata)).expect("appdata present");
 
-    assert_eq!(dir, appdata.join("echo-daemon"));
+    assert_eq!(dir, appdata.join("bark-echo"));
 }
 
 #[cfg(unix)]

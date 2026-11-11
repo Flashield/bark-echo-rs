@@ -125,9 +125,9 @@ Everything lives under one per-OS config directory:
 
 | Platform | Config directory |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/echo-daemon`, else `~/.config/echo-daemon` |
-| macOS | `~/Library/Application Support/echo-daemon` |
-| Windows | `%APPDATA%\echo-daemon` |
+| Linux | `$XDG_CONFIG_HOME/bark-echo`, else `~/.config/bark-echo` |
+| macOS | `~/Library/Application Support/bark-echo` |
+| Windows | `%APPDATA%\bark-echo` |
 
 Inside it:
 

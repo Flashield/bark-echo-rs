@@ -215,7 +215,7 @@ impl SecretStore for PlainFileStore {
 /// The normal secret home (spec story 18): the OS credential store —
 /// keychain on macOS, Credential Manager on Windows, Secret Service on
 /// Linux. One keyring entry per secret, addressed
-/// `service = "echo-daemon"`, `account = "<kind>::<server>::<token_id>"`
+/// `service = "bark-echo"`, `account = "<kind>::<server>::<token_id>"`
 /// (ADR-0001: keyed by server + token_id — the fresh-per-add `token_id`
 /// keeps two Subscriptions on one Device from sharing a key).
 #[derive(Debug, Clone, Default)]
@@ -227,7 +227,7 @@ impl KeyringStore {
     /// A store in the OS keyring under this application's service name.
     pub fn new() -> Self {
         Self {
-            service: "echo-daemon",
+            service: "bark-echo",
         }
     }
 
