@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# The push subcommand is the send module's first consumer (issue #6).
 echo-core = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -14,8 +15,13 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 # The one test seam (spec Testing Decisions): the real server, embedded
-# in-process, mirroring echo-core's own test common module.
+# in-process, mirroring echo-core's own test common module. Dev-only and
+# revision-pinned — production builds never link the server.
 bark-server-rs = { git = "https://github.com/Flashield/bark-server-rs.git", rev = "b8d832af9ade314f87fb9d349709c26ab519ce4f" }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+# Async child runs (see tests/push_cli.rs): the embedded server shares
+# the test runtime, so a blocking child wait would starve it.
+tokio = { workspace = true, features = ["process"] }

@@ -1,9 +1,11 @@
 //! echo-daemon: the desktop Realtime Client binary. This shell holds the
 //! CLI surface — ticket #3's `subscribe` subcommands over the config, the
-//! secret store, and the server's Device/Token plane; the daemon runtime
-//! (streams, notifications) arrives with later tickets (ADR-0002).
+//! secret store, and the server's Device/Token plane; ticket #6's `push`
+//! subcommand over echo-core's send module; the daemon runtime (streams,
+//! notifications) arrives with later tickets (ADR-0002).
 
 use clap::{Args, Parser, Subcommand};
+use echo_core::push::{Push, PushClient};
 use echo_core::server::ServerClient;
 
 use echo_daemon::config::Config;
@@ -28,6 +30,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Send one Push to a Device by its Device Key — the CLI face of the
+    /// core send module (issue #6). The future scheduler's entry point.
+    Push {
+        /// The flags, verbatim: `--server URL`, `--device-key KEY`, the
+        /// alert fields (`--title`, `--subtitle`, `--body`), the per-server
+        /// Basic Auth credentials (`--user`, `--password`), and every other
+        /// `--key value` pair riding through as an Ext Param (`--url`,
+        /// `--group`, `--sound`, …) exactly like the server's V2 JSON
+        /// route (protocol §2.2).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage this machine's Subscriptions.
     Subscribe {
         #[command(subcommand)]
@@ -94,6 +108,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match cli.command {
+        Command::Push { args } => run_push(&args).await?,
         Command::Subscribe { command } => match command {
             SubscribeCommand::Add {
                 server,
@@ -145,6 +160,76 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     }
+    Ok(())
+}
+
+/// The `push` subcommand: `push --server URL --device-key KEY --title …`
+/// targets any Device, mapping its flags onto the send module's Push
+/// (protocol §2.2). The flags are parsed here rather than by clap's typed
+/// args so that flag order never matters and unknown `--key value` pairs
+/// ride through as Ext Params verbatim. Failures surface the server's
+/// message and code; `run` prints them and exits non-zero.
+async fn run_push(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = None;
+    let mut device_key = None;
+    let mut title = None;
+    let mut subtitle = None;
+    let mut body = None;
+    let mut user = None;
+    let mut password = None;
+    let mut ext_params: Vec<(String, String)> = Vec::new();
+
+    let mut fields = args.iter();
+    while let Some(flag) = fields.next() {
+        let value = match fields.next() {
+            Some(value) => value,
+            None => return Err(format!("push: flag {flag} needs a value").into()),
+        };
+        match flag.as_str() {
+            "--server" => server = Some(value.clone()),
+            "--device-key" => device_key = Some(value.clone()),
+            "--title" => title = Some(value.clone()),
+            "--subtitle" => subtitle = Some(value.clone()),
+            "--body" => body = Some(value.clone()),
+            // Per-server Basic Auth credentials (protocol §1.4) — either
+            // field alone is enough; servers enable the check on each
+            // independently.
+            "--user" => user = Some(value.clone()),
+            "--password" => password = Some(value.clone()),
+            // Anything else is an Ext Param (url, group, sound, …): passed
+            // through exactly like the server's V2 JSON route (§2.2).
+            _ => ext_params.push((flag.trim_start_matches('-').to_owned(), value.clone())),
+        }
+    }
+
+    let Some(server) = server else {
+        return Err("push: --server URL is required".into());
+    };
+    let Some(device_key) = device_key else {
+        return Err("push: --device-key KEY is required".into());
+    };
+
+    let mut push = Push::to(device_key);
+    if let Some(title) = title {
+        push = push.title(title);
+    }
+    if let Some(subtitle) = subtitle {
+        push = push.subtitle(subtitle);
+    }
+    if let Some(body) = body {
+        push = push.body(body);
+    }
+    for (key, value) in &ext_params {
+        push = push.ext_param(key, value);
+    }
+
+    let client = PushClient::new(&server);
+    let client = if user.is_some() || password.is_some() {
+        client.with_basic_auth(user.unwrap_or_default(), password.unwrap_or_default())
+    } else {
+        client
+    };
+    client.send(&push).await?;
     Ok(())
 }
 
