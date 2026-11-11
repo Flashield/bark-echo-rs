@@ -228,9 +228,12 @@ async fn supervise(
                     if let Err(err) = renderer.render(&intent) {
                         eprintln!("notification render failed: {err}");
                     }
-                    // The History Log line exists by now (the core
-                    // appends before the intent is handed over), so the
-                    // cursor follows it regardless of render success.
+                    // The core hands the intent over first and appends the
+                    // History Log line right after, so this state-file
+                    // cursor can land a beat before the log line does.
+                    // That is safe: the History Log — not this file — is
+                    // the reconnect cursor (GLOSSARY) and the durability
+                    // anchor; this id only feeds `status`'s display.
                     if let Err(err) = state.set_last_message_id(&id, intent.id) {
                         eprintln!("state file update failed: {err}");
                     }
