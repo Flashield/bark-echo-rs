@@ -3,6 +3,7 @@
 //! lives in echo-core; this crate is everything that touches the machine.
 
 pub mod config;
+pub mod history;
 pub mod paths;
 pub mod secrets;
 pub mod subscribe;

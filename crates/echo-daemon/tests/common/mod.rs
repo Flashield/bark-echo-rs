@@ -97,3 +97,85 @@ async fn wait_ready(url: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// One CLI run's observable surface (exit status, stdout, stderr).
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
+pub struct Run {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Run {
+    /// Assert the run exited 0 and return its stdout.
+    #[allow(dead_code)]
+    pub fn stdout_or_die(&self, what: &str) -> String {
+        assert!(
+            self.success,
+            "{what} must exit 0; stderr: {}; stdout: {}",
+            self.stderr, self.stdout
+        );
+        self.stdout.clone()
+    }
+}
+
+/// A hermetic CLI run environment: a temp `HOME` (so config, secrets, and
+/// History Logs land nowhere else) and the daemon subprocess. Mirrors the
+/// harness in tests/cli.rs for the pull/log seams (ticket #7).
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
+pub struct Harness {
+    home: tempfile::TempDir,
+}
+
+#[allow(dead_code)]
+impl Harness {
+    pub fn new() -> Self {
+        Harness {
+            home: tempfile::tempdir().expect("temp home"),
+        }
+    }
+
+    /// The config locations the daemon resolves inside this harness —
+    /// computed with the same pure function the binary uses.
+    #[cfg(unix)]
+    pub fn paths(&self) -> echo_daemon::paths::Paths {
+        let xdg = self.home.path().join(".config");
+        let config_dir = echo_daemon::paths::config_dir_from(Some(self.home.path()), Some(&xdg))
+            .expect("temp home resolves");
+        echo_daemon::paths::Paths::from_dir(config_dir)
+    }
+
+    pub async fn run(&self, args: &[&str]) -> Run {
+        let output = self.spawn(args).output().await.expect("spawn echo-daemon");
+        Run {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    /// Spawn (not await) the daemon: for long-lived runs (`log --follow`)
+    /// the test reads stdout incrementally and kills the child.
+    #[cfg(unix)]
+    pub fn spawn(&self, args: &[&str]) -> tokio::process::Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        command
+            .args(args)
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"));
+        command
+    }
+
+    #[cfg(windows)]
+    pub fn spawn(&self, args: &[&str]) -> tokio::process::Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        command.env("APPDATA", self.home.path().join("AppData/Roaming"));
+        command
+    }
+}
+
+use tokio::process::Command;
