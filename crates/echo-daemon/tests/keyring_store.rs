@@ -12,9 +12,19 @@ fn key() -> SecretKey {
     }
 }
 
-/// A scratch entry proves a secret service answers this session.
+/// A scratch entry proves a secret service answers this session. The
+/// probe account is unique per call so two tests probing in parallel
+/// never fight over the same entry.
 fn service_reachable() -> bool {
-    let Ok(entry) = keyring::Entry::new("echo-daemon-test-probe", "probe") else {
+    let probe = format!(
+        "echo-daemon-test-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.subsec_nanos())
+            .unwrap_or(0)
+    );
+    let Ok(entry) = keyring::Entry::new(&probe, "probe") else {
         return false;
     };
     match entry.set_password("probe") {
