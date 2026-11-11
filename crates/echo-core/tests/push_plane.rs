@@ -43,3 +43,41 @@ async fn pushing_to_a_stream_device_delivers_on_its_realtime_stream() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn ext_params_ride_through_into_the_received_event() {
+    let server = common::TestServer::spawn().await;
+    let server_client = ServerClient::new(&server.base_url);
+    let device = server_client
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+    let token = server_client
+        .mint_stream_token(&device.device_key, "push-test-reader")
+        .await
+        .expect("mint stream token");
+    let mut stream = SseStream::open(&server, &token.secret).await;
+
+    PushClient::new(&server.base_url)
+        .send(
+            &Push::to(&device.device_key)
+                .body("Boarding")
+                .ext_param("url", "https://example.com/boarding")
+                .ext_param("group", "trips")
+                .ext_param("level", "timeSensitive")
+                .ext_param("call", "1"),
+        )
+        .await
+        .expect("push accepted");
+
+    let event = stream.next_push_event().await;
+    // Ext Params appear in the fan-out event's ext_params (§3.4) —
+    // unrecognized params as-is, `group` dual-written by the server.
+    let ext = &event["ext_params"];
+    assert_eq!(ext["url"], "https://example.com/boarding", "url: {event}");
+    assert_eq!(ext["group"], "trips", "group: {event}");
+    assert_eq!(ext["level"], "timeSensitive", "level: {event}");
+    assert_eq!(ext["call"], "1", "call: {event}");
+
+    server.shutdown().await;
+}
