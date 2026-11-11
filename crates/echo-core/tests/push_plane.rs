@@ -155,3 +155,61 @@ async fn missing_or_wrong_basic_auth_credentials_answer_teapot() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn pushing_to_an_ios_type_device_delivers_over_apns() {
+    let apns = common::apns::ApnsStub::spawn().await;
+    let server = common::TestServer::spawn_with_apns(&apns.url).await;
+
+    // Register an iOS-type Device (protocol §2.1): its Device Token is
+    // the APNs address; the stub records requests against it.
+    let register = reqwest::Client::new()
+        .post(format!("{}/register", server.base_url))
+        .json(&serde_json::json!({
+            "device_type": "ios",
+            "device_token": "PUSHTOKEN1",
+        }))
+        .send()
+        .await
+        .expect("register ios device");
+    assert!(register.status().is_success(), "register: {register:?}");
+    let envelope: serde_json::Value = register.json().await.expect("register envelope");
+    let device_key = envelope["data"]["device_key"]
+        .as_str()
+        .expect("device_key")
+        .to_owned();
+
+    PushClient::new(&server.base_url)
+        .send(
+            &Push::to(&device_key)
+                .title("Flight")
+                .body("Gate 7")
+                .ext_param("url", "https://example.com/boarding"),
+        )
+        .await
+        .expect("push accepted");
+
+    // One APNs request, addressed to the Device Token, carrying the alert
+    // and the Ext Params as root-level custom keys (server apns module).
+    let pushes = apns.pushes();
+    assert_eq!(pushes.len(), 1, "exactly one APNs request: {pushes:?}");
+    let recorded = &pushes[0];
+    assert_eq!(recorded.path, "/3/device/PUSHTOKEN1", "token-addressed");
+    assert_eq!(
+        recorded.payload["aps"]["alert"]["title"], "Flight",
+        "payload: {}",
+        recorded.payload
+    );
+    assert_eq!(
+        recorded.payload["aps"]["alert"]["body"], "Gate 7",
+        "payload: {}",
+        recorded.payload
+    );
+    assert_eq!(
+        recorded.payload["url"], "https://example.com/boarding",
+        "ext params ride as custom payload keys"
+    );
+
+    apns.shutdown().await;
+    server.shutdown().await;
+}

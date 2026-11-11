@@ -4,6 +4,7 @@
 //! listener itself to `run_server_on_listener`, poll `/ping` until ready,
 //! shut down via a oneshot. No Docker, no subprocess.
 
+pub mod apns;
 pub mod sse;
 
 use bark_server_rs::config::Config;
@@ -33,6 +34,16 @@ impl TestServer {
         Self::spawn_configuring(|config| {
             config.basic_auth_user = user.to_string();
             config.basic_auth_password = password.to_string();
+        })
+        .await
+    }
+
+    /// [`TestServer::spawn`] with the APNs endpoint pointed at `endpoint`
+    /// (TLS verification off) — the stub route for iOS-type Devices.
+    pub async fn spawn_with_apns(endpoint: &str) -> Self {
+        Self::spawn_configuring(|config| {
+            config.apns_endpoint = endpoint.to_string();
+            config.apns_insecure_skip_tls_verify = true;
         })
         .await
     }
