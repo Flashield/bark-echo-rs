@@ -36,6 +36,7 @@ async fn run_push(args: &[String]) {
     let mut title = None;
     let mut subtitle = None;
     let mut body = None;
+    let mut ext_params: Vec<(String, String)> = Vec::new();
 
     let mut fields = args.iter();
     while let Some(flag) = fields.next() {
@@ -48,7 +49,9 @@ async fn run_push(args: &[String]) {
             "--title" => title = Some(value.clone()),
             "--subtitle" => subtitle = Some(value.clone()),
             "--body" => body = Some(value.clone()),
-            other => die(&format!("push: unknown flag {other}")),
+            // Anything else is an Ext Param (url, group, sound, …): passed
+            // through exactly like the server's V2 JSON route (§2.2).
+            _ => ext_params.push((flag.trim_start_matches('-').to_owned(), value.clone())),
         }
     }
 
@@ -68,6 +71,9 @@ async fn run_push(args: &[String]) {
     }
     if let Some(body) = body {
         push = push.body(body);
+    }
+    for (key, value) in &ext_params {
+        push = push.ext_param(key, value);
     }
 
     PushClient::new(&server)
