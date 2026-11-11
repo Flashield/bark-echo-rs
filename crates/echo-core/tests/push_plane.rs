@@ -5,7 +5,7 @@
 mod common;
 
 use common::sse::SseStream;
-use echo_core::push::{Push, PushClient};
+use echo_core::push::{Push, PushClient, PushError};
 use echo_core::server::ServerClient;
 
 #[tokio::test]
@@ -78,6 +78,34 @@ async fn ext_params_ride_through_into_the_received_event() {
     assert_eq!(ext["group"], "trips", "group: {event}");
     assert_eq!(ext["level"], "timeSensitive", "level: {event}");
     assert_eq!(ext["call"], "1", "call: {event}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pushing_to_an_unknown_device_key_reports_the_server_message_and_code() {
+    let server = common::TestServer::spawn().await;
+    let client = PushClient::new(&server.base_url);
+    // A never-registered 22-char key (same shape as the Device/Token
+    // plane's unknown-key probes).
+    let unknown_key = "zzzzzzzzzzzzzzzzzzzzzz";
+
+    let err = client
+        .send(&Push::to(unknown_key).body("anyone?"))
+        .await
+        .expect_err("unknown key must fail");
+
+    // The server's message rides verbatim with its code (protocol §2.2:
+    // unknown device_key quotes the key back).
+    let PushError::Server { code, message } = &err else {
+        panic!("wrong error face: {err}")
+    };
+    assert_eq!(*code, 400, "code mirrors the HTTP status: {err}");
+    assert_eq!(
+        message,
+        "failed to get device token: failed to get [zzzzzzzzzzzzzzzzzzzzzz] device token from database",
+        "the server's message surfaces verbatim"
+    );
 
     server.shutdown().await;
 }
