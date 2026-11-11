@@ -27,7 +27,7 @@ async fn pushing_from_the_cli_delivers_on_the_device_realtime_stream() {
         .expect("mint stream token");
     let mut stream = SseStream::open(&server, &token.secret).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .args([
             "push",
             "--server",
@@ -43,7 +43,7 @@ async fn pushing_from_the_cli_delivers_on_the_device_realtime_stream() {
         ])
         .output()
         .await
-        .expect("spawn echo-daemon push");
+        .expect("spawn bark-echo push");
 
     assert!(
         output.status.success(),
@@ -78,7 +78,7 @@ async fn cli_extra_flags_ride_through_as_ext_params() {
 
     // Extra flags pass through as Ext Params exactly like the server's
     // V2 JSON route (§2.2) — the CLI neither names nor filters them.
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .args([
             "push",
             "--server",
@@ -98,7 +98,7 @@ async fn cli_extra_flags_ride_through_as_ext_params() {
         ])
         .output()
         .await
-        .expect("spawn echo-daemon push");
+        .expect("spawn bark-echo push");
 
     assert!(
         output.status.success(),
@@ -122,7 +122,7 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
     // probes elsewhere).
     let unknown_key = "zzzzzzzzzzzzzzzzzzzzzz";
 
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .args([
             "push",
             "--server",
@@ -134,7 +134,7 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
         ])
         .output()
         .await
-        .expect("spawn echo-daemon push");
+        .expect("spawn bark-echo push");
 
     assert!(
         !output.status.success(),
@@ -163,7 +163,7 @@ async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
         .expect("register stream device");
 
     // With the operator's credentials the push is accepted.
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .args([
             "push",
             "--server",
@@ -179,7 +179,7 @@ async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
         ])
         .output()
         .await
-        .expect("spawn echo-daemon push");
+        .expect("spawn bark-echo push");
     assert!(
         output.status.success(),
         "correct credentials must be accepted, stderr: {}",
@@ -187,7 +187,7 @@ async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
     );
 
     // Wrong password: the server answers 418 Teapot (§1.4), non-zero exit.
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .args([
             "push",
             "--server",
@@ -203,7 +203,7 @@ async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
         ])
         .output()
         .await
-        .expect("spawn echo-daemon push");
+        .expect("spawn bark-echo push");
     assert!(
         !output.status.success(),
         "wrong credentials must exit non-zero"

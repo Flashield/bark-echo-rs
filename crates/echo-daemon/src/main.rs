@@ -1,8 +1,9 @@
-//! echo-daemon: the desktop Realtime Client binary. This shell holds the
-//! CLI surface — ticket #3's `subscribe` subcommands over the config, the
-//! secret store, and the server's Device/Token plane; ticket #6's `push`
-//! subcommand over echo-core's send module; the daemon runtime (streams,
-//! notifications) arrives with later tickets (ADR-0002).
+//! The `bark-echo` binary (this crate's product face, named after the
+//! repo): the desktop Realtime Client. It holds the CLI surface — ticket
+//! #3's `subscribe` subcommands over the config, the secret store, and
+//! the server's Device/Token plane; ticket #6's `push` subcommand over
+//! echo-core's send module; the daemon runtime (streams, notifications)
+//! arrives with later tickets (ADR-0002).
 
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use echo_daemon::subscribe::{self, AddSource};
 /// bark-echo-rs desktop Realtime Client: hold Subscriptions, mirror
 /// their Pushes as desktop notifications, send Pushes.
 #[derive(Parser)]
-#[command(name = "echo-daemon", version, about)]
+#[command(name = "bark-echo", version, about)]
 struct Cli {
     /// Keep secrets in a 0600 plain file under the config dir instead of
     /// the OS keyring — the explicit opt-in for headless machines without

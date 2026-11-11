@@ -1,14 +1,14 @@
-//! CLI seam: until the daemon grows subcommands (later tickets), the
-//! version flag is its entire observable surface.
+//! CLI seam: the version flag pins the product identity — the binary is
+//! named after the repository (bark-echo), whatever the crate is called.
 
 use std::process::Command;
 
 #[test]
-fn version_flag_prints_the_daemon_name_and_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_echo-daemon"))
+fn version_flag_prints_the_binary_name_and_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
         .arg("--version")
         .output()
-        .expect("spawn echo-daemon");
+        .expect("spawn bark-echo");
 
     assert!(
         output.status.success(),
@@ -17,7 +17,7 @@ fn version_flag_prints_the_daemon_name_and_version() {
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     assert_eq!(
         stdout.trim(),
-        format!("echo-daemon {}", env!("CARGO_PKG_VERSION")),
-        "--version must print name and version"
+        format!("bark-echo {}", env!("CARGO_PKG_VERSION")),
+        "--version must print the product binary name and version"
     );
 }

@@ -18,7 +18,7 @@ pub enum LockError {
     /// Starting anyway would double-display every Push, so the caller
     /// must stop that instance (or point this run at another config).
     #[error(
-        "another echo-daemon instance is already running (lock held at {path}) — \
+        "another bark-echo instance is already running (lock held at {path}) — \
          notifications would double-display; stop that instance first"
     )]
     Held { path: PathBuf },

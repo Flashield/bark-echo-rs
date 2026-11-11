@@ -3,6 +3,12 @@ name = "echo-daemon"
 version.workspace = true
 edition.workspace = true
 
+# The product binary is named after the repository (bark-echo); the crate
+# — and its directory — keep the architecture name echo-daemon (ADR-0002).
+[[bin]]
+name = "bark-echo"
+path = "src/main.rs"
+
 [dependencies]
 # The push subcommand is the send module's first consumer (issue #6).
 echo-core = { workspace = true }
