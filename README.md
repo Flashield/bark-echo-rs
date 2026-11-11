@@ -25,9 +25,10 @@ is [`GLOSSARY.md`](GLOSSARY.md).
   Windows the toast fires and click actions land with the tray work); an
   end-to-end-encrypted Push renders a readable placeholder instead of
   ciphertext noise.
-- **Pull** (GLOSSARY): `pull` backfills everything the server still
-  retains — for a laptop that slept through a day — into the History Log,
-  silently, with replay-overlap duplicates suppressed by dedup.
+- **Pull** (GLOSSARY): `pull` replays and lands everything the server
+  still retains — for a laptop that slept through a day — into the
+  History Log, silently, with replay-overlap duplicates suppressed by
+  dedup.
 - **History Log** (GLOSSARY): one append-only JSONL file per Subscription;
   it doubles as the reconnect cursor, and `log` tails and filters it.
 - **Push from scripts**: `push` sends through the server's V2 JSON route;
@@ -79,7 +80,7 @@ Missed time (the laptop was closed, the server restarted) is recoverable,
 and the History Log answers "did it reach my desktop?":
 
 ```sh
-# 4. Backfill everything the server still retains, silently:
+# 4. Pull (replay) everything the server still retains, silently:
 $ bark-echo pull
 
 # 5. Audit recent reminders, or stream them live while the daemon runs:
