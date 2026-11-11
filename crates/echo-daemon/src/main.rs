@@ -4,6 +4,8 @@
 //! subcommand over echo-core's send module; the daemon runtime (streams,
 //! notifications) arrives with later tickets (ADR-0002).
 
+use std::sync::Arc;
+
 use clap::{Args, Parser, Subcommand};
 use echo_core::pull::PullConfig;
 use echo_core::push::{Push, PushClient};
@@ -11,8 +13,11 @@ use echo_core::server::ServerClient;
 
 use echo_daemon::config::Config;
 use echo_daemon::history;
+use echo_daemon::notify::DesktopRenderer;
 use echo_daemon::paths::Paths;
+use echo_daemon::run::{self, DaemonSpec};
 use echo_daemon::secrets::{KeyringStore, PlainFileStore, SecretStore};
+use echo_daemon::status;
 use echo_daemon::subscribe::{self, AddSource};
 
 /// bark-echo-rs desktop Realtime Client: hold Subscriptions, mirror
@@ -77,6 +82,13 @@ enum Command {
         #[command(subcommand)]
         command: SubscribeCommand,
     },
+    /// Hold every Subscription's Realtime Stream open and render each
+    /// Push as a desktop notification — the daemon runtime (ADR-0002).
+    /// Stops on ctrl-C; a second run refuses on the single-instance lock.
+    Run,
+    /// Per-Subscription stream state plus the server's live statistics
+    /// (/info): delivery health at a glance.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -131,10 +143,10 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::resolve()?;
     let mut config = Config::load(&paths.config_file())?;
-    let store: Box<dyn SecretStore> = if cli.plain_secrets {
-        Box::new(PlainFileStore::new(paths.secrets_file()))
+    let store: Arc<dyn SecretStore> = if cli.plain_secrets {
+        Arc::new(PlainFileStore::new(paths.secrets_file()))
     } else {
-        Box::new(KeyringStore::new())
+        Arc::new(KeyringStore::new())
     };
 
     match cli.command {
@@ -195,6 +207,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        Command::Run => {
+            let spec = DaemonSpec {
+                paths: paths.clone(),
+                config,
+                store,
+                renderer: Arc::new(DesktopRenderer),
+            };
+            run::run(spec, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+        }
+        Command::Status => {
+            let report = status::report(&paths, &config).await?;
+            print!("{}", report.render());
+        }
     }
     Ok(())
 }

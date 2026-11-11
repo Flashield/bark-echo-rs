@@ -122,6 +122,7 @@ async fn a_pull_after_the_live_receive_loop_only_heals_the_gap() {
             base: Duration::from_millis(150),
             cap: Duration::from_secs(2),
         },
+        events: None,
     };
     let (handle, mut intents) = echo_core::stream::RealtimeStream::spawn(config);
     common::wait_active_streams(&harness.server, 1).await;

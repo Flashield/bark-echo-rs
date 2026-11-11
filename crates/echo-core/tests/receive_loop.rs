@@ -33,6 +33,7 @@ fn stream_config(
         basic_auth: None,
         history_log: HistoryLog::new(history_path),
         backoff: fast_backoff(),
+        events: None,
     }
 }
 
@@ -595,6 +596,7 @@ async fn basic_auth_credentials_ride_alongside_the_stream_token() {
         }),
         history_log: HistoryLog::new(dir.path().join("history.jsonl")),
         backoff: fast_backoff(),
+        events: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
     common::wait_active_streams_with(&server, 1, Some((OPERATOR_USER, OPERATOR_PASSWORD))).await;
@@ -627,6 +629,7 @@ async fn a_basic_auth_rejection_ends_the_loop_instead_of_spin_retrying() {
         }),
         history_log: HistoryLog::new(dir.path().join("history.jsonl")),
         backoff: fast_backoff(),
+        events: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
 

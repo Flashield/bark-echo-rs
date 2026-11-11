@@ -77,15 +77,29 @@ impl Paths {
         self.config_dir.join("secrets.toml")
     }
 
-    /// One Subscription's History Log (GLOSSARY): an append-only JSONL
-    /// file named by the Subscription id, under the history directory
-    /// beside the config. One file for every writer — the daemon's
-    /// receive loop appends live, `pull` backfills into it, `log` reads
-    /// it back.
+    /// The single-instance lock file (ADR-0002): an advisory lock the
+    /// runtime holds for its lifetime.
+    pub fn lock_file(&self) -> PathBuf {
+        self.config_dir.join("daemon.lock")
+    }
+
+    /// The runtime state file (ADR-0002 MVP): what `status` reads while
+    /// the daemon runs.
+    pub fn state_file(&self) -> PathBuf {
+        self.config_dir.join("daemon-state.json")
+    }
+
+    /// The History Log directory (GLOSSARY): one append-only JSONL file
+    /// per Subscription, named by the Subscription's id. One file for
+    /// every writer — the daemon's receive loop appends live, `pull`
+    /// backfills into it, `log` reads it back.
+    pub fn history_dir(&self) -> PathBuf {
+        self.config_dir.join("history")
+    }
+
+    /// One Subscription's History Log path inside [`Paths::history_dir`].
     pub fn history_log(&self, subscription_id: &str) -> PathBuf {
-        self.config_dir
-            .join("history")
-            .join(format!("{subscription_id}.jsonl"))
+        self.history_dir().join(format!("{subscription_id}.jsonl"))
     }
 
     #[cfg(unix)]

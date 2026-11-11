@@ -92,6 +92,26 @@ pub struct StreamTokenSummary {
 pub struct ServerClient {
     base_url: String,
     http: reqwest::Client,
+    /// Operator Basic Auth (§1.4) presented on every request, `None` for
+    /// an open server.
+    basic_auth: Option<(String, String)>,
+}
+
+/// The live statistics `/info` answers (protocol §2.3) — the subset
+/// `status` surfaces. The server answers a bare JSON map here, not the
+/// envelope.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ServerInfo {
+    /// Server build identification.
+    pub version: String,
+    /// Registered Devices (all types).
+    pub devices: u64,
+    /// Stream Tokens minted, revoked included.
+    pub streams: u64,
+    /// SSE connections currently open.
+    pub active_streams: u64,
+    /// Stored Pushes replay could return (retention-aware).
+    pub pending_messages: u64,
 }
 
 impl ServerClient {
@@ -100,7 +120,15 @@ impl ServerClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             http: reqwest::Client::new(),
+            basic_auth: None,
         }
+    }
+
+    /// Present operator Basic Auth on every request (§1.4) — the face a
+    /// Basic-Auth-protected server demands for observation and minting.
+    pub fn with_basic_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
+        self.basic_auth = Some((user.into(), password.into()));
+        self
     }
 
     /// The canonical server base URL (no trailing slash) this client
@@ -174,9 +202,7 @@ impl ServerClient {
     ) -> Result<Vec<StreamTokenSummary>, ServerError> {
         let url = format!("{}/realtime/v1/devices/{device_key}/streams", self.base_url);
         let response = self
-            .http
-            .get(&url)
-            .header("X-Device-Key", device_key)
+            .authorize(self.http.get(&url).header("X-Device-Key", device_key))
             .send()
             .await?;
         let envelope = Self::decode(response).await?;
@@ -203,14 +229,26 @@ impl ServerClient {
             self.base_url
         );
         let response = self
-            .http
-            .delete(&url)
-            .header("X-Device-Key", device_key)
+            .authorize(self.http.delete(&url).header("X-Device-Key", device_key))
             .send()
             .await?;
         let envelope = Self::decode(response).await?;
         let data = envelope.data.expect("revoke success carries data");
         Ok(summary_from(&data))
+    }
+
+    /// Fetch `/info` (protocol §2.3): build info plus live statistics.
+    /// The route answers a bare JSON map (no envelope); a refusal comes
+    /// back as [`ServerError::Unexpected`] with the body as its message.
+    pub async fn info(&self) -> Result<ServerInfo, ServerError> {
+        let request = self.authorize(self.http.get(format!("{}/info", self.base_url)));
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(ServerError::Unexpected { status, message });
+        }
+        Ok(response.json().await?)
     }
 
     /// Shared `POST /register` flow for both registration flavors.
@@ -239,8 +277,17 @@ impl ServerClient {
         if let Some(key) = device_key {
             request = request.header("X-Device-Key", key);
         }
-        let response = request.send().await?;
+        let response = self.authorize(request).send().await?;
         Self::decode(response).await
+    }
+
+    /// Present the operator Basic Auth on a request being built (§1.4) —
+    /// a no-op for an open server.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.basic_auth {
+            Some((user, password)) => request.basic_auth(user, Some(password)),
+            None => request,
+        }
     }
 
     /// Decode a response into its envelope, mapping non-200 codes onto

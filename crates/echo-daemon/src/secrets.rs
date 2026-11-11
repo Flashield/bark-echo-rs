@@ -78,8 +78,10 @@ pub enum SecretError {
 }
 
 /// Where a Subscription's secrets live. Implementations: the OS keyring
-/// (normal mode) and the 0600 plain file (`--plain-secrets`).
-pub trait SecretStore {
+/// (normal mode) and the 0600 plain file (`--plain-secrets`). The
+/// runtime holds the store behind an `Arc` across await points, so the
+/// trait carries `Send + Sync`.
+pub trait SecretStore: Send + Sync {
     /// Store `secret` under `key`/`kind`, replacing any previous value.
     fn set(&self, key: &SecretKey, kind: SecretKind, secret: &str) -> Result<(), SecretError>;
     /// Fetch the secret stored under `key`/`kind`.
