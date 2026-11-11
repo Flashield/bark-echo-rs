@@ -691,6 +691,7 @@ dependencies = [
  "keyring",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
