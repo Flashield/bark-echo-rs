@@ -261,6 +261,61 @@ async fn duplicate_ids_at_or_below_the_cursor_never_emit_intents() {
 }
 
 #[tokio::test]
+async fn killing_and_reopening_the_stream_replays_exactly_the_gap() {
+    let harness = common::Subscribed::spawn().await;
+    let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
+    common::wait_active_streams(&harness.server, 1).await;
+
+    // Two pushes while connected: both surface, in id order.
+    harness.push(serde_json::json!({ "body": "one" })).await;
+    harness.push(serde_json::json!({ "body": "two" })).await;
+    let one = next_intent(&mut intents).await;
+    let two = next_intent(&mut intents).await;
+    assert_eq!((one.id, one.body.as_str()), (1, "one"));
+    assert_eq!((two.id, two.body.as_str()), (2, "two"));
+
+    // Kill the stream mid-sequence.
+    handle.stop().await;
+
+    // Pushes with no live stream are persisted for replay (§3.7) — this is
+    // the gap the reopened stream must heal.
+    harness.push(serde_json::json!({ "body": "three" })).await;
+    harness.push(serde_json::json!({ "body": "four" })).await;
+
+    // Reopen. The History Log's last line (id 2) is the reconnect cursor
+    // (GLOSSARY) and rides as Last-Event-ID; the server replays exactly
+    // the gap, then hands off to live delivery (§3.5).
+    let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
+    let three = next_intent(&mut intents).await;
+    let four = next_intent(&mut intents).await;
+    assert_eq!((three.id, three.body.as_str()), (3, "three"));
+    assert_eq!((four.id, four.body.as_str()), (4, "four"));
+
+    // Live again: a fresh push surfaces once, and nothing old re-surfaces.
+    harness.push(serde_json::json!({ "body": "five" })).await;
+    let five = next_intent(&mut intents).await;
+    assert_eq!((five.id, five.body.as_str()), (5, "five"));
+    assert_no_intent(&mut intents, 300).await;
+
+    // The whole sequence, exactly once: no loss, no duplicate reached the
+    // intent output, and the cursor sits on the tail.
+    let log = HistoryLog::new(harness.history_path());
+    let entries = log.entries().expect("history entries");
+    assert_eq!(
+        entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        vec!["one", "two", "three", "four", "five"]
+    );
+    assert_eq!(log.cursor().expect("cursor"), Some(5));
+
+    handle.stop().await;
+    harness.server.shutdown().await;
+}
+
+#[tokio::test]
 async fn ext_params_map_to_click_actions_with_url_winning_over_copy() {
     let harness = common::Subscribed::spawn().await;
     let (handle, mut intents) = RealtimeStream::spawn(config_for(&harness));
