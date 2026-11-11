@@ -2,3 +2,5 @@
 //! subscriptions, the History Log, and the bark-server client face.
 //! Platform I/O (keyring, notifications, config files) lives in
 //! echo-daemon, never here.
+
+pub mod server;
