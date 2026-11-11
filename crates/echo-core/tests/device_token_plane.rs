@@ -70,3 +70,37 @@ async fn minting_a_stream_token_returns_the_full_secret_with_id_and_hint() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn listing_stream_tokens_returns_creation_order_summaries_with_hints() {
+    let server = common::TestServer::spawn().await;
+    let client = ServerClient::new(&server.base_url);
+    let device = client.register_stream_device().await.expect("register");
+    let first = client
+        .mint_stream_token(&device.device_key, "macbook-reminder")
+        .await
+        .expect("mint");
+    let second = client
+        .mint_stream_token(&device.device_key, "android-phone")
+        .await
+        .expect("mint");
+
+    let tokens = client
+        .list_stream_tokens(&device.device_key)
+        .await
+        .expect("list");
+
+    assert_eq!(tokens.len(), 2, "one entry per minted token");
+    // Creation order (protocol §3.2).
+    assert_eq!(tokens[0].token_id, first.token_id);
+    assert_eq!(tokens[1].token_id, second.token_id);
+    // Summaries carry label and hint matching mint time — the summary has
+    // no secret field: the full secret left the server exactly once.
+    assert_eq!(tokens[0].client_label, "macbook-reminder");
+    assert_eq!(tokens[0].token_hint, first.token_hint);
+    assert_eq!(tokens[1].client_label, "android-phone");
+    assert_eq!(tokens[1].token_hint, second.token_hint);
+    assert!(!tokens[0].revoked, "freshly minted token is live");
+
+    server.shutdown().await;
+}

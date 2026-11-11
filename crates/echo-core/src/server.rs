@@ -55,6 +55,20 @@ pub struct MintedStreamToken {
     pub client_label: String,
 }
 
+/// A Stream Token as seen in list/revoke answers (protocol §3.2): the
+/// token's public identity and state — the secret is structurally absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamTokenSummary {
+    /// 16 lowercase hex chars — the handle for revoke.
+    pub token_id: String,
+    /// First 12 characters of the secret + `...`.
+    pub token_hint: String,
+    /// The label the token was minted with.
+    pub client_label: String,
+    /// True once [`ServerClient::revoke_stream_token`] has succeeded.
+    pub revoked: bool,
+}
+
 /// A client of one bark server's Device/Token plane.
 #[derive(Debug, Clone)]
 pub struct ServerClient {
@@ -128,6 +142,44 @@ impl ServerClient {
         })
     }
 
+    /// List a Device's Stream Token summaries (protocol §3.2): creation
+    /// order, `token_id` + `token_hint` identity, never the secret.
+    pub async fn list_stream_tokens(
+        &self,
+        device_key: &str,
+    ) -> Result<Vec<StreamTokenSummary>, ServerError> {
+        let url = format!("{}/realtime/v1/devices/{device_key}/streams", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .header("X-Device-Key", device_key)
+            .send()
+            .await?;
+        let envelope = Self::decode(response).await?;
+        let data = envelope.data.expect("list success carries data");
+        let summaries = data
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .map(|entry| StreamTokenSummary {
+                token_id: entry["token_id"]
+                    .as_str()
+                    .expect("token_id is a string")
+                    .to_owned(),
+                token_hint: entry["token_hint"]
+                    .as_str()
+                    .expect("token_hint is a string")
+                    .to_owned(),
+                client_label: entry["client_label"]
+                    .as_str()
+                    .expect("client_label is a string")
+                    .to_owned(),
+                revoked: entry["revoked"].as_bool().expect("revoked is a bool"),
+            })
+            .collect();
+        Ok(summaries)
+    }
+
     /// Shared `POST /register` flow for both registration flavors.
     async fn register(&self, body: serde_json::Value) -> Result<StreamDevice, ServerError> {
         let envelope = self
@@ -155,6 +207,12 @@ impl ServerClient {
             request = request.header("X-Device-Key", key);
         }
         let response = request.send().await?;
+        Self::decode(response).await
+    }
+
+    /// Decode a response into its envelope, mapping non-200 codes onto
+    /// [`ServerError`].
+    async fn decode(response: reqwest::Response) -> Result<Envelope, ServerError> {
         let status = response.status().as_u16();
         let envelope: Envelope = response.json().await?;
         if envelope.code == 200 {
