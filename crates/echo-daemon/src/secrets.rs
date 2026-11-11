@@ -7,13 +7,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Which of a Subscription's two secrets is being addressed.
+/// Which secret is being addressed: a Subscription's two (Device Key,
+/// Stream Token) or the operator's per-server Basic Auth password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The Device Key — authorizes pushing and token minting (§3.2).
     DeviceKey,
     /// The Stream Token — authorizes reading the Realtime Stream (§3.2).
     StreamToken,
+    /// The operator Basic Auth password for one server (§1.4, story 18)
+    /// — keyed by server alone, shared by every Subscription on it.
+    BasicAuthPassword,
 }
 
 impl SecretKind {
@@ -22,6 +26,7 @@ impl SecretKind {
         match self {
             SecretKind::DeviceKey => "device-key",
             SecretKind::StreamToken => "stream-token",
+            SecretKind::BasicAuthPassword => "basic-auth-password",
         }
     }
 }
@@ -39,6 +44,25 @@ pub struct SecretKey {
 }
 
 impl SecretKey {
+    /// The key for one Subscription's secrets: the server plus its Stream
+    /// Token's `token_id` (the Subscription's id, ADR-0001).
+    pub fn for_subscription(server: impl Into<String>, token_id: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            token_id: token_id.into(),
+        }
+    }
+
+    /// The per-server key the operator's Basic Auth password lives under
+    /// (§1.4, story 18): one credential per server, shared by every
+    /// Subscription on it.
+    pub fn for_server(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            token_id: String::new(),
+        }
+    }
+
     /// The human-readable address of one secret — what NotFound errors
     /// quote and what the keyring account line looks like.
     fn account(&self, kind: SecretKind) -> String {

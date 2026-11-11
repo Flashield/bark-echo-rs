@@ -12,6 +12,7 @@ use echo_core::pull::PullConfig;
 use echo_core::push::{Push, PushClient};
 use echo_core::server::ServerClient;
 
+use echo_daemon::auth;
 use echo_daemon::config::Config;
 use echo_daemon::history;
 use echo_daemon::notify::DesktopRenderer;
@@ -63,6 +64,14 @@ enum Command {
         /// suppressed by dedup.
         #[arg(long, default_value_t = 0)]
         cursor: u64,
+        /// The operator Basic Auth user (§1.4) — overrides the stored
+        /// credentials.
+        #[arg(long)]
+        user: Option<String>,
+        /// The operator Basic Auth password (§1.4) — overrides the stored
+        /// credentials.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Read a Subscription's History Log back for auditing (GLOSSARY).
     Log {
@@ -113,6 +122,15 @@ enum SubscribeCommand {
         /// (default: this machine's hostname).
         #[arg(long)]
         label: Option<String>,
+        /// The operator Basic Auth user (§1.4) for a protected server —
+        /// stored (with the password) so every later connection rides
+        /// it; without these flags no credentials are set.
+        #[arg(long)]
+        auth_user: Option<String>,
+        /// The operator Basic Auth password (§1.4) — stored in the secret
+        /// store under the server's key, never in config.toml.
+        #[arg(long)]
+        auth_password: Option<String>,
     },
     /// List Subscriptions with their token hints.
     List,
@@ -188,13 +206,11 @@ struct BasicAuthArgs {
 }
 
 impl BasicAuthArgs {
-    /// The credentials as the server face takes them, `None` when neither
-    /// flag is given.
-    fn into_basic_auth(self) -> Option<(String, String)> {
-        match (self.user, self.password) {
-            (None, None) => None,
-            (user, password) => Some((user.unwrap_or_default(), password.unwrap_or_default())),
-        }
+    /// The flags as the resolution seam takes them: `(user, password)`,
+    /// either `None` when its flag is absent (the stored credentials fill
+    /// it then).
+    fn parts(&self) -> (Option<&str>, Option<&str>) {
+        (self.user.as_deref(), self.password.as_deref())
     }
 }
 
@@ -217,9 +233,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match cli.command {
-        Command::Push { args } => run_push(&args).await?,
-        Command::Pull { sub, cursor } => {
-            run_pull(&paths, &config, store.as_ref(), sub.as_deref(), cursor).await?
+        Command::Push { args } => {
+            run_push(&config, store.as_ref(), &args).await?;
+        }
+        Command::Pull {
+            sub,
+            cursor,
+            user,
+            password,
+        } => {
+            run_pull(
+                &paths,
+                &config,
+                store.as_ref(),
+                sub.as_deref(),
+                cursor,
+                user.as_deref(),
+                password.as_deref(),
+            )
+            .await?
         }
         Command::Log { sub, follow, tail } => {
             run_log(&paths, &config, sub.as_deref(), follow, tail).await?
@@ -229,6 +261,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 server,
                 source,
                 label,
+                auth_user,
+                auth_password,
             } => {
                 // The arg group guarantees exactly one source; the else
                 // arm only keeps this panic-free should that ever change.
@@ -240,9 +274,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Err("either --own or --device-key KEY is required".into());
                 };
                 let label = label.unwrap_or_else(default_label);
+                // Operator Basic Auth (§1.4, story 18): the client presents
+                // the credentials for minting; `add` then stores the
+                // password and lays the user + marker into the config.
                 let client = ServerClient::new(&server);
+                let client = match (&auth_user, &auth_password) {
+                    (None, None) => client,
+                    (user, password) => client.with_basic_auth(
+                        user.clone().unwrap_or_default(),
+                        password.clone().unwrap_or_default(),
+                    ),
+                };
+                let auth = (auth_user.is_some() || auth_password.is_some()).then(|| {
+                    echo_core::stream::BasicAuth {
+                        user: auth_user.unwrap_or_default(),
+                        password: auth_password.unwrap_or_default(),
+                    }
+                });
                 let added =
-                    subscribe::add(&mut config, store.as_ref(), &client, source, &label).await?;
+                    subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
+                        .await?;
                 config.save(&paths.config_file())?;
                 println!("device key: {}", added.device_key);
                 println!(
@@ -278,9 +329,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             TokenCommand::List {
                 server,
                 device_key,
-                auth,
+                auth: auth_flags,
             } => {
-                let client = token_client(&server, auth)?;
+                let client = token_client(&config, store.as_ref(), &server, auth_flags)?;
                 let tokens = client.list_stream_tokens(&device_key).await?;
                 if tokens.is_empty() {
                     println!("no stream tokens");
@@ -297,9 +348,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 server,
                 device_key,
                 token_id,
-                auth,
+                auth: auth_flags,
             } => {
-                let client = token_client(&server, auth)?;
+                let client = token_client(&config, store.as_ref(), &server, auth_flags)?;
                 let token = client.revoke_stream_token(&device_key, &token_id).await?;
                 println!(
                     "stream token {} revoked (label: {})",
@@ -320,7 +371,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Command::Status => {
-            let report = status::report(&paths, &config).await?;
+            let report = status::report(&paths, &config, store.as_ref()).await?;
             print!("{}", report.render());
         }
     }
@@ -331,13 +382,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Messages into its History Log (GLOSSARY: Pull) — silent, no intents,
 /// no notifications — reporting the ingested count. The Stream Token comes
 /// from the secret store; the per-server Basic Auth credentials (§1.4)
-/// ride along when the config carries them.
+/// are the stored ones (story 18) unless the flags override them.
 async fn run_pull(
     paths: &Paths,
     config: &Config,
     store: &dyn SecretStore,
     label: Option<&str>,
     cursor: u64,
+    flag_user: Option<&str>,
+    flag_password: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let subscription = history::resolve_subscription(config, label)?;
     let token = history::stream_token(store, &subscription)?;
@@ -347,7 +400,13 @@ async fn run_pull(
         history::history_log(paths, &subscription),
     );
     pull_config.cursor = cursor as i64;
-    pull_config.basic_auth = history::basic_auth(config, &subscription);
+    pull_config.basic_auth = auth::resolve(
+        config,
+        store,
+        &subscription.server,
+        flag_user,
+        flag_password,
+    )?;
     let report = echo_core::pull::pull(pull_config).await?;
     println!("pulled {} messages", report.ingested);
     Ok(())
@@ -385,9 +444,15 @@ async fn run_log(
 /// targets any Device, mapping its flags onto the send module's Push
 /// (protocol §2.2). The flags are parsed here rather than by clap's typed
 /// args so that flag order never matters and unknown `--key value` pairs
-/// ride through as Ext Params verbatim. Failures surface the server's
-/// message and code; `run` prints them and exits non-zero.
-async fn run_push(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// ride through as Ext Params verbatim. The Basic Auth credentials (§1.4)
+/// are the stored ones (story 18) unless the flags override them.
+/// Failures surface the server's message and code; `run` prints them and
+/// exits non-zero.
+async fn run_push(
+    config: &Config,
+    store: &dyn SecretStore,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = None;
     let mut device_key = None;
     let mut title = None;
@@ -442,26 +507,37 @@ async fn run_push(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = PushClient::new(&server);
-    let client = if user.is_some() || password.is_some() {
-        client.with_basic_auth(user.unwrap_or_default(), password.unwrap_or_default())
-    } else {
-        client
+    let client = match auth::resolve(config, store, &server, user.as_deref(), password.as_deref())?
+    {
+        Some(auth) => client.with_basic_auth(auth.user, auth.password),
+        None => client,
     };
     client.send(&push).await?;
     Ok(())
 }
 
 /// The server client the `token` subcommands talk through, carrying the
-/// operator Basic Auth credentials (§1.4) when the flags name them.
+/// operator Basic Auth credentials (§1.4) — the stored ones (story 18)
+/// unless the flags override them.
 fn token_client(
+    config: &Config,
+    store: &dyn SecretStore,
     server: &str,
-    auth: BasicAuthArgs,
+    auth_flags: BasicAuthArgs,
 ) -> Result<ServerClient, Box<dyn std::error::Error>> {
     let client = ServerClient::new(server);
-    Ok(match auth.into_basic_auth() {
-        Some((user, password)) => client.with_basic_auth(user, password),
-        None => client,
-    })
+    Ok(
+        match auth::resolve(
+            config,
+            store,
+            server,
+            auth_flags.parts().0,
+            auth_flags.parts().1,
+        )? {
+            Some(auth) => client.with_basic_auth(auth.user, auth.password),
+            None => client,
+        },
+    )
 }
 
 /// The default client label: this machine's name (spec story 3), from

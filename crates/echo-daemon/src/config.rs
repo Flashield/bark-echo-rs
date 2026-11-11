@@ -46,8 +46,10 @@ pub struct Subscription {
     pub device_hint: String,
 }
 
-/// Per-server settings (protocol §1.4): Basic Auth credentials an
-/// operator may put in front of a bark server.
+/// Per-server settings (protocol §1.4): the operator Basic Auth an
+/// operator may put in front of a bark server. The user and a
+/// stored-password marker live here; the password itself is a secret and
+/// lives in the secret store (spec story 18) under the server's key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerEntry {
@@ -56,9 +58,10 @@ pub struct ServerEntry {
     /// Basic Auth user, empty when the server is open.
     #[serde(default)]
     pub basic_auth_user: String,
-    /// Basic Auth password, empty when the server is open.
+    /// Whether a Basic Auth password is stored in the secret store for
+    /// this server.
     #[serde(default)]
-    pub basic_auth_password: String,
+    pub basic_auth_password_stored: bool,
 }
 
 /// Failures of loading or saving the config file — every variant names
@@ -84,17 +87,15 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// The operator Basic Auth (protocol §1.4) `server` demands, taken
-    /// from the per-server entries — the credentials stream connects and
-    /// `/info` observations present alongside the Stream Token.
-    pub fn basic_auth(&self, server: &str) -> Option<echo_core::stream::BasicAuth> {
+    /// The operator Basic Auth user (protocol §1.4) configured for
+    /// `server`, from the per-server entry — the password is never here;
+    /// it lives in the secret store (story 18) and is resolved by
+    /// [`crate::auth`].
+    pub fn basic_auth_user(&self, server: &str) -> Option<String> {
         self.servers
             .iter()
             .find(|entry| entry.url == server && !entry.basic_auth_user.is_empty())
-            .map(|entry| echo_core::stream::BasicAuth {
-                user: entry.basic_auth_user.clone(),
-                password: entry.basic_auth_password.clone(),
-            })
+            .map(|entry| entry.basic_auth_user.clone())
     }
 
     /// Load the config at `path`. A missing file is a fresh install and

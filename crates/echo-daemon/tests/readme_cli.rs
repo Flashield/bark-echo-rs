@@ -78,7 +78,10 @@ fn parse_invocation(tokens: &[String]) -> Invocation {
             {
                 index += 1;
             }
-        } else if (path.is_empty() || path.last().map(String::as_str) == Some("subscribe"))
+        } else if (path.is_empty()
+            || path
+                .last()
+                .is_some_and(|name: &String| ["subscribe", "token"].contains(&name.as_str())))
             && is_command_word(token)
         {
             // A lowercase word is a command name candidate; placeholders
@@ -153,8 +156,10 @@ fn clean_token(token: &str) -> String {
 fn every_command_and_flag_the_readme_shows_exists_in_the_cli() {
     let top_help = run_help(&[]);
     let subscribe_help = run_help(&["subscribe"]);
+    let token_help = run_help(&["token"]);
     let top_commands = command_names(&top_help);
     let subscribe_commands = command_names(&subscribe_help);
+    let token_commands = command_names(&token_help);
     assert!(
         top_commands.contains(&"subscribe".to_owned()),
         "help parsing broke: {top_commands:?}"
@@ -185,6 +190,13 @@ fn every_command_and_flag_the_readme_shows_exists_in_the_cli() {
                 // checked against `subscribe --help`.
                 subscribe_commands.as_slice(),
                 vec!["subscribe", *leaf],
+            ),
+            ["token"] => (token_commands.as_slice(), vec!["token"]),
+            ["token", leaf] => (
+                // Same two-level shape as `subscribe`: the leaf's own
+                // help carries its flags.
+                token_commands.as_slice(),
+                vec!["token", *leaf],
             ),
             [command] => {
                 assert!(

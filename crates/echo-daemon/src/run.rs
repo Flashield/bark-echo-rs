@@ -133,12 +133,34 @@ pub async fn run(
                 continue;
             }
         };
+        // The operator Basic Auth credentials (§1.4) out of the store
+        // (story 18): an unreachable store is this Subscription's failure
+        // to record, not the run's.
+        let basic_auth = match crate::auth::resolve(
+            &spec.config,
+            spec.store.as_ref(),
+            &subscription.server,
+            None,
+            None,
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                record(
+                    &state,
+                    &subscription.id,
+                    StreamState::Failed {
+                        detail: err.to_string(),
+                    },
+                );
+                continue;
+            }
+        };
 
         let (events_tx, events_rx) = mpsc::channel(64);
         let config = StreamConfig {
             base_url: subscription.server.clone(),
             stream_token: secret,
-            basic_auth: spec.config.basic_auth(&subscription.server),
+            basic_auth,
             history_log: HistoryLog::new(spec.paths.history_log(&subscription.id)),
             backoff: Default::default(),
             // The server's default keep-alive interval (§3.4): the idle

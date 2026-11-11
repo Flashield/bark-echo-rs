@@ -8,7 +8,6 @@ mod common;
 
 use common::Harness;
 use echo_daemon::config::Config;
-use echo_daemon::secrets::{PlainFileStore, SecretKey, SecretKind, SecretStore};
 
 /// Push one V2 JSON Push carrying `body` (the daemon is not running —
 /// the Push piles up in the server's store-and-forward store), with
@@ -102,77 +101,37 @@ async fn pull_after_offline_pushes_lands_the_history_log_and_reports_the_count()
 }
 
 #[tokio::test]
-async fn pull_sends_the_basic_auth_credentials_configured_for_the_server() {
-    // Behind operator Basic Auth (protocol §1.4) the CLI cannot subscribe
-    // by itself (minting demands the credentials), so the Subscription is
-    // laid out the way an operator would: config + secrets written by the
-    // setup tooling — the pull then rides the config's credentials.
+async fn pull_rides_the_stored_basic_auth_credentials() {
+    // Behind operator Basic Auth (protocol §1.4) the credentials are laid
+    // in once at add time — the password into the secret store (story
+    // 18) — and the pull rides them with no flags at all.
     let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
     let harness = Harness::new();
-    let paths = harness.paths();
-    std::fs::create_dir_all(&paths.config_dir).expect("config dir");
 
-    // /register is Basic-Auth-exempt (§1.4); minting is not.
-    let envelope: serde_json::Value = reqwest::Client::new()
-        .post(format!("{}/register", server.base_url))
-        .json(&serde_json::json!({ "device_type": "stream" }))
-        .send()
+    let stdout = harness
+        .run(&[
+            "--plain-secrets",
+            "subscribe",
+            "add",
+            "--server",
+            &server.base_url,
+            "--own",
+            "--label",
+            "laptop",
+            "--auth-user",
+            "operator",
+            "--auth-password",
+            "hunter2",
+        ])
         .await
-        .expect("register")
-        .json()
-        .await
-        .expect("register envelope");
-    let device_key = envelope["data"]["device_key"]
-        .as_str()
-        .expect("key")
-        .to_owned();
-    let minted: serde_json::Value = reqwest::Client::new()
-        .post(format!(
-            "{}/realtime/v1/devices/{}/streams",
-            server.base_url, device_key
-        ))
-        .header("X-Device-Key", &device_key)
-        .basic_auth("operator", Some("hunter2"))
-        .json(&serde_json::json!({ "client_label": "laptop" }))
-        .send()
-        .await
-        .expect("mint")
-        .json()
-        .await
-        .expect("mint envelope");
-    let token = minted["data"]["token"].as_str().expect("token").to_owned();
-    let token_id = minted["data"]["token_id"]
-        .as_str()
-        .expect("token id")
+        .stdout_or_die("subscribe add behind Basic Auth");
+    let device_key = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("device key: "))
+        .expect("device key")
         .to_owned();
 
-    let config = Config {
-        subscriptions: vec![echo_daemon::config::Subscription {
-            id: token_id.clone(),
-            server: server.base_url.clone(),
-            label: "laptop".to_owned(),
-            token_hint: format!("{}...", &token[..12]),
-            device_hint: format!("{}...", &device_key[..8]),
-        }],
-        servers: vec![echo_daemon::config::ServerEntry {
-            url: server.base_url.clone(),
-            basic_auth_user: "operator".to_owned(),
-            basic_auth_password: "hunter2".to_owned(),
-        }],
-    };
-    config.save(&paths.config_file()).expect("config saved");
-    let store = PlainFileStore::new(paths.secrets_file());
-    store
-        .set(
-            &SecretKey {
-                server: server.base_url.clone(),
-                token_id,
-            },
-            SecretKind::StreamToken,
-            &token,
-        )
-        .expect("token stored");
-
+    // No daemon running: the Push is retained for replay (§3.7).
     push(
         &server,
         &device_key,
@@ -184,7 +143,7 @@ async fn pull_sends_the_basic_auth_credentials_configured_for_the_server() {
     let run = harness.run(&["--plain-secrets", "pull"]).await;
     assert!(
         run.success && run.stdout.contains("1"),
-        "the pull rides the config's Basic Auth credentials, got: {}/{}",
+        "the pull rides the stored Basic Auth credentials, got: {}/{}",
         run.stderr,
         run.stdout
     );

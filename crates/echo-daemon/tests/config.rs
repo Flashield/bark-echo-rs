@@ -35,7 +35,7 @@ fn saving_and_loading_round_trips_subscriptions_and_server_entries() {
         servers: vec![ServerEntry {
             url: "https://bark.example.org".to_owned(),
             basic_auth_user: "operator".to_owned(),
-            basic_auth_password: "s3cret".to_owned(),
+            basic_auth_password_stored: true,
         }],
     };
 

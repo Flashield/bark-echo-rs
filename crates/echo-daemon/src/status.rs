@@ -6,9 +6,11 @@
 
 use echo_core::server::{ServerClient, ServerInfo};
 
+use crate::auth;
 use crate::config::Config;
 use crate::lock::{DaemonLock, LockError};
 use crate::paths::Paths;
+use crate::secrets::SecretStore;
 use crate::state::{StateError, StateFile, StreamState};
 
 /// Why the status report could not be assembled.
@@ -53,9 +55,14 @@ pub struct StatusReport {
 }
 
 /// Assemble the report: probe the lock, read the state file, fetch each
-/// server's `/info` live. No secrets are read — the state file and the
-/// config hold everything public the face needs.
-pub async fn report(paths: &Paths, config: &Config) -> Result<StatusReport, StatusError> {
+/// server's `/info` live. Displayed data is all public; the only secret
+/// read is the operator Basic Auth password out of the store (story 18)
+/// when a protected server's `/info` demands it — never displayed.
+pub async fn report(
+    paths: &Paths,
+    config: &Config,
+    store: &dyn SecretStore,
+) -> Result<StatusReport, StatusError> {
     let daemon_running = DaemonLock::probe(paths.lock_file())?;
     let state = StateFile::read(&paths.state_file())?;
 
@@ -64,12 +71,18 @@ pub async fn report(paths: &Paths, config: &Config) -> Result<StatusReport, Stat
         let runtime = state
             .as_ref()
             .and_then(|state| state.subscriptions.get(&subscription.id));
-        let client = ServerClient::new(&subscription.server);
-        let client = match config.basic_auth(&subscription.server) {
-            Some(auth) => client.with_basic_auth(auth.user, auth.password),
-            None => client,
+        let info = match auth::resolve(config, store, &subscription.server, None, None) {
+            Ok(Some(credentials)) => ServerClient::new(&subscription.server)
+                .with_basic_auth(credentials.user, credentials.password)
+                .info()
+                .await
+                .map_err(|err| err.to_string()),
+            Ok(None) => ServerClient::new(&subscription.server)
+                .info()
+                .await
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
         };
-        let info = client.info().await.map_err(|err| err.to_string());
         subscriptions.push(SubscriptionStatus {
             id: subscription.id.clone(),
             label: subscription.label.clone(),

@@ -7,7 +7,6 @@
 
 use echo_core::history::HistoryLog;
 use echo_core::intent::{ClickAction, NotificationIntent};
-use echo_core::stream::BasicAuth;
 
 use crate::config::{Config, Subscription};
 use crate::paths::Paths;
@@ -72,19 +71,6 @@ pub fn stream_token(
         token_id: subscription.id.clone(),
     };
     Ok(store.get(&key, SecretKind::StreamToken)?)
-}
-
-/// The per-server Basic Auth credentials (protocol §1.4) configured for
-/// the Subscription's server, when the config carries an entry for it.
-pub fn basic_auth(config: &Config, subscription: &Subscription) -> Option<BasicAuth> {
-    config
-        .servers
-        .iter()
-        .find(|entry| entry.url == subscription.server)
-        .map(|entry| BasicAuth {
-            user: entry.basic_auth_user.clone(),
-            password: entry.basic_auth_password.clone(),
-        })
 }
 
 /// One History Log entry, human-readable for the `log` command: the
