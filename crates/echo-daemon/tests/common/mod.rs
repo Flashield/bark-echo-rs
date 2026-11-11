@@ -212,7 +212,7 @@ impl Harness {
     }
 
     pub async fn run(&self, args: &[&str]) -> Run {
-        let output = self.spawn(args).output().await.expect("spawn echo-daemon");
+        let output = self.spawn(args).output().await.expect("spawn bark-echo");
         Run {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -224,7 +224,7 @@ impl Harness {
     /// the test reads stdout incrementally and kills the child.
     #[cfg(unix)]
     pub fn spawn(&self, args: &[&str]) -> tokio::process::Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bark-echo"));
         command
             .args(args)
             .env("HOME", self.home.path())
@@ -234,7 +234,7 @@ impl Harness {
 
     #[cfg(windows)]
     pub fn spawn(&self, args: &[&str]) -> tokio::process::Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bark-echo"));
         command.env("APPDATA", self.home.path().join("AppData/Roaming"));
         command
     }

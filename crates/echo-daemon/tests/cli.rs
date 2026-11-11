@@ -55,7 +55,7 @@ impl Harness {
     }
 
     async fn run(&self, args: &[&str]) -> Run {
-        let output = self.spawn(args).output().await.expect("spawn echo-daemon");
+        let output = self.spawn(args).output().await.expect("spawn bark-echo");
         Run {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -65,7 +65,7 @@ impl Harness {
 
     #[cfg(unix)]
     fn spawn(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bark-echo"));
         command
             .args(args)
             .env("HOME", self.home.path())
@@ -75,7 +75,7 @@ impl Harness {
 
     #[cfg(windows)]
     fn spawn(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_echo-daemon"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bark-echo"));
         command
             .args(args)
             .env("APPDATA", self.home.path().join("AppData/Roaming"));
