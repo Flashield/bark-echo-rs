@@ -30,6 +30,9 @@ impl TestServer {
     /// [`TestServer::spawn`] with operator Basic Auth enabled (protocol
     /// §1.4): every path except `/ping`, `/register` and `/healthz`
     /// demands the credentials.
+    // common/ is compiled into every test target; these constructors are
+    // shared per target, not used everywhere.
+    #[allow(dead_code)]
     pub async fn spawn_with_basic_auth(user: &str, password: &str) -> Self {
         Self::spawn_configuring(|config| {
             config.basic_auth_user = user.to_string();
@@ -40,6 +43,7 @@ impl TestServer {
 
     /// [`TestServer::spawn`] with the APNs endpoint pointed at `endpoint`
     /// (TLS verification off) — the stub route for iOS-type Devices.
+    #[allow(dead_code)]
     pub async fn spawn_with_apns(endpoint: &str) -> Self {
         Self::spawn_configuring(|config| {
             config.apns_endpoint = endpoint.to_string();
