@@ -84,6 +84,19 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// The operator Basic Auth (protocol §1.4) `server` demands, taken
+    /// from the per-server entries — the credentials stream connects and
+    /// `/info` observations present alongside the Stream Token.
+    pub fn basic_auth(&self, server: &str) -> Option<echo_core::stream::BasicAuth> {
+        self.servers
+            .iter()
+            .find(|entry| entry.url == server && !entry.basic_auth_user.is_empty())
+            .map(|entry| echo_core::stream::BasicAuth {
+                user: entry.basic_auth_user.clone(),
+                password: entry.basic_auth_password.clone(),
+            })
+    }
+
     /// Load the config at `path`. A missing file is a fresh install and
     /// yields an empty [`Config`]; anything unreadable or unparseable is
     /// an error naming the file and the spot.

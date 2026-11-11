@@ -93,6 +93,48 @@ impl DaemonLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Liveness probe: is a daemon running (its lock held) at `path`?
+    /// Never creates the file — an absent lock file means nothing has
+    /// ever run here. Transient collisions with a starting daemon are
+    /// the caller's to absorb (`run` retries; a probe answer that flips
+    /// a heartbeat later is harmless).
+    pub fn probe(path: impl AsRef<Path>) -> Result<bool, LockError> {
+        let path = path.as_ref().to_path_buf();
+        let file = std::fs::OpenOptions::new()
+            .create(false)
+            .write(true)
+            .open(&path)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // Nothing has ever run here.
+                    std::io::Error::from(std::io::ErrorKind::Other)
+                } else {
+                    err
+                }
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::Other => return Ok(false),
+            Err(source) => {
+                return Err(LockError::Io {
+                    doing: "probe",
+                    path,
+                    source,
+                });
+            }
+        };
+        match try_lock(&file) {
+            // Acquired: no daemon is running; drop the transient hold.
+            Ok(()) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(source) => Err(LockError::Io {
+                doing: "probe",
+                path,
+                source,
+            }),
+        }
+    }
 }
 
 /// Try to lock the whole file exclusively, without waiting.

@@ -46,3 +46,23 @@ fn locks_on_different_paths_do_not_contend() {
     let _one = DaemonLock::acquire(dir.path().join("one.lock")).expect("first path");
     let _two = DaemonLock::acquire(dir.path().join("two.lock")).expect("second path");
 }
+
+#[test]
+fn a_probe_never_creates_the_file_and_answers_whether_a_daemon_holds_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("daemon.lock");
+
+    // Nothing has ever run: absent file, answered as free — and the
+    // probe must not have fabricated the file as a side effect.
+    assert!(!DaemonLock::probe(&path).expect("probe absent"), "free");
+    assert!(!path.exists(), "probing must not create the lock file");
+
+    let held = DaemonLock::acquire(&path).expect("acquire");
+    assert!(DaemonLock::probe(&path).expect("probe held"), "held");
+
+    drop(held);
+    assert!(
+        !DaemonLock::probe(&path).expect("probe released"),
+        "free again"
+    );
+}

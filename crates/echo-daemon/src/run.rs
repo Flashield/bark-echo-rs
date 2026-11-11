@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use echo_core::history::HistoryLog;
 use echo_core::intent::NotificationIntent;
-use echo_core::stream::{BasicAuth, RealtimeStream, StreamConfig, StreamEnd, StreamEvent};
+use echo_core::stream::{RealtimeStream, StreamConfig, StreamEnd, StreamEvent};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::lock::DaemonLock;
+use crate::lock::{DaemonLock, LockError};
 use crate::notify::NotificationRenderer;
 use crate::paths::Paths;
 use crate::secrets::{SecretKey, SecretKind, SecretStore};
@@ -74,8 +74,20 @@ pub async fn run(
     }
 
     // Two daemons would double-display every Push (ADR-0002): the loser
-    // of the lock leaves with a clear error.
-    let _lock = DaemonLock::acquire(spec.paths.lock_file())?;
+    // of the lock leaves with a clear error. The lock can also be held
+    // for a heartbeat by a `status` probe, so a starting daemon absorbs
+    // those transients before concluding a real second instance exists.
+    let mut attempts = 0;
+    let _lock = loop {
+        match DaemonLock::acquire(spec.paths.lock_file()) {
+            Ok(lock) => break lock,
+            Err(LockError::Held { .. }) if attempts < 6 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
     // The History Logs land here, one per Subscription (GLOSSARY); the
     // directory must exist before the first append or the receive loop
     // stops rather than emit unlogged intents.
@@ -126,7 +138,7 @@ pub async fn run(
         let config = StreamConfig {
             base_url: subscription.server.clone(),
             stream_token: secret,
-            basic_auth: basic_auth_for(&spec.config, &subscription.server),
+            basic_auth: spec.config.basic_auth(&subscription.server),
             history_log: HistoryLog::new(
                 spec.paths
                     .history_dir()
@@ -235,19 +247,6 @@ async fn supervise(
         // cancelled: the last live state stands.
         StreamEnd::Stopped => {}
     }
-}
-
-/// The operator Basic Auth a Subscription's server demands (§1.4), taken
-/// from the config's per-server entries.
-fn basic_auth_for(config: &Config, server: &str) -> Option<BasicAuth> {
-    config
-        .servers
-        .iter()
-        .find(|entry| entry.url == server && !entry.basic_auth_user.is_empty())
-        .map(|entry| BasicAuth {
-            user: entry.basic_auth_user.clone(),
-            password: entry.basic_auth_password.clone(),
-        })
 }
 
 /// Record a state change, tolerating a persist hiccup (the daemon keeps
