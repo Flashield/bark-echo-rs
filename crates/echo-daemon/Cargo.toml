@@ -1,0 +1,4 @@
+[package]
+name = "echo-daemon"
+version.workspace = true
+edition.workspace = true
