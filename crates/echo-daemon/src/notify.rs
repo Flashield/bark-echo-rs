@@ -45,7 +45,17 @@ impl NotificationRenderer for DesktopRenderer {
         if intent.click_action.is_some() {
             notification.action("default", action_label(intent));
         }
+        // The handle carries the async activation events where the
+        // platform has them. Windows toast activations live outside
+        // notify-rust's event model — the tray stage owns them
+        // (ADR-0002) — so there the handle is not needed (the toast is
+        // already shown by show() itself).
+        #[cfg(not(target_os = "windows"))]
         let handle = notification
+            .show()
+            .map_err(|err| RenderError::Show(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        notification
             .show()
             .map_err(|err| RenderError::Show(err.to_string()))?;
 
@@ -103,7 +113,10 @@ fn render_parts(intent: &NotificationIntent) -> (String, String) {
     }
 }
 
-/// What a click on the notification does (spec stories 11 and 12).
+/// What a click on the notification does (spec stories 11 and 12). Only
+/// the platforms that watch the notification's activation events call
+/// it — on Windows the tray stage owns activations (ADR-0002).
+#[cfg(not(target_os = "windows"))]
 fn perform_click(action: &ClickAction) {
     match action {
         ClickAction::OpenUrl { url } => {
@@ -120,6 +133,7 @@ fn perform_click(action: &ClickAction) {
 }
 
 /// Open a URL in the default browser.
+#[cfg(not(target_os = "windows"))]
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let mut command = {
@@ -144,6 +158,7 @@ fn open_url(url: &str) -> Result<(), String> {
 
 /// Place text on the system clipboard, by the platform's clipboard
 /// command fed over stdin (no clipboard crate).
+#[cfg(not(target_os = "windows"))]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     use std::io::Write;
 
