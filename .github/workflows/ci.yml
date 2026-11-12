@@ -4,6 +4,15 @@
 # suite runs on every runner). The CLI seam doubles as headless coverage:
 # CI has no secret service, and the suite pins the `--plain-secrets`
 # fallback there.
+#
+# Windows runs build + fmt + clippy on the first-party targets only, and
+# skips `clippy --all-targets` and `cargo test`: both compile the
+# dev-dependency bark-server-rs (the embedded in-process test server),
+# whose lib target does not build on Windows — it binds a UnixListener
+# unconditionally (upstream Flashield/bark-server-rs#13). Plain
+# `cargo build` compiles no dev-dependencies, so the released Windows
+# binary is unaffected (release.yml builds exactly that). Until the
+# upstream cfg(unix) fix lands, that gate stands.
 
 name: CI
 
@@ -38,11 +47,26 @@ jobs:
       - name: Formatting
         run: cargo fmt --check --all
 
+      # Windows: first-party targets only — --all-targets pulls the
+      # dev-dependency that cannot compile there (see the file header).
+      - name: Lints (first-party targets)
+        if: runner.os == 'Windows'
+        run: cargo clippy --lib --bins -- -D warnings
+
       - name: Lints
+        if: runner.os != 'Windows'
         run: cargo clippy --all-targets -- -D warnings
 
+      # Windows: plain build — --all-targets would compile the test
+      # targets and their dev-dependency (see the file header).
+      - name: Build (first-party targets)
+        if: runner.os == 'Windows'
+        run: cargo build --workspace
+
       - name: Build
+        if: runner.os != 'Windows'
         run: cargo build --workspace --all-targets
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --workspace
