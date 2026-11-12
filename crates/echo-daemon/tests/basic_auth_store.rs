@@ -8,9 +8,12 @@
 mod common;
 
 use common::Harness;
-use echo_daemon::secrets::{
-    KeyringStore, PlainFileStore, SecretError, SecretKey, SecretKind, SecretStore,
-};
+// KeyringStore: only the keyring-mode test (gated off macOS, whose
+// temp-HOME CLI runs cannot see a default keychain) touches the real OS
+// store; every other test drives the PlainFileStore or its own fakes.
+#[cfg(not(target_os = "macos"))]
+use echo_daemon::secrets::KeyringStore;
+use echo_daemon::secrets::{PlainFileStore, SecretError, SecretKey, SecretKind, SecretStore};
 
 /// Add one Subscription to a Basic-Auth-protected server, laying the
 /// operator credentials in with `--auth-user`/`--auth-password`, and
@@ -173,6 +176,7 @@ async fn add_without_auth_flags_sets_no_credentials_and_minting_refuses() {
 
 /// A scratch keyring entry proves a secret service answers this session
 /// (the CI box has none — the plain-file tests above carry those runs).
+#[cfg(not(target_os = "macos"))]
 fn keyring_reachable() -> bool {
     let probe = format!(
         "bark-echo-auth-probe-{}-{}",
