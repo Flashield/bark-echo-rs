@@ -1,14 +1,13 @@
 //! The `push` subcommand against the embedded real server: the CLI is the
 //! send module's first consumer (issue #6) — its flags map onto the V2
 //! JSON Push (protocol §2.2), delivery is observed on the target Device's
-//! Realtime Stream fan-out (§3.4), and failures exit non-zero.
+//! Realtime Stream fan-out (§3.4), and failures exit non-zero. Every run
+//! rides the test convention: a temp `HOME` with `--plain-secrets`, so no
+//! run touches a real keyring or a real config dir (ticket #10 — these
+//! tests predated the convention and probed the CI runner's keyless
+//! keyring instead).
 
 mod common;
-
-// The child wait must be async: the embedded server shares this test's
-// tokio runtime, and a blocking `std::process::Command::output` on the
-// current_thread runtime would starve it mid-request.
-use tokio::process::Command;
 
 use common::{Harness, sse::SseStream};
 use echo_core::server::ServerClient;
@@ -26,9 +25,11 @@ async fn pushing_from_the_cli_delivers_on_the_device_realtime_stream() {
         .await
         .expect("mint stream token");
     let mut stream = SseStream::open(&server, &token.secret).await;
+    let harness = Harness::new();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
-        .args([
+    let run = harness
+        .run(&[
+            "--plain-secrets",
             "push",
             "--server",
             &server.base_url,
@@ -41,15 +42,9 @@ async fn pushing_from_the_cli_delivers_on_the_device_realtime_stream() {
             "--body",
             "Gate 7",
         ])
-        .output()
-        .await
-        .expect("spawn bark-echo push");
+        .await;
 
-    assert!(
-        output.status.success(),
-        "push must exit 0, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(run.success, "push must exit 0, stderr: {}", run.stderr);
     let event = stream.next_push_event().await;
     assert_eq!(event["title"], "Flight", "title rides through: {event}");
     assert_eq!(event["subtitle"], "SFO", "subtitle rides through: {event}");
@@ -75,11 +70,13 @@ async fn cli_extra_flags_ride_through_as_ext_params() {
         .await
         .expect("mint stream token");
     let mut stream = SseStream::open(&server, &token.secret).await;
+    let harness = Harness::new();
 
     // Extra flags pass through as Ext Params exactly like the server's
     // V2 JSON route (§2.2) — the CLI neither names nor filters them.
-    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
-        .args([
+    let run = harness
+        .run(&[
+            "--plain-secrets",
             "push",
             "--server",
             &server.base_url,
@@ -96,15 +93,9 @@ async fn cli_extra_flags_ride_through_as_ext_params() {
             "--call",
             "1",
         ])
-        .output()
-        .await
-        .expect("spawn bark-echo push");
+        .await;
 
-    assert!(
-        output.status.success(),
-        "push must exit 0, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(run.success, "push must exit 0, stderr: {}", run.stderr);
     let event = stream.next_push_event().await;
     let ext = &event["ext_params"];
     assert_eq!(ext["url"], "https://example.com/boarding", "url: {event}");
@@ -121,9 +112,11 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
     // A never-registered 22-char key (same shape as the unknown-key
     // probes elsewhere).
     let unknown_key = "zzzzzzzzzzzzzzzzzzzzzz";
+    let harness = Harness::new();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
-        .args([
+    let run = harness
+        .run(&[
+            "--plain-secrets",
             "push",
             "--server",
             &server.base_url,
@@ -132,21 +125,79 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
             "--body",
             "anyone?",
         ])
-        .output()
-        .await
-        .expect("spawn bark-echo push");
+        .await;
 
-    assert!(
-        !output.status.success(),
-        "an unknown Device Key must exit non-zero"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!run.success, "an unknown Device Key must exit non-zero");
     // The server's error message and code surface verbatim (§2.2:
-    // unknown device_key quotes the key back).
+    // unknown device_key quotes the key back). The plain-file store in
+    // the temp home answers NotFound cleanly, so no store noise rides
+    // along.
     assert_eq!(
-        stderr.trim(),
+        run.stderr.trim(),
         "push rejected by the bark server (code 400): failed to get device token: failed to get [zzzzzzzzzzzzzzzzzzzzzz] device token from database",
-        "the server's message surfaces verbatim: {stderr}"
+        "the server's message surfaces verbatim: {}",
+        run.stderr
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    // /register is Basic-Auth-exempt (protocol §1.4), so setup needs no
+    // credentials; /push is not.
+    let device = ServerClient::new(&server.base_url)
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+    let harness = Harness::new();
+
+    // With the operator's credentials the push is accepted.
+    let run = harness
+        .run(&[
+            "--plain-secrets",
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            &device.device_key,
+            "--body",
+            "behind auth",
+            "--user",
+            "operator",
+            "--password",
+            "hunter2",
+        ])
+        .await;
+    assert!(
+        run.success,
+        "correct credentials must be accepted, stderr: {}",
+        run.stderr
+    );
+
+    // Wrong password: the server answers 418 Teapot (§1.4), non-zero exit.
+    let run = harness
+        .run(&[
+            "--plain-secrets",
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            &device.device_key,
+            "--body",
+            "behind auth",
+            "--user",
+            "operator",
+            "--password",
+            "wrong-password",
+        ])
+        .await;
+    assert!(!run.success, "wrong credentials must exit non-zero");
+    assert!(
+        run.stderr.contains("418"),
+        "the 418 Teapot refusal surfaces: {}",
+        run.stderr
     );
 
     server.shutdown().await;
@@ -212,71 +263,6 @@ async fn push_survives_a_headless_machine_without_a_secret_service() {
             "the one-line note must name the store and the fallback: {stderr}"
         );
     }
-
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn cli_basic_auth_credentials_are_sent_and_wrong_ones_exit_non_zero() {
-    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
-    // /register is Basic-Auth-exempt (protocol §1.4), so setup needs no
-    // credentials; /push is not.
-    let device = ServerClient::new(&server.base_url)
-        .register_stream_device()
-        .await
-        .expect("register stream device");
-
-    // With the operator's credentials the push is accepted.
-    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
-        .args([
-            "push",
-            "--server",
-            &server.base_url,
-            "--device-key",
-            &device.device_key,
-            "--body",
-            "behind auth",
-            "--user",
-            "operator",
-            "--password",
-            "hunter2",
-        ])
-        .output()
-        .await
-        .expect("spawn bark-echo push");
-    assert!(
-        output.status.success(),
-        "correct credentials must be accepted, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Wrong password: the server answers 418 Teapot (§1.4), non-zero exit.
-    let output = Command::new(env!("CARGO_BIN_EXE_bark-echo"))
-        .args([
-            "push",
-            "--server",
-            &server.base_url,
-            "--device-key",
-            &device.device_key,
-            "--body",
-            "behind auth",
-            "--user",
-            "operator",
-            "--password",
-            "wrong-password",
-        ])
-        .output()
-        .await
-        .expect("spawn bark-echo push");
-    assert!(
-        !output.status.success(),
-        "wrong credentials must exit non-zero"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("418"),
-        "the 418 Teapot refusal surfaces: {stderr}"
-    );
 
     server.shutdown().await;
 }
