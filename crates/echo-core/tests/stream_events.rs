@@ -10,7 +10,17 @@ use std::time::Duration;
 
 use echo_core::history::HistoryLog;
 use echo_core::stream::{BackoffConfig, RealtimeStream, StreamConfig, StreamEnd, StreamEvent};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Close a wire-fake connection the way a real server does: drain the
+/// request bytes, then FIN. A bare drop sends RST while receive-buffer
+/// data sits unread (BSD/macOS), which destroys the peer's buffered
+/// response before it reads the envelope — the 401 body must land.
+async fn close_gracefully(socket: &mut tokio::net::TcpStream) {
+    let mut sink = [0u8; 4096];
+    let _ = socket.read(&mut sink).await;
+    let _ = socket.shutdown().await;
+}
 
 /// Backoff fast enough for tests (the default base is a second).
 fn fast_backoff() -> BackoffConfig {
@@ -105,12 +115,13 @@ async fn a_token_invalidated_mid_stream_rejects_the_reconnect_with_token_invalid
 {\"body\":\"live\",\"created_at\":1760000000}\n\n",
                     )
                     .await;
-                drop(socket); // hang up: the reconnect must happen
+                // hang up (EOF): the reconnect must happen
+                close_gracefully(&mut socket).await;
                 continue;
             }
             // Connection 2 (and any further): the revoked-token 401.
             let _ = socket.write_all(rejected.as_bytes()).await;
-            drop(socket);
+            close_gracefully(&mut socket).await;
             break;
         }
     });
@@ -181,6 +192,7 @@ async fn other_rejections_stay_auth_rejected_not_token_invalid() {
 {\"code\":401,\"message\":\"stream token required\",\"timestamp\":1760000000}",
                 )
                 .await;
+            close_gracefully(&mut socket).await;
         }
     });
     let dir = tempfile::tempdir().expect("temp dir");
