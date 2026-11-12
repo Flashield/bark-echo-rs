@@ -2,7 +2,11 @@
 //! per-OS config dir (ADR-0001), resolved from the environment so a temp
 //! `HOME` hermetically relocates every CLI test (spec Testing Decisions).
 
-use std::path::{Path, PathBuf};
+// `Path` is only used in tests that exist where XDG or AppData do; on
+// macOS the config dir resolves from $HOME alone (paths.rs cfg split).
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use echo_daemon::paths::{PathsError, config_dir_from};
 
