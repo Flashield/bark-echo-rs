@@ -198,7 +198,8 @@ fn try_lock(file: &File) -> std::io::Result<()> {
     };
     let ok = unsafe {
         LockFileEx(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            // RawHandle is already `*mut c_void`: no cast needed.
+            file.as_raw_handle(),
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
             1, // one byte at offset 0: the whole-file convention
