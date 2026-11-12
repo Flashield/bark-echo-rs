@@ -10,7 +10,7 @@ mod common;
 // current_thread runtime would starve it mid-request.
 use tokio::process::Command;
 
-use common::sse::SseStream;
+use common::{Harness, sse::SseStream};
 use echo_core::server::ServerClient;
 
 #[tokio::test]
@@ -148,6 +148,70 @@ async fn cli_unknown_device_key_reports_the_server_message_and_exits_non_zero() 
         "push rejected by the bark server (code 400): failed to get device token: failed to get [zzzzzzzzzzzzzzzzzzzzzz] device token from database",
         "the server's message surfaces verbatim: {stderr}"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_survives_a_headless_machine_without_a_secret_service() {
+    // The CI shape: no secret service answers, the push carries no auth
+    // flags, the server is open — the stored credentials are irrelevant,
+    // so the unreachable store degrades to a one-line note instead of
+    // failing the push. The credential-required seams (the daemon's
+    // streams, the token plane) keep the actionable error; see
+    // tests/run.rs and tests/basic_auth_store.rs for their pins.
+    let server = common::TestServer::spawn().await;
+    let device = ServerClient::new(&server.base_url)
+        .register_stream_device()
+        .await
+        .expect("register stream device");
+    let harness = Harness::new();
+
+    let output = harness
+        .spawn(&[
+            "push",
+            "--server",
+            &server.base_url,
+            "--device-key",
+            &device.device_key,
+            "--title",
+            "Headless",
+            "--body",
+            "no keyring here",
+        ])
+        // Headless simulation: no reachable session bus. Dropping
+        // XDG_RUNTIME_DIR alone is not enough — zbus falls back to
+        // /run/user/<uid>/bus, which exists on developer machines — so
+        // the session bus address also points at a dead socket, pinning
+        // the store-unreachable condition on every Linux box.
+        .env_remove("XDG_RUNTIME_DIR")
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/bark-echo-ci-bus",
+        )
+        .output()
+        .await
+        .expect("spawn bark-echo push");
+
+    assert!(
+        output.status.success(),
+        "push must survive an unreachable secret store, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The degradation is visible, not silent: one note line naming the
+    // store and both fixes. (Only where the store truly cannot answer —
+    // the simulation guarantees that on Linux; macOS CI reaches its
+    // native keychain and takes the plain no-stored-credentials path.)
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            stderr.contains("secret store unavailable")
+                && stderr.contains("--plain-secrets")
+                && stderr.lines().count() == 1,
+            "the one-line note must name the store and the fallback: {stderr}"
+        );
+    }
 
     server.shutdown().await;
 }

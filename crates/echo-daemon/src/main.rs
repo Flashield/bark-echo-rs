@@ -18,7 +18,7 @@ use echo_daemon::history;
 use echo_daemon::notify::DesktopRenderer;
 use echo_daemon::paths::Paths;
 use echo_daemon::run::{self, DaemonSpec};
-use echo_daemon::secrets::{KeyringStore, PlainFileStore, SecretStore};
+use echo_daemon::secrets::{KeyringStore, PlainFileStore, SecretError, SecretStore};
 use echo_daemon::status;
 use echo_daemon::subscribe::{self, AddSource};
 
@@ -507,10 +507,25 @@ async fn run_push(
     }
 
     let client = PushClient::new(&server);
-    let client = match auth::resolve(config, store, &server, user.as_deref(), password.as_deref())?
-    {
-        Some(auth) => client.with_basic_auth(auth.user, auth.password),
-        None => client,
+    let client = match auth::resolve(config, store, &server, user.as_deref(), password.as_deref()) {
+        // The flags or the store produced credentials: ride them.
+        Ok(Some(auth)) => client.with_basic_auth(auth.user, auth.password),
+        Ok(None) => client,
+        // Push is not a credential-required seam (§1.4): the Device Key
+        // alone addresses the target, and whether the server wants
+        // operator credentials is the server's own answer to a
+        // credential-free attempt. So an unreachable secret service (a
+        // headless machine with no keyring — CI, an SSH box) degrades to
+        // pushing without the stored credentials, with a one-line note,
+        // where the credential-required seams (the daemon's streams, the
+        // token plane, `pull`, `status`) surface the actionable error.
+        Err(SecretError::Unavailable(_)) => {
+            eprintln!(
+                "push: secret store unavailable; continuing without stored credentials (hint: --plain-secrets, or --user/--password on a protected server)"
+            );
+            client
+        }
+        Err(err) => return Err(err.into()),
     };
     client.send(&push).await?;
     Ok(())
