@@ -36,7 +36,10 @@ fn default_suffix() -> PathBuf {
     PathBuf::from("Library/Application Support")
 }
 
-#[cfg(unix)]
+/// The XDG variable is the standard's own business (README config table):
+/// macOS resolves from `~/Library/Application Support` alone, so these
+/// two apply where the XDG standard does.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn xdg_config_home_overrides_the_home_default() {
     let xdg = Path::new("/hermetic/config");
@@ -46,7 +49,7 @@ fn xdg_config_home_overrides_the_home_default() {
     assert_eq!(dir, xdg.join("bark-echo"), "$XDG_CONFIG_HOME wins");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn xdg_config_home_stands_alone_without_a_home() {
     let xdg = Path::new("/hermetic/config");
@@ -66,7 +69,7 @@ fn the_config_dir_is_roaming_appdata_plus_the_app_name() {
     assert_eq!(dir, appdata.join("bark-echo"));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn without_home_or_xdg_the_error_names_what_to_set() {
     let err = config_dir_from(None, None).expect_err("nothing to resolve from");
@@ -79,6 +82,23 @@ fn without_home_or_xdg_the_error_names_what_to_set() {
     assert!(
         message.contains("HOME") && message.contains("XDG_CONFIG_HOME"),
         "error must name the missing variables, got: {message}"
+    );
+}
+
+/// macOS resolves from `$HOME` alone, so its hint names only that.
+#[cfg(target_os = "macos")]
+#[test]
+fn without_home_the_error_names_what_to_set() {
+    let err = config_dir_from(None, None).expect_err("nothing to resolve from");
+
+    let message = err.to_string();
+    assert!(
+        matches!(err, PathsError::NoConfigRoot),
+        "wrong error: {err}"
+    );
+    assert!(
+        message.contains("HOME") && !message.contains("XDG"),
+        "error must name the missing variable, got: {message}"
     );
 }
 

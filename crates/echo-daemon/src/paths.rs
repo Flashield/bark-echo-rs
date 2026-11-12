@@ -48,9 +48,13 @@ impl Paths {
         #[cfg(unix)]
         {
             let home = env::var_os("HOME").map(PathBuf::from);
+            #[cfg(not(target_os = "macos"))]
             let xdg = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-            Self::from_unix_roots(home.as_deref(), xdg.as_deref())
-                .map(|config_dir| Paths { config_dir })
+            #[cfg(not(target_os = "macos"))]
+            let config_dir = Self::from_unix_roots(home.as_deref(), xdg.as_deref())?;
+            #[cfg(target_os = "macos")]
+            let config_dir = Self::from_unix_roots(home.as_deref())?;
+            Ok(Paths { config_dir })
         }
         #[cfg(windows)]
         {
@@ -102,15 +106,22 @@ impl Paths {
         self.history_dir().join(format!("{subscription_id}.jsonl"))
     }
 
-    #[cfg(unix)]
+    /// The unix root where the XDG standard applies (Linux and friends):
+    /// `$XDG_CONFIG_HOME` wins, else `$HOME/.config`.
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn from_unix_roots(home: Option<&Path>, xdg: Option<&Path>) -> Result<PathBuf, PathsError> {
-        #[cfg(target_os = "macos")]
-        let root = home.map(|home| home.join("Library/Application Support"));
-        #[cfg(not(target_os = "macos"))]
-        let root = xdg
-            .map(PathBuf::from)
-            .or_else(|| home.map(|home| home.join(".config")));
-        root.map(|root| root.join("bark-echo"))
+        xdg.map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join(".config")))
+            .map(|root| root.join("bark-echo"))
+            .ok_or(PathsError::NoConfigRoot)
+    }
+
+    /// The macOS root: the standard `~/Library/Application Support` — the
+    /// XDG variable is not part of macOS's conventions and is ignored.
+    #[cfg(target_os = "macos")]
+    fn from_unix_roots(home: Option<&Path>) -> Result<PathBuf, PathsError> {
+        home.map(|home| home.join("Library/Application Support"))
+            .map(|root| root.join("bark-echo"))
             .ok_or(PathsError::NoConfigRoot)
     }
 
@@ -142,7 +153,7 @@ pub fn config_dir_from(
     home: Option<&Path>,
     _xdg_config_home: Option<&Path>,
 ) -> Result<PathBuf, PathsError> {
-    Paths::from_unix_roots(home, None)
+    Paths::from_unix_roots(home)
 }
 
 /// Resolve the app config dir on Windows from the explicit `%APPDATA%` root.
