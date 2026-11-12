@@ -71,17 +71,25 @@ pub async fn report(
         let runtime = state
             .as_ref()
             .and_then(|state| state.subscriptions.get(&subscription.id));
-        let info = match auth::resolve(config, store, &subscription.server, None, None) {
-            Ok(Some(credentials)) => ServerClient::new(&subscription.server)
-                .with_basic_auth(credentials.user, credentials.password)
-                .info()
-                .await
-                .map_err(|err| err.to_string()),
-            Ok(None) => ServerClient::new(&subscription.server)
-                .info()
-                .await
-                .map_err(|err| err.to_string()),
-            Err(err) => Err(err.to_string()),
+        // The server's live statistics (§2.3): an open server answers
+        // /info anonymously — no credentials, so the secret store is not
+        // consulted (a headless machine has none, and the stream state
+        // above must still report). Only a server with Basic Auth
+        // configured (§1.4) resolves credentials; an unreachable store on
+        // one of those stays the actionable error on the server line.
+        let client = ServerClient::new(&subscription.server);
+        let info = if config.basic_auth_configured(&subscription.server) {
+            match auth::resolve(config, store, &subscription.server, None, None) {
+                Ok(Some(credentials)) => client
+                    .with_basic_auth(credentials.user, credentials.password)
+                    .info()
+                    .await
+                    .map_err(|err| err.to_string()),
+                Ok(None) => client.info().await.map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            }
+        } else {
+            client.info().await.map_err(|err| err.to_string())
         };
         subscriptions.push(SubscriptionStatus {
             id: subscription.id.clone(),

@@ -52,7 +52,7 @@ async fn push(server: &common::TestServer, device_key: &str, body: &str) {
 async fn wait_for_status(harness: &common::Harness, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let output = harness.run(&["status"]).await;
+        let output = harness.run(&["--plain-secrets", "status"]).await;
         assert!(
             output.success,
             "status must exit 0: {} {}",
@@ -81,7 +81,7 @@ async fn status_without_a_daemon_reports_not_running_with_the_server_stats() {
     push(&server, &device_key, "waiting for the desktop").await;
     push(&server, &device_key, "and another").await;
 
-    let output = harness.run(&["status"]).await;
+    let output = harness.run(&["--plain-secrets", "status"]).await;
     assert!(
         output.success,
         "status must exit 0: {} {}",
@@ -146,6 +146,72 @@ async fn status_follows_a_running_daemons_stream_state_and_shuts_down_clean() {
         stdout.contains("active_streams 0"),
         "the killed daemon's stream is closed: {stdout}"
     );
+
+    server.shutdown().await;
+}
+
+/// A headless machine with no secret service (a dead DBus session bus in
+/// the subprocess env — CI, an SSH box): the OS keyring cannot answer. An
+/// open server's `/info` needs no credentials (protocol §2.3), so
+/// `status` must still report the stream state and the live server
+/// statistics — the store's absence must not matter.
+#[cfg(unix)]
+#[tokio::test]
+async fn status_reports_stream_and_server_stats_without_a_secret_service() {
+    let server = common::TestServer::spawn().await;
+    let harness = common::Harness::new();
+    let device_key = subscribe_own(&harness, &server.base_url).await;
+
+    // The daemon rides the plain-file fallback (repo test convention);
+    // `status` below deliberately does not — its keyring store faces the
+    // dead session bus and must not matter here.
+    let mut daemon = harness
+        .spawn(&["--plain-secrets", "run"])
+        .spawn()
+        .expect("spawn run");
+    push(&server, &device_key, "headless live push").await;
+
+    // Nothing can answer on this address, so any secret-store consult
+    // fails — exactly the headless CI environment.
+    let dead_bus = format!(
+        "unix:path=/nonexistent/bark-echo-test-{}",
+        std::process::id()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let stdout = loop {
+        let output = harness
+            .spawn(&["status"])
+            .env("DBUS_SESSION_BUS_ADDRESS", &dead_bus)
+            .output()
+            .await
+            .expect("spawn status");
+        assert!(
+            output.status.success(),
+            "status must exit 0: {} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("stream: running") && stdout.contains("active_streams 1") {
+            break stdout;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status never showed the running stream; last:\n{stdout}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+    assert!(
+        stdout.contains("pending_messages 1"),
+        "the push the server holds rides along: {stdout}"
+    );
+    assert!(
+        !stdout.contains("unreachable"),
+        "an open server needs no credentials, so no store consult: {stdout}"
+    );
+
+    daemon.kill().await.expect("kill daemon");
+    let _ = daemon.wait().await;
 
     server.shutdown().await;
 }

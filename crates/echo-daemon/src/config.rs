@@ -98,6 +98,19 @@ impl Config {
             .map(|entry| entry.basic_auth_user.clone())
     }
 
+    /// Whether operator Basic Auth (§1.4) is configured for `server`: a
+    /// per-server entry carrying a user or a stored-password marker. Only
+    /// a configured server needs credentials at all — resolving them may
+    /// consult the secret store. An open server must not touch the store
+    /// (a headless machine has none, and its absence is not this server's
+    /// problem).
+    pub fn basic_auth_configured(&self, server: &str) -> bool {
+        self.servers.iter().any(|entry| {
+            entry.url == server
+                && (!entry.basic_auth_user.is_empty() || entry.basic_auth_password_stored)
+        })
+    }
+
     /// Load the config at `path`. A missing file is a fresh install and
     /// yields an empty [`Config`]; anything unreadable or unparseable is
     /// an error naming the file and the spot.
