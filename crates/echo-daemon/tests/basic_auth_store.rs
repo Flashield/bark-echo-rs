@@ -191,6 +191,11 @@ fn keyring_reachable() -> bool {
     }
 }
 
+/// macOS resolves the default keychain from the process's HOME, so a CLI
+/// run in the harness's temp HOME can never see one (the in-process probe
+/// below still answers — different process). Desktop macOS users get
+/// keyring mode normally; CI just cannot exercise it hermetically.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn in_keyring_mode_the_password_lands_in_the_keyring() {
     if !keyring_reachable() {
