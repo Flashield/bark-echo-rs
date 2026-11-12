@@ -1,0 +1,28 @@
+[package]
+name = "echo-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+# The one test seam (spec Testing Decisions): the real server, embedded
+# in-process. Dev-only and revision-pinned — production builds never link
+# the server. Dependency key is the package name; code imports the lib
+# name `bark_server_rs`.
+bark-server-rs = { git = "https://github.com/Flashield/bark-server-rs.git", rev = "b8d832af9ade314f87fb9d349709c26ab519ce4f" }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+# The APNs stand-in (tests/common/apns.rs), mirroring the server repo's
+# own stub: versions unify with bark-server-rs's dependency set.
+axum = "0.8"
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
