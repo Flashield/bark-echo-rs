@@ -8,7 +8,9 @@
 mod common;
 
 use common::Harness;
-use echo_daemon::secrets::{KeyringStore, PlainFileStore, SecretKey, SecretKind, SecretStore};
+use echo_daemon::secrets::{
+    KeyringStore, PlainFileStore, SecretError, SecretKey, SecretKind, SecretStore,
+};
 
 /// Add one Subscription to a Basic-Auth-protected server, laying the
 /// operator credentials in with `--auth-user`/`--auth-password`, and
@@ -279,4 +281,79 @@ async fn the_daemons_stream_and_status_ride_the_stored_credentials() {
     );
 
     server.shutdown().await;
+}
+
+/// A store that must never be touched: for the flag-driven resolution
+/// the seam has no business probing (or writing) anything.
+struct NeverProbed;
+
+impl SecretStore for NeverProbed {
+    fn set(&self, _: &SecretKey, _: SecretKind, _: &str) -> Result<(), SecretError> {
+        panic!("the flags carry the whole credential; the store must not be written");
+    }
+
+    fn get(&self, _: &SecretKey, _: SecretKind) -> Result<String, SecretError> {
+        panic!("the flags carry the whole credential; the store must not be probed");
+    }
+
+    fn delete(&self, _: &SecretKey, _: SecretKind) -> Result<(), SecretError> {
+        panic!("the flags carry the whole credential; the store must not be touched");
+    }
+}
+
+/// A store that cannot answer any read — the headless shape (no secret
+/// service behind the keyring facade).
+struct UnreachableStore;
+
+impl SecretStore for UnreachableStore {
+    fn set(&self, _: &SecretKey, _: SecretKind, _: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable("no secret service".to_owned()))
+    }
+
+    fn get(&self, _: &SecretKey, _: SecretKind) -> Result<String, SecretError> {
+        Err(SecretError::Unavailable("no secret service".to_owned()))
+    }
+
+    fn delete(&self, _: &SecretKey, _: SecretKind) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable("no secret service".to_owned()))
+    }
+}
+
+#[test]
+fn the_flags_carrying_the_whole_credential_silence_the_store() {
+    // The resolution seam's first rule: explicit flags win field by
+    // field — and when they carry both fields, the store is never
+    // probed. An unreachable secret service must not stand between the
+    // operator's typed credentials and the connection.
+    let auth = echo_daemon::auth::resolve(
+        &echo_daemon::config::Config::default(),
+        &NeverProbed,
+        "http://127.0.0.1:8080",
+        Some("operator"),
+        Some("hunter2"),
+    )
+    .expect("the flags resolve without touching the store");
+    let auth = auth.expect("the resolved credential");
+    assert_eq!(auth.user, "operator");
+    assert_eq!(auth.password, "hunter2");
+}
+
+#[test]
+fn an_unavailable_store_is_the_actionable_error_not_silence() {
+    // The credential-required seams (the daemon's streams, the token
+    // plane, `pull`, `status`) must not silently drop the stored
+    // credentials when the store cannot answer: the error names the
+    // store and points at the plain-file fallback. (`push` is the one
+    // seam allowed to degrade — its own test pins that.)
+    let err = echo_daemon::auth::resolve(
+        &echo_daemon::config::Config::default(),
+        &UnreachableStore,
+        "http://127.0.0.1:8080",
+        None,
+        None,
+    )
+    .expect_err("an unreachable store surfaces");
+    let text = err.to_string();
+    assert!(text.contains("secret store unavailable"), "{text}");
+    assert!(text.contains("--plain-secrets"), "{text}");
 }

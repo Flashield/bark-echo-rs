@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use echo_core::intent::NotificationIntent;
 use echo_daemon::notify::{NotificationRenderer, RenderError};
+use echo_daemon::secrets::{SecretError, SecretKind, SecretStore};
 
 /// A renderer fake: records every intent it was handed, in order.
 #[derive(Clone, Default)]
@@ -157,6 +158,44 @@ impl Env {
             store,
             _dir: dir,
         }
+    }
+}
+
+/// A store that serves the Subscription's Stream Token but refuses every
+/// other read with the unreachable error — the shape of a machine whose
+/// secret service cannot answer the operator's password lookup (CI, a
+/// locked keychain).
+struct TokenOnlyStore {
+    token: String,
+}
+
+impl SecretStore for TokenOnlyStore {
+    fn set(
+        &self,
+        _: &echo_daemon::secrets::SecretKey,
+        _: SecretKind,
+        _: &str,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable("no store in this test".to_owned()))
+    }
+
+    fn get(
+        &self,
+        _: &echo_daemon::secrets::SecretKey,
+        kind: SecretKind,
+    ) -> Result<String, SecretError> {
+        match kind {
+            SecretKind::StreamToken => Ok(self.token.clone()),
+            _ => Err(SecretError::Unavailable("no store in this test".to_owned())),
+        }
+    }
+
+    fn delete(
+        &self,
+        _: &echo_daemon::secrets::SecretKey,
+        _: SecretKind,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable("no store in this test".to_owned()))
     }
 }
 
@@ -484,4 +523,92 @@ async fn run_without_subscriptions_is_an_actionable_error() {
         ),
         Ok(()) => panic!("a daemon with nothing to mirror must not start"),
     }
+}
+
+#[tokio::test]
+async fn an_unreachable_store_keeps_the_daemons_basic_auth_error_actionable() {
+    // Credential-required seam (§1.4): the daemon's stream rides a
+    // Basic-Auth-protected server, so the stored password is required.
+    // When the secret store cannot answer that lookup (the store is
+    // reachable enough for the token, not for the password — or simply
+    // refuses everything), the Subscription fails with the actionable
+    // store error. The daemon never degrades to a credential-free
+    // connect — that would earn the server's 418 instead of naming the
+    // real problem — and the run itself carries on.
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    // Setup rides the operator credentials (§1.4): minting on a protected
+    // server demands them.
+    let client = echo_core::server::ServerClient::new(&server.base_url)
+        .with_basic_auth("operator", "hunter2");
+    let device = client.register_stream_device().await.expect("register");
+    let minted = client
+        .mint_stream_token(&device.device_key, "storeless")
+        .await
+        .expect("mint");
+    let (device_key, secret, token_id) = (device.device_key, minted.secret, minted.token_id);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paths = echo_daemon::paths::Paths::from_dir(dir.path());
+    let config = echo_daemon::config::Config {
+        subscriptions: vec![echo_daemon::config::Subscription {
+            id: token_id.clone(),
+            server: server.base_url.clone(),
+            label: "desktop".to_owned(),
+            token_hint: format!("{}...", &secret[..12]),
+            device_hint: format!("{}...", &device_key[..8]),
+        }],
+        servers: vec![echo_daemon::config::ServerEntry {
+            url: server.base_url.clone(),
+            basic_auth_user: "operator".to_owned(),
+            basic_auth_password_stored: true,
+        }],
+    };
+    let store: Arc<dyn SecretStore> = Arc::new(TokenOnlyStore {
+        token: secret.clone(),
+    });
+
+    let (fence_tx, fence_rx) = tokio::sync::oneshot::channel::<()>();
+    let spec = echo_daemon::run::DaemonSpec {
+        paths: paths.clone(),
+        config,
+        store,
+        renderer: Arc::new(RecordingRenderer::default()),
+    };
+    let runner = tokio::spawn(async move {
+        echo_daemon::run::run(spec, async move {
+            let _ = fence_rx.await;
+        })
+        .await
+    });
+
+    // The store error is recorded as the Subscription's state.
+    wait_state(
+        &paths,
+        &token_id,
+        &echo_daemon::state::StreamState::Failed {
+            detail: String::new(),
+        },
+    )
+    .await;
+    let state = echo_daemon::state::StateFile::read(&paths.state_file())
+        .expect("read state")
+        .expect("state present");
+    let echo_daemon::state::StreamState::Failed { detail } = &state.subscriptions[&token_id].state
+    else {
+        panic!("expected a failed state");
+    };
+    assert!(
+        detail.contains("secret store unavailable"),
+        "the actionable store error surfaces, got: {detail}"
+    );
+
+    // The run carries on: a store problem is this Subscription's state,
+    // not the runtime's crash.
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+
+    server.shutdown().await;
 }
