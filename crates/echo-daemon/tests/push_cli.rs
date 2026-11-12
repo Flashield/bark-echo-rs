@@ -249,6 +249,7 @@ async fn push_survives_a_headless_machine_without_a_secret_service() {
         "push must survive an unreachable secret store, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    #[cfg(target_os = "linux")]
     let stderr = String::from_utf8_lossy(&output.stderr);
     // The degradation is visible, not silent: one note line naming the
     // store and both fixes. (Only where the store truly cannot answer —
