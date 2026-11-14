@@ -214,6 +214,156 @@ impl Manager {
             let _ = task.await;
         }
     }
+
+    /// Add a Subscription hot (ticket #14, ADR-0004): the CLI's exact
+    /// orchestration ([`crate::subscribe::add`] — register/mint through
+    /// the server plane, secrets stored before the config is touched),
+    /// then the single writer persists the config, grows the snapshot,
+    /// announces the new line, and starts that stream's supervisor —
+    /// all before the answer goes out, so "runs immediately" is
+    /// literal.
+    async fn add(
+        &self,
+        server: &str,
+        source: echo_ipc::message::AddSource,
+        label: &str,
+        basic_auth: Option<echo_ipc::message::BasicAuthCredentials>,
+    ) -> Result<crate::subscribe::Added, ApplyError> {
+        if label.trim().is_empty() {
+            return Err(ApplyError::EmptyLabel);
+        }
+        let source = match source {
+            echo_ipc::message::AddSource::Own => crate::subscribe::AddSource::Own,
+            echo_ipc::message::AddSource::DeviceKey { device_key } => {
+                crate::subscribe::AddSource::DeviceKey(device_key)
+            }
+        };
+        let auth = basic_auth.map(|credentials| echo_core::stream::BasicAuth {
+            user: credentials.user,
+            password: credentials.password,
+        });
+        // The minting client carries the credentials the request gave —
+        // or, when none rode the channel, the stored ones for that
+        // server (story 18): a re-add on an already-configured server
+        // must not demand retyping them.
+        let client = match &auth {
+            Some(auth) => echo_core::server::ServerClient::new(server)
+                .with_basic_auth(auth.user.clone(), auth.password.clone()),
+            None => {
+                let core = self.core.lock().await;
+                match crate::auth::resolve(&core.config, self.store.as_ref(), server, None, None)? {
+                    Some(credentials) => echo_core::server::ServerClient::new(server)
+                        .with_basic_auth(credentials.user, credentials.password),
+                    None => echo_core::server::ServerClient::new(server),
+                }
+            }
+        };
+        // The apply works on a candidate: the config file is written
+        // before the in-memory list takes the change, so a save failure
+        // leaves the daemon's memory agreeing with the file it could
+        // not update — the add is refused whole.
+        let mut candidate = {
+            let core = self.core.lock().await;
+            core.config.clone()
+        };
+        let added = crate::subscribe::add(
+            &mut candidate,
+            self.store.as_ref(),
+            &client,
+            source,
+            label,
+            auth,
+        )
+        .await?;
+        if let Err(err) = candidate.save(&self.paths.config_file()) {
+            // A refused add never half-applied: sweep the fresh
+            // Subscription's secrets (both ids were minted this call —
+            // unreachable garbage otherwise). The per-server Basic Auth
+            // password stays; the next add re-stores it.
+            let key =
+                SecretKey::for_subscription(&added.subscription.server, &added.subscription.id);
+            let _ = self.store.delete(&key, SecretKind::DeviceKey);
+            let _ = self.store.delete(&key, SecretKind::StreamToken);
+            return Err(err.into());
+        }
+        let mut core = self.core.lock().await;
+        core.config = candidate;
+        // The snapshot grows the line (Starting, like startup's), and
+        // the channel hears it at once — the Tray Menu and the window
+        // grow their rows without a poll.
+        if let Err(err) = self.state.add_subscription(&added.subscription) {
+            eprintln!("state file update failed: {err}");
+        }
+        let _ = self.event_hub.send(echo_ipc::Event::StreamState {
+            subscription_id: added.subscription.id.clone(),
+            label: added.subscription.label.clone(),
+            state: echo_ipc::message::StreamState::Starting,
+        });
+        self.start_stream(&mut core, &added.subscription);
+        Ok(added)
+    }
+
+    /// Remove one Subscription hot (ticket #14, ADR-0004): the stream
+    /// stops first — a removal must not leave a live mirror behind
+    /// while the files catch up — then its secrets are erased and the
+    /// config persisted ([`crate::subscribe::remove`]'s contract), and
+    /// the snapshot line leaves with an announcement for the watching
+    /// clients. The whole apply serializes on the single writer.
+    async fn remove(&self, id: &str) -> Result<crate::config::Subscription, ApplyError> {
+        let mut core = self.core.lock().await;
+        let known = core
+            .config
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.id == id);
+        if !known {
+            return Err(
+                crate::subscribe::SubscribeError::UnknownSubscription(id.to_owned()).into(),
+            );
+        }
+        // The stream stops first and leaves the set before any file
+        // changes: no late state write races the removal.
+        if let Some(stream) = core.streams.remove(id) {
+            Manager::stop_stream(stream).await;
+        }
+        // The candidate carries the removal — secrets erased with it —
+        // and is persisted before the in-memory list takes the change.
+        let mut candidate = core.config.clone();
+        let removed = crate::subscribe::remove(&mut candidate, self.store.as_ref(), id)?;
+        candidate.save(&self.paths.config_file())?;
+        core.config = candidate;
+        if let Err(err) = self.state.remove_subscription(id) {
+            eprintln!("state file update failed: {err}");
+        }
+        let _ = self.event_hub.send(echo_ipc::Event::SubscriptionRemoved {
+            subscription_id: id.to_owned(),
+        });
+        Ok(removed)
+    }
+}
+
+/// Why a hot apply refused (ticket #14). Every message rides the
+/// channel back to the caller — the CLI prints it, the window shows it
+/// — so the server's typed errors and the store's pass through
+/// unchanged.
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// The subscribe orchestration refused — an unknown Device Key, an
+    /// unreachable server, an unknown id, a store failure.
+    #[error(transparent)]
+    Subscribe(#[from] crate::subscribe::SubscribeError),
+    /// The config file could not be written — the single writer's file
+    /// and memory must agree, so a failed save refuses the whole apply.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    /// The stored credentials for this server could not be resolved.
+    #[error(transparent)]
+    Secret(#[from] crate::secrets::SecretError),
+    /// An empty label — the Stream Token is minted with it (GLOSSARY),
+    /// so an unnamed Subscription is refused before the server is
+    /// touched.
+    #[error("a Subscription needs a label — the Stream Token is minted with it")]
+    EmptyLabel,
 }
 
 /// Run the daemon until `shutdown` resolves: one supervised Realtime
@@ -311,10 +461,38 @@ pub async fn run(
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
                         snapshot: manager.state.snapshot(),
                     },
-                    // Only post-handshake requests arrive here; the
-                    // CRUD vocabulary is answered by the handlers that
-                    // land with ticket #14, but an unknown request is
-                    // answered, never fatal.
+                    // The CRUD face (ticket #14): each apply runs to
+                    // completion under the single writer before its
+                    // typed answer goes out; a refusal is an error
+                    // response whose message is the reason.
+                    echo_ipc::Request::SubscribeAdd {
+                        server,
+                        source,
+                        label,
+                        basic_auth,
+                    } => match manager.add(&server, source, &label, basic_auth).await {
+                        Ok(added) => echo_ipc::Response::SubscriptionAdded {
+                            id: added.subscription.id,
+                            label: added.subscription.label,
+                            server: added.subscription.server,
+                            token_hint: added.subscription.token_hint,
+                            device_key: added.device_key,
+                        },
+                        Err(err) => echo_ipc::Response::Error {
+                            message: err.to_string(),
+                        },
+                    },
+                    echo_ipc::Request::SubscribeRemove { id } => match manager.remove(&id).await {
+                        Ok(removed) => echo_ipc::Response::SubscriptionRemoved {
+                            id: removed.id,
+                            label: removed.label,
+                        },
+                        Err(err) => echo_ipc::Response::Error {
+                            message: err.to_string(),
+                        },
+                    },
+                    // Only post-handshake requests arrive here; an
+                    // unknown request is answered, never fatal.
                     other => echo_ipc::Response::Error {
                         message: format!("this daemon does not answer {other:?}"),
                     },

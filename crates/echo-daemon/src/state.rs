@@ -126,6 +126,37 @@ impl StateWriter {
         self.mutate(id, |runtime| runtime.state = state)
     }
 
+    /// Record a Subscription added while the run is live (ticket #14's
+    /// hot apply): its line starts as [`StreamState::Starting`], like
+    /// the startup lines do, with its full public identity.
+    pub fn add_subscription(
+        &self,
+        subscription: &crate::config::Subscription,
+    ) -> Result<(), StateError> {
+        let mut guard = self.state.lock().expect("state mutex poisoned");
+        guard.subscriptions.insert(
+            subscription.id.clone(),
+            SubscriptionRuntime {
+                label: subscription.label.clone(),
+                state: StreamState::Starting,
+                last_message_id: None,
+                updated_at: unix_now(),
+                server: subscription.server.clone(),
+                token_hint: subscription.token_hint.clone(),
+            },
+        );
+        self.persist_locked(&guard)
+    }
+
+    /// Record a Subscription removed while the run is live (ticket
+    /// #14): its line leaves the snapshot — nothing lingers there to
+    /// pose as live.
+    pub fn remove_subscription(&self, id: &str) -> Result<(), StateError> {
+        let mut guard = self.state.lock().expect("state mutex poisoned");
+        guard.subscriptions.remove(id);
+        self.persist_locked(&guard)
+    }
+
     /// Record the id of a Subscription's last processed notification and
     /// persist.
     pub fn set_last_message_id(&self, id: &str, message_id: i64) -> Result<(), StateError> {

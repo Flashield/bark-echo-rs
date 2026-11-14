@@ -1,17 +1,20 @@
-//! The IPC seam (ticket #10): the real daemon in-process — the way the
-//! existing runtime tests drive it, embedded bark-server and all —
-//! driven by a real echo-ipc client over the real transport (UDS or
-//! named pipe). The channel answers with the daemon's live
-//! per-Subscription state, serves a second client concurrently, and
+//! The IPC seam (tickets #10 and #14): the real daemon in-process — the
+//! way the existing runtime tests drive it, embedded bark-server and
+//! all — driven by a real echo-ipc client over the real transport (UDS
+//! or named pipe). The channel answers with the daemon's live
+//! per-Subscription state, serves a second client concurrently,
 //! survives hostile bytes on one connection without disturbing anyone
-//! else.
+//! else, and hot-applies Subscription CRUD: an add starts that stream's
+//! supervisor immediately, a remove stops it — config, secrets, and
+//! snapshot following, all observed from outside the daemon.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use echo_ipc::message::{StatusSnapshot, StreamState};
+use echo_daemon::secrets::{SecretKey, SecretKind};
+use echo_ipc::message::{AddSource, BasicAuthCredentials, StatusSnapshot, StreamState};
 use echo_ipc::{Client, RequestFrame, connect_raw};
 
 /// A renderer fake that swallows every intent: the seam under test here
@@ -489,5 +492,437 @@ async fn a_daemon_with_zero_subscriptions_stays_healthy_and_actionable() {
         .expect("run task joined");
     assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
 
+    server.shutdown().await;
+}
+
+// --- Hot-apply CRUD (ticket #14): add and remove ride the channel and
+// --- take effect immediately — asserted from outside the daemon, on
+// --- the channel, the server, the config file, and the secret store.
+
+/// Register one Stream Device and return its key — the mirror mode's
+/// input (GLOSSARY: mirroring by Device Key).
+async fn register_device(server: &common::TestServer) -> String {
+    let client = echo_core::server::ServerClient::new(&server.base_url);
+    client
+        .register_stream_device()
+        .await
+        .expect("register stream device")
+        .device_key
+}
+
+/// The config file as the daemon (the single writer) has left it.
+fn config_on_disk(env: &Env) -> echo_daemon::config::Config {
+    echo_daemon::config::Config::load(&env.paths.config_file()).expect("config file parses")
+}
+
+#[tokio::test]
+async fn a_hot_own_add_starts_the_stream_and_its_pushes_reach_the_history_log() {
+    let server = common::TestServer::spawn().await;
+    let env = Env::empty();
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+
+    // The listener never asks for anything — it just watches, like the
+    // Tray Menu; the driver performs the add.
+    let mut listener = connect_when_listening(&endpoint).await;
+    let mut client = connect_when_listening(&endpoint).await;
+
+    let added = client
+        .subscribe_add(&server.base_url, AddSource::Own, "hot-add", None)
+        .await
+        .expect("the add is answered");
+    assert_eq!(added.label, "hot-add");
+    assert_eq!(added.server, server.base_url);
+    assert_eq!(
+        added.device_key.len(),
+        22,
+        "the push target rides the answer: {}",
+        added.device_key
+    );
+
+    // The stream runs immediately — the supervisor was up before the
+    // answer went out.
+    common::wait_active_streams(&server, 1).await;
+
+    // A push lands in the new Subscription's History Log and arrives as
+    // an event — the tray's glance and the window's list both learn it
+    // without a poll.
+    push_to(&server, &added.device_key, "hot off the press").await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let appended = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), listener.next_event())
+            .await
+            .expect("an event within 10s")
+            .expect("the channel stayed open");
+        match event {
+            echo_ipc::message::Event::StreamState { .. } => {
+                assert!(
+                    Instant::now() < deadline,
+                    "only state flips before the append: no append event"
+                );
+            }
+            echo_ipc::message::Event::HistoryAppended {
+                subscription_id,
+                label,
+                entry,
+            } => {
+                assert_eq!(subscription_id, added.id);
+                assert_eq!(label, "hot-add");
+                assert_eq!(entry.body, "hot off the press");
+                break entry;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+    let log = echo_core::history::HistoryLog::new(env.paths.history_log(&added.id));
+    let entries = log.entries().expect("read the new Subscription's log");
+    assert_eq!(entries.len(), 1, "the push is durably in the log");
+    assert_eq!(entries[0].id, appended.id);
+
+    // The snapshot names the line with its full public identity and the
+    // cursor follows the push.
+    let snapshot = wait_snapshot(&mut client, "the hot-added line", |snapshot| {
+        snapshot
+            .subscriptions
+            .get(&added.id)
+            .map(|line| line.last_message_id == Some(appended.id))
+            .unwrap_or(false)
+    })
+    .await;
+    let line = &snapshot.subscriptions[&added.id];
+    assert_eq!(line.label, "hot-add");
+    assert_eq!(line.server, server.base_url);
+    assert_eq!(line.state, StreamState::Running);
+    assert_eq!(line.token_hint, added.token_hint);
+
+    // The single writer persisted both faces: the config's non-secret
+    // entry and the secrets under the fresh id.
+    let config = config_on_disk(&env);
+    assert_eq!(config.subscriptions.len(), 1, "the config carries the add");
+    let persisted = &config.subscriptions[0];
+    assert_eq!(persisted.id, added.id);
+    assert_eq!(persisted.label, "hot-add");
+    assert_eq!(persisted.token_hint, added.token_hint);
+    let key = SecretKey {
+        server: server.base_url.clone(),
+        token_id: added.id.clone(),
+    };
+    env.store
+        .get(&key, SecretKind::StreamToken)
+        .expect("the Stream Token is stored");
+    env.store
+        .get(&key, SecretKind::DeviceKey)
+        .expect("the Device Key is stored");
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    common::wait_active_streams(&server, 0).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hot_mirror_add_mints_a_labelled_token_for_the_existing_device() {
+    let server = common::TestServer::spawn().await;
+    let env = Env::empty();
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+
+    let device_key = register_device(&server).await;
+    let added = client
+        .subscribe_add(
+            &server.base_url,
+            AddSource::DeviceKey {
+                device_key: device_key.clone(),
+            },
+            "the iPhone",
+            None,
+        )
+        .await
+        .expect("the mirror add is answered");
+
+    // The stream runs against the mirrored Device, and the token the
+    // daemon minted carries the form's label (GLOSSARY: one
+    // Subscription mirrors exactly one Device).
+    common::wait_active_streams(&server, 1).await;
+    let tokens = echo_core::server::ServerClient::new(&server.base_url)
+        .list_stream_tokens(&device_key)
+        .await
+        .expect("list the Device's tokens");
+    assert_eq!(tokens.len(), 1, "exactly the token the add minted");
+    assert_eq!(tokens[0].client_label, "the iPhone");
+    assert_eq!(tokens[0].token_hint, added.token_hint);
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_add_is_an_error_and_leaves_nothing_behind() {
+    let server = common::TestServer::spawn().await;
+    let env = Env::empty();
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+
+    // A bad Device Key: the server's typed refusal surfaces readably —
+    // the window and the CLI print it, the daemon stays untouched.
+    let outcome = client
+        .subscribe_add(
+            &server.base_url,
+            AddSource::DeviceKey {
+                device_key: "notARealDeviceKey0000".to_owned(),
+            },
+            "doomed",
+            None,
+        )
+        .await;
+    match outcome {
+        Err(echo_ipc::IpcError::Rejected(message)) => {
+            assert!(
+                message.contains("device not found"),
+                "the server's refusal surfaces: {message}"
+            );
+        }
+        other => panic!("a bad Device Key is refused, got {other:?}"),
+    }
+
+    // Nothing half-applied: no stream, no config entry, no line, and
+    // the channel still answers.
+    common::wait_active_streams(&server, 0).await;
+    let snapshot = client.status().await.expect("the channel still answers");
+    assert!(
+        snapshot.subscriptions.is_empty(),
+        "no line for the refused add"
+    );
+    assert!(
+        config_on_disk(&env).subscriptions.is_empty(),
+        "no config entry for the refused add"
+    );
+    // An empty label is refused before the server is even touched.
+    let outcome = client
+        .subscribe_add(&server.base_url, AddSource::Own, "   ", None)
+        .await;
+    assert!(
+        matches!(outcome, Err(echo_ipc::IpcError::Rejected(_))),
+        "an empty label is refused: {outcome:?}"
+    );
+
+    // And the daemon remains actionable: a good add still works after
+    // the refusals.
+    let added = client
+        .subscribe_add(&server.base_url, AddSource::Own, "after-the-refusal", None)
+        .await
+        .expect("the daemon still applies adds");
+    common::wait_active_streams(&server, 1).await;
+    assert!(config_on_disk(&env).subscriptions.len() == 1);
+    assert_eq!(added.label, "after-the-refusal");
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hot_remove_stops_the_stream_erases_secrets_and_updates_the_config() {
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "to-remove").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "doomed");
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+
+    // A watcher hears the removal; the driver performs it.
+    let mut listener = connect_when_listening(&endpoint).await;
+    let mut client = connect_when_listening(&endpoint).await;
+    common::wait_active_streams(&server, 1).await;
+
+    let removed = client
+        .subscribe_remove(&token_id)
+        .await
+        .expect("the remove is answered");
+    assert_eq!(removed.id, token_id);
+    assert_eq!(removed.label, "doomed");
+
+    // The stream stops immediately.
+    common::wait_active_streams(&server, 0).await;
+    // The removal is announced — the tray and the window drop the line
+    // at once, without a poll.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), listener.next_event())
+            .await
+            .expect("an event within 10s")
+            .expect("the channel stayed open");
+        match event {
+            echo_ipc::message::Event::SubscriptionRemoved { subscription_id } => {
+                assert_eq!(subscription_id, token_id);
+                break;
+            }
+            echo_ipc::message::Event::StreamState { .. } => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the removal event never arrived behind the flips"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    // The snapshot's line is gone and the channel still answers.
+    let snapshot = wait_snapshot(&mut client, "the emptied snapshot", |snapshot| {
+        snapshot.subscriptions.is_empty()
+    })
+    .await;
+    assert!(snapshot.subscriptions.is_empty());
+    // Both secrets are erased from the store.
+    let key = SecretKey {
+        server: server.base_url.clone(),
+        token_id: token_id.clone(),
+    };
+    assert!(
+        env.store.get(&key, SecretKind::StreamToken).is_err(),
+        "the Stream Token is gone"
+    );
+    assert!(
+        env.store.get(&key, SecretKind::DeviceKey).is_err(),
+        "the Device Key is gone"
+    );
+    // The config file no longer carries the Subscription.
+    assert!(
+        config_on_disk(&env).subscriptions.is_empty(),
+        "the config no longer carries the removed Subscription"
+    );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn removing_every_subscription_leaves_the_daemon_healthy_and_actionable() {
+    // The acceptance line: zero Subscriptions after removals is a state
+    // the daemon holds — no crash, and adds still work.
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "starter").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "starter");
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+    common::wait_active_streams(&server, 1).await;
+
+    // A second Subscription rides in hot, then both leave.
+    let second = client
+        .subscribe_add(&server.base_url, AddSource::Own, "second", None)
+        .await
+        .expect("the hot add");
+    common::wait_active_streams(&server, 2).await;
+    client.subscribe_remove(&second.id).await.expect("remove 2");
+    client.subscribe_remove(&token_id).await.expect("remove 1");
+    common::wait_active_streams(&server, 0).await;
+
+    // Zero held — and the daemon answers, empty and actionable.
+    let snapshot = wait_snapshot(&mut client, "the emptied snapshot", |snapshot| {
+        snapshot.subscriptions.is_empty()
+    })
+    .await;
+    assert_eq!(snapshot.pid, std::process::id());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let again = client.status().await.expect("still answering at zero");
+    assert!(again.subscriptions.is_empty(), "no crash, no residue");
+
+    // Actionable: another add still starts its stream.
+    let third = client
+        .subscribe_add(&server.base_url, AddSource::Own, "third", None)
+        .await
+        .expect("the daemon still applies adds");
+    common::wait_active_streams(&server, 1).await;
+    assert_eq!(third.label, "third");
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn basic_auth_credentials_land_in_the_store_never_in_the_config() {
+    // Story 18's rule over the wire: the form's credentials ride the
+    // channel into the daemon, which presents them for minting and
+    // keeps the password in the secret store; the config file carries
+    // the user and the marker only.
+    let server = common::TestServer::spawn_with_basic_auth("operator", "op-secret").await;
+    let env = Env::empty();
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+
+    let added = client
+        .subscribe_add(
+            &server.base_url,
+            AddSource::Own,
+            "guarded",
+            Some(BasicAuthCredentials {
+                user: "operator".to_owned(),
+                password: "op-secret".to_owned(),
+            }),
+        )
+        .await
+        .expect("the add with credentials is answered");
+    // The stream runs — the daemon presented the credentials itself
+    // (spec story 13: the secrets stay inside the daemon). The /info
+    // poll rides the same credentials: the protected server refuses
+    // the anonymous observation (§1.4).
+    common::wait_active_streams_with(&server, 1, Some(("operator", "op-secret"))).await;
+
+    // The password is in the store under the server's key…
+    let stored = env
+        .store
+        .get(
+            &SecretKey::for_server(&server.base_url),
+            SecretKind::BasicAuthPassword,
+        )
+        .expect("the password is stored");
+    assert_eq!(stored, "op-secret");
+    // …and in no file: the config carries the user and the marker only.
+    let raw_config = std::fs::read_to_string(env.paths.config_file()).expect("config file exists");
+    assert!(
+        !raw_config.contains("op-secret"),
+        "the password never enters the config file: {raw_config}"
+    );
+    let config = config_on_disk(&env);
+    assert_eq!(
+        config.basic_auth_user(&server.base_url).as_deref(),
+        Some("operator")
+    );
+    assert!(
+        config.basic_auth_configured(&server.base_url),
+        "the stored-password marker is set"
+    );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
     server.shutdown().await;
 }
