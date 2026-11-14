@@ -48,9 +48,9 @@ pub struct TrayModel {
 }
 
 /// One row of the tray menu. Subscription rows are informational (the
-/// read-only tray of ticket #11); the two actions are placeholders —
-/// "open Management Window" is wired by ticket #13, and Quit only exits
-/// the GUI process here (the daemon shutdown is ticket #12).
+/// read-only tray of ticket #11); of the two actions, "open Management
+/// Window" is still #13's placeholder, and Quit asks the daemon for a
+/// graceful shutdown before leaving (ticket #12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
     /// A non-interactive line: the daemon link's state.
@@ -63,7 +63,8 @@ pub enum MenuItem {
     Separator,
     /// "Open Management Window" (GLOSSARY) — placeholder.
     OpenManagementWindow,
-    /// Quit — this ticket: exits the GUI process.
+    /// Quit — asks the daemon for a graceful shutdown, waits a bounded
+    /// while for its confirmation, then exits (ticket #12).
     Quit,
 }
 
