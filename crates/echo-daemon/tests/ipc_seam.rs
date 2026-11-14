@@ -55,9 +55,10 @@ async fn push_to(server: &common::TestServer, device_key: &str, body: &str) {
     );
 }
 
-/// A daemon environment in a temp dir: config with `subscription` in it,
-/// plain-file secrets holding its Device Key and Stream Token (mirrors
-/// tests/run.rs).
+/// A daemon environment in a temp dir: an empty Subscription list and a
+/// plain-file secret store (mirrors tests/run.rs). Subscriptions are
+/// added with [`Env::with_subscription`] — or hot, over the channel
+/// (ticket #14).
 struct Env {
     paths: echo_daemon::paths::Paths,
     config: echo_daemon::config::Config,
@@ -66,6 +67,22 @@ struct Env {
 }
 
 impl Env {
+    fn empty() -> Self {
+        use echo_daemon::config::Config;
+        use echo_daemon::secrets::{PlainFileStore, SecretStore};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = echo_daemon::paths::Paths::from_dir(dir.path());
+        let store: Arc<dyn echo_daemon::secrets::SecretStore> =
+            Arc::new(PlainFileStore::new(paths.secrets_file()));
+        Self {
+            paths,
+            config: Config::default(),
+            store,
+            _dir: dir,
+        }
+    }
+
     fn with_subscription(
         server_url: &str,
         device_key: &str,
@@ -74,22 +91,20 @@ impl Env {
         label: &str,
     ) -> Self {
         use echo_daemon::config::{Config, Subscription};
-        use echo_daemon::secrets::{PlainFileStore, SecretKey, SecretKind, SecretStore};
+        use echo_daemon::secrets::{SecretKey, SecretKind, SecretStore};
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let paths = echo_daemon::paths::Paths::from_dir(dir.path());
-        let store: Arc<dyn SecretStore> = Arc::new(PlainFileStore::new(paths.secrets_file()));
+        let mut env = Self::empty();
         let key = SecretKey {
             server: server_url.to_owned(),
             token_id: token_id.to_owned(),
         };
-        store
+        env.store
             .set(&key, SecretKind::DeviceKey, device_key)
             .expect("store device key");
-        store
+        env.store
             .set(&key, SecretKind::StreamToken, stream_token)
             .expect("store stream token");
-        let config = Config {
+        env.config = Config {
             subscriptions: vec![Subscription {
                 id: token_id.to_owned(),
                 server: server_url.to_owned(),
@@ -99,12 +114,7 @@ impl Env {
             }],
             servers: Vec::new(),
         };
-        Self {
-            paths,
-            config,
-            store,
-            _dir: dir,
-        }
+        env
     }
 }
 
@@ -441,4 +451,43 @@ async fn a_push_lands_as_a_history_event_and_a_server_death_as_a_state_flip() {
         .expect("run ends within 10s")
         .expect("run task joined");
     assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+}
+
+#[tokio::test]
+async fn a_daemon_with_zero_subscriptions_stays_healthy_and_actionable() {
+    // Ticket #14: hot CRUD means a daemon can reach zero Subscriptions,
+    // and the GUI's spawn-if-absent starts one before any exists. Zero
+    // streams is a state, not a failure: the channel answers with an
+    // empty snapshot and the run stays up for more to come.
+    let server = common::TestServer::spawn().await;
+    let env = Env::empty();
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+
+    let mut client = connect_when_listening(&endpoint).await;
+    let snapshot = client.status().await.expect("the channel answers");
+    assert_eq!(
+        snapshot.subscriptions.len(),
+        0,
+        "no Subscription is configured yet"
+    );
+    assert_eq!(
+        snapshot.pid,
+        std::process::id(),
+        "the snapshot is this daemon run's"
+    );
+    // Still alive and answering after the first beat — no crash on the
+    // empty list.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let again = client.status().await.expect("the channel still answers");
+    assert_eq!(again.subscriptions.len(), 0);
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+
+    server.shutdown().await;
 }

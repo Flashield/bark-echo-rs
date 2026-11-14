@@ -6,11 +6,17 @@
 //! file `status` reads, and rides out server restarts — the receive
 //! loop reconnects with replay while the runtime keeps rendering.
 //!
+//! The supervisor set is dynamic (ticket #14, ADR-0004's hot-apply):
+//! subscriptions start and stop by id while the run lives — the CRUD
+//! handlers spawn and retire one stream's supervisor each, and zero
+//! Subscriptions is a healthy, actionable state, not a failure.
+//!
 //! A 401 `stream token invalid` is the one terminal-but-isolated case:
 //! that Subscription is flagged `token invalid` (actionable —
 //! re-subscribe, spec story 21) and never retried, while the other
 //! Subscriptions carry on.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use echo_core::history::HistoryLog;
@@ -40,8 +46,9 @@ pub struct DaemonSpec {
 }
 
 /// Why a run could not start. In-run problems (a render hiccup, a
-/// rejected token) never land here — they are logged or recorded in the
-/// state file, and the run carries on.
+/// rejected token, a hot apply refused) never land here — they are
+/// logged, recorded in the state file, or answered over the channel,
+/// and the run carries on.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// Another live instance holds the single-instance lock (ADR-0002).
@@ -61,29 +68,163 @@ pub enum RunError {
         #[source]
         source: std::io::Error,
     },
-    /// Nothing to mirror — the actionable fix is `subscribe add`.
-    #[error("no subscriptions configured — add one with `subscribe add` first")]
-    NoSubscriptions,
+}
+
+/// One live Subscription's handles: how shutdown and hot removal stop
+/// that stream (ticket #14 — subscriptions start and stop by id now).
+struct LiveStream {
+    /// The fence that ends the supervise task. `None` when the stream
+    /// never started — its secret could not be read, its `Failed` state
+    /// stands, and there is nothing to stop.
+    fence: Option<mpsc::Sender<()>>,
+    /// The supervise task, joined at stop so no late state recording
+    /// races the removal that follows the stop.
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// The daemon's mutable world (ADR-0004: the single writer). The
+/// Subscription list and the live supervisor set live here; every
+/// mutation — the startup spawn and the hot CRUD handlers — serializes
+/// on the mutex, so two requests can never interleave a half-apply.
+struct Manager {
+    /// The daemon's file locations — the config file the single writer
+    /// keeps current (ADR-0004).
+    paths: Paths,
+    /// The secret store the Stream Tokens come from and go back to.
+    store: Arc<dyn SecretStore>,
+    /// The renderer the intents flow into.
+    renderer: Arc<dyn NotificationRenderer>,
+    /// The state file writer — the snapshot's source of truth.
+    state: Arc<StateWriter>,
+    /// The channel's event hub the flips and appends are announced on.
+    event_hub: tokio::sync::broadcast::Sender<echo_ipc::Event>,
+    /// The Subscription list plus the live supervisor set.
+    core: tokio::sync::Mutex<Core>,
+}
+
+struct Core {
+    /// The Subscription list as the single writer holds it (ADR-0001).
+    config: Config,
+    /// One entry per Subscription whose stream was started, keyed by
+    /// Subscription id. A Subscription whose stream never started (its
+    /// secret read failed at spawn) has no entry — removal skips the
+    /// stop and cleans the files.
+    streams: BTreeMap<String, LiveStream>,
+}
+
+impl Manager {
+    /// Start one Subscription's Realtime Stream (ADR-0002): the Stream
+    /// Token and the operator Basic Auth credentials out of the store,
+    /// the core receive loop spawned, a supervisor watching it. The
+    /// startup spawn and the hot-apply add go through this one door, so
+    /// a hot-added stream is configured exactly like a startup one.
+    fn start_stream(&self, core: &mut Core, subscription: &crate::config::Subscription) {
+        let secret = match self.store.get(
+            &SecretKey::for_subscription(&subscription.server, &subscription.id),
+            SecretKind::StreamToken,
+        ) {
+            Ok(secret) => secret,
+            Err(err) => {
+                // No read credential: this Subscription cannot run, but
+                // the others still must. Record and move on.
+                record(
+                    &self.state,
+                    &self.event_hub,
+                    &subscription.id,
+                    &subscription.label,
+                    StreamState::Failed {
+                        detail: err.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+        // The operator Basic Auth credentials (§1.4) out of the store
+        // (story 18): an unreachable store is this Subscription's failure
+        // to record, not the run's.
+        let basic_auth = match crate::auth::resolve(
+            &core.config,
+            self.store.as_ref(),
+            &subscription.server,
+            None,
+            None,
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                record(
+                    &self.state,
+                    &self.event_hub,
+                    &subscription.id,
+                    &subscription.label,
+                    StreamState::Failed {
+                        detail: err.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (appends_tx, appends_rx) = mpsc::channel(64);
+        let config = StreamConfig {
+            base_url: subscription.server.clone(),
+            stream_token: secret,
+            basic_auth,
+            history_log: HistoryLog::new(self.paths.history_log(&subscription.id)),
+            backoff: Default::default(),
+            // The server's default keep-alive interval (§3.4): the idle
+            // watchdog declares a silent connection dead at 45 s.
+            keepalive_interval: Some(std::time::Duration::from_secs(15)),
+            events: Some(events_tx),
+            appends: Some(appends_tx),
+        };
+        let (handle, intents) = RealtimeStream::spawn(config);
+        let (fence_tx, fence_rx) = mpsc::channel::<()>(1);
+        let task = tokio::spawn(supervise(
+            Supervised {
+                id: subscription.id.clone(),
+                label: subscription.label.clone(),
+                state: self.state.clone(),
+                renderer: self.renderer.clone(),
+                event_hub: self.event_hub.clone(),
+            },
+            handle,
+            intents,
+            events_rx,
+            appends_rx,
+            fence_rx,
+        ));
+        core.streams.insert(
+            subscription.id.clone(),
+            LiveStream {
+                fence: Some(fence_tx),
+                task: Some(task),
+            },
+        );
+    }
+
+    /// Stop one Subscription's stream: fence, then join — the loop is
+    /// done recording when this returns, so a removal's file changes
+    /// never race a late state write.
+    async fn stop_stream(stream: LiveStream) {
+        if let Some(fence) = stream.fence {
+            let _ = fence.send(()).await;
+        }
+        if let Some(task) = stream.task {
+            let _ = task.await;
+        }
+    }
 }
 
 /// Run the daemon until `shutdown` resolves: one supervised Realtime
 /// Stream per Subscription, every intent rendered, the state file kept
 /// current. The single-instance lock is held for the whole run and
-/// released on return.
+/// released on return. Zero Subscriptions is healthy: the channel
+/// serves an empty snapshot and CRUD can add to it (ticket #14).
 pub async fn run(
     spec: DaemonSpec,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RunError> {
-    let ids: Vec<String> = spec
-        .config
-        .subscriptions
-        .iter()
-        .map(|subscription| subscription.id.clone())
-        .collect();
-    if ids.is_empty() {
-        return Err(RunError::NoSubscriptions);
-    }
-
     // Two daemons would double-display every Push (ADR-0002): the loser
     // of the lock leaves with a clear error. The lock can also be held
     // for a heartbeat by a `status` probe, so a starting daemon absorbs
@@ -130,8 +271,33 @@ pub async fn run(
     // line each; a client further behind than this is dropped by `serve`
     // and re-snapshots on reconnect — never served stale.
     let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
+    // The single writer's world (ADR-0004): the config the CRUD handlers
+    // mutate and the supervisor set they start and stop by id.
+    let manager = Arc::new(Manager {
+        paths: spec.paths.clone(),
+        store: spec.store.clone(),
+        renderer: spec.renderer.clone(),
+        state: state.clone(),
+        event_hub: event_hub.clone(),
+        core: tokio::sync::Mutex::new(Core {
+            config: spec.config,
+            streams: BTreeMap::new(),
+        }),
+    });
+
+    // The opening supervisor set: one stream per configured Subscription
+    // (ADR-0002) — through the same door a hot add uses later, so both
+    // start streams exactly alike.
+    {
+        let mut core = manager.core.lock().await;
+        let subscriptions = core.config.subscriptions.clone();
+        for subscription in &subscriptions {
+            manager.start_stream(&mut core, subscription);
+        }
+    }
+
     let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let channel_state = state.clone();
+    let channel_manager = manager.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
         server,
         async move {
@@ -139,15 +305,15 @@ pub async fn run(
         },
         event_hub.clone(),
         move |request| {
-            let state = channel_state.clone();
+            let manager = channel_manager.clone();
             async move {
                 match request {
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
-                        snapshot: state.snapshot(),
+                        snapshot: manager.state.snapshot(),
                     },
                     // Only post-handshake requests arrive here; the
-                    // vocabulary has no other request yet (the event
-                    // stream is ticket #11), but an unknown request is
+                    // CRUD vocabulary is answered by the handlers that
+                    // land with ticket #14, but an unknown request is
                     // answered, never fatal.
                     other => echo_ipc::Response::Error {
                         message: format!("this daemon does not answer {other:?}"),
@@ -156,90 +322,6 @@ pub async fn run(
             }
         },
     ));
-
-    // One supervisor per Subscription; each owns its stream handle and
-    // is stopped through its own fence at shutdown.
-    let mut supervisors = Vec::new();
-    let mut fences = Vec::new();
-    for subscription in &spec.config.subscriptions {
-        let (fence_tx, fence_rx) = mpsc::channel::<()>(1);
-        fences.push(fence_tx);
-
-        let secret = match spec.store.get(
-            &SecretKey::for_subscription(&subscription.server, &subscription.id),
-            SecretKind::StreamToken,
-        ) {
-            Ok(secret) => secret,
-            Err(err) => {
-                // No read credential: this Subscription cannot run, but
-                // the others still must. Record and move on.
-                record(
-                    &state,
-                    &event_hub,
-                    &subscription.id,
-                    &subscription.label,
-                    StreamState::Failed {
-                        detail: err.to_string(),
-                    },
-                );
-                continue;
-            }
-        };
-        // The operator Basic Auth credentials (§1.4) out of the store
-        // (story 18): an unreachable store is this Subscription's failure
-        // to record, not the run's.
-        let basic_auth = match crate::auth::resolve(
-            &spec.config,
-            spec.store.as_ref(),
-            &subscription.server,
-            None,
-            None,
-        ) {
-            Ok(auth) => auth,
-            Err(err) => {
-                record(
-                    &state,
-                    &event_hub,
-                    &subscription.id,
-                    &subscription.label,
-                    StreamState::Failed {
-                        detail: err.to_string(),
-                    },
-                );
-                continue;
-            }
-        };
-
-        let (events_tx, events_rx) = mpsc::channel(64);
-        let (appends_tx, appends_rx) = mpsc::channel(64);
-        let config = StreamConfig {
-            base_url: subscription.server.clone(),
-            stream_token: secret,
-            basic_auth,
-            history_log: HistoryLog::new(spec.paths.history_log(&subscription.id)),
-            backoff: Default::default(),
-            // The server's default keep-alive interval (§3.4): the idle
-            // watchdog declares a silent connection dead at 45 s.
-            keepalive_interval: Some(std::time::Duration::from_secs(15)),
-            events: Some(events_tx),
-            appends: Some(appends_tx),
-        };
-        let (handle, intents) = RealtimeStream::spawn(config);
-        supervisors.push(tokio::spawn(supervise(
-            Supervised {
-                id: subscription.id.clone(),
-                label: subscription.label.clone(),
-                state: state.clone(),
-                renderer: spec.renderer.clone(),
-                event_hub: event_hub.clone(),
-            },
-            handle,
-            intents,
-            events_rx,
-            appends_rx,
-            fence_rx,
-        )));
-    }
 
     // Hold the runtime until the owner lets go (ctrl-C in production, a
     // fence in tests). The channel ending early does not end the run:
@@ -265,28 +347,31 @@ pub async fn run(
     }
 
     // Graceful stop: the channel closes first (its connections die with
-    // the aborted tasks), then every supervisor closes its stream — all
-    // before the lock is released with this function's scope.
+    // the aborted tasks), then every supervisor still in the set closes
+    // its stream — the set is whatever hot CRUD left running (ticket
+    // #14), read from the map, not remembered from startup — all before
+    // the lock is released with this function's scope.
     let _ = channel_stop_tx.send(());
     match channel.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("the IPC channel ended with an error: {err}"),
         Err(join_error) => eprintln!("the IPC channel task failed: {join_error}"),
     }
-    for fence in &fences {
-        let _ = fence.send(()).await;
-    }
-    for supervisor in supervisors {
-        let _ = supervisor.await;
+    let streams = {
+        let mut core = manager.core.lock().await;
+        std::mem::take(&mut core.streams)
+    };
+    for (_, stream) in streams {
+        Manager::stop_stream(stream).await;
     }
     Ok(())
 }
 
 /// One Subscription's runtime: forward the stream's intents into the
 /// renderer and its connection-state changes into the state file, until
-/// either the fence (shutdown) or the loop's own end. A self-ended loop
-/// is classified into its terminal state — token invalid means
-/// re-subscribe, never retry.
+/// either the fence (shutdown or a hot removal) or the loop's own end.
+/// A self-ended loop is classified into its terminal state — token
+/// invalid means re-subscribe, never retry.
 /// Everything one supervised Subscription's loop touches beyond its
 /// stream channels: who it is (id, label — the channel's and the
 /// snapshot's name for it), where its flips are recorded, what renders
@@ -308,9 +393,9 @@ struct Supervised {
 /// renderer, its connection-state changes into the state file — each
 /// flip announced on the channel as it is recorded — and its History
 /// Log appends onto the channel as events, until either the fence
-/// (shutdown) or the loop's own end. A self-ended loop is classified
-/// into its terminal state — token invalid means re-subscribe, never
-/// retry.
+/// (shutdown or a hot removal) or the loop's own end. A self-ended loop
+/// is classified into its terminal state — token invalid means
+/// re-subscribe, never retry.
 async fn supervise(
     subscription: Supervised,
     handle: echo_core::stream::StreamHandle,
@@ -409,8 +494,8 @@ async fn supervise(
                 },
             );
         }
-        // A stop we initiated (shutdown) or a loop that was already
-        // cancelled: the last live state stands.
+        // A stop we initiated (shutdown or a hot removal) or a loop that
+        // was already cancelled: the last live state stands.
         StreamEnd::Stopped => {}
     }
 }
