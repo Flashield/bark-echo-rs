@@ -20,8 +20,8 @@ pub use client::Client;
 pub use error::IpcError;
 pub use handshake::{client_handshake, server_handshake};
 pub use message::{
-    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
-    StreamState, SubscriptionRuntime,
+    ClickAction, Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame,
+    StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 pub use server::serve;
 pub use transport::{Endpoint, IpcServer, connect_raw};

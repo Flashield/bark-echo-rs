@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 // daemon appends `NotificationIntent` lines to the log, and the channel
 // relays appended lines as-is — one type, so the event payload cannot
 // fork the log format (spec story 24). Re-exported here so every
-// consumer of the channel names it from the channel's crate.
-pub use echo_core::intent::NotificationIntent;
+// consumer of the channel names it from the channel's crate, with the
+// resolved `ClickAction` the lines carry (ticket #15's viewer renders
+// them).
+pub use echo_core::intent::{ClickAction, NotificationIntent};
 
 /// One client → daemon frame: the request plus the id its response must
 /// carry. The first frame on every connection is [`Request::Hello`].
