@@ -115,10 +115,10 @@ pub(crate) fn render_parts(intent: &NotificationIntent) -> (String, String) {
     }
 }
 
-/// What a click on the notification does (spec stories 11 and 12). Only
-/// the platforms that watch the notification's activation events call
-/// it — on Windows the tray stage owns activations (ADR-0002).
-#[cfg(not(target_os = "windows"))]
+/// What a click on the notification does (spec stories 11 and 12). The
+/// platforms that watch the notification's activation events call it
+/// from their wait thread (macOS/Linux); Windows calls it from the COM
+/// toast-activation callback (toast_activation, ticket #17).
 fn perform_click(action: &ClickAction) {
     match action {
         ClickAction::OpenUrl { url } => {
@@ -135,7 +135,6 @@ fn perform_click(action: &ClickAction) {
 }
 
 /// Open a URL in the default browser.
-#[cfg(not(target_os = "windows"))]
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let mut command = {
@@ -149,10 +148,13 @@ fn open_url(url: &str) -> Result<(), String> {
         command.arg(url);
         command
     };
+    // Platform fact: `start` treats the first quoted argument as a
+    // window title, so the URL must ride second behind an empty title —
+    // without it a URL with special characters is swallowed as a title.
     #[cfg(windows)]
     let mut command = {
         let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start"]).arg(url);
+        command.args(["/C", "start", ""]).arg(url);
         command
     };
     command.spawn().map(|_| ()).map_err(|err| err.to_string())
@@ -160,7 +162,6 @@ fn open_url(url: &str) -> Result<(), String> {
 
 /// Place text on the system clipboard, by the platform's clipboard
 /// command fed over stdin (no clipboard crate).
-#[cfg(not(target_os = "windows"))]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -179,18 +180,40 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         command
     };
 
+    // The bytes each clipboard command consumes: the unix tools read
+    // UTF-8; clip.exe needs the UTF-16LE BOM form (see
+    // [`clip_stdin_bytes`]) or it garbles every non-ASCII character.
+    #[cfg(windows)]
+    let payload = clip_stdin_bytes(text);
+    #[cfg(not(windows))]
+    let payload = text.as_bytes().to_vec();
+
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| "clipboard command lost its stdin".to_owned())?;
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|err| err.to_string())?;
+    stdin.write_all(&payload).map_err(|err| err.to_string())?;
     drop(stdin);
     // The clipboard command exits once stdin closes; reaping it here
     // keeps the daemon's children from piling up as zombies.
     child.wait().map(|_| ()).map_err(|err| err.to_string())
+}
+
+/// The bytes the Windows clipboard command (`clip.exe`) consumes to
+/// place `text` on the clipboard: UTF-16 little-endian with a BOM.
+/// Platform fact: without the BOM clip.exe decodes piped bytes in the
+/// console codepage and garbles every non-ASCII character — with it the
+/// bytes are read as wide characters, which CJK Push text needs.
+/// Compiled on every platform and pinned by `tests/toast_activation.rs`;
+/// only the Windows clipboard path feeds it to a process.
+pub fn clip_stdin_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 /// The Linux clipboard command, Wayland or X11: `wl-copy` under a

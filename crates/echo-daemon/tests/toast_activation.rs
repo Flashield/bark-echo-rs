@@ -1,12 +1,14 @@
 //! The platform-independent seam of the Windows toast activation (ticket
 //! #17): the launch-argument encoding that carries a click action from
-//! the rendered toast to the COM `INotificationActivationCallback`, and
-//! the toast XML the renderer builds under the registered AUMID. These
+//! the rendered toast to the COM `INotificationActivationCallback`, the
+//! toast XML the renderer builds under the registered AUMID, and the
+//! clipboard byte format the `copy` click feeds to clip.exe. These
 //! decisions run on Windows but are pure data — so they are pinned by
 //! tests on every platform (the WinRT/COM I/O around them is Windows
 //! CI's build + clippy gate; a Linux runner cannot host a toast).
 
 use echo_core::intent::{ClickAction, NotificationIntent};
+use echo_daemon::notify::clip_stdin_bytes;
 use echo_daemon::toast_activation::{decode_launch_argument, encode_launch_argument, toast_xml};
 
 fn url_action(url: &str) -> ClickAction {
@@ -191,4 +193,35 @@ fn xml_launch_attribute(xml: &str) -> String {
     let rest = &xml[start..];
     let end = rest.find('"').expect("closing quote");
     rest[..end].to_owned()
+}
+
+#[test]
+fn the_clipboard_bytes_carry_a_bom_so_clip_exe_reads_unicode() {
+    // Platform fact: clip.exe without a BOM interprets piped bytes in
+    // the console codepage, garbling every non-ASCII character — and
+    // Bark's primary audience pushes CJK text. With the UTF-16LE BOM
+    // (FF FE) it reads the bytes as wide characters.
+    let bytes = clip_stdin_bytes("标题 body");
+    assert_eq!(&bytes[..2], &[0xFF, 0xFE], "missing UTF-16LE BOM");
+    // 标 = U+6807 → LE bytes 07 68.
+    assert_eq!(&bytes[2..4], &[0x07, 0x68]);
+    // ASCII rides as one byte plus a NUL, exactly wide-char LE: after
+    // the BOM and the two CJK units, bytes 6-7 are the space unit and
+    // bytes 8-9 the `b` of `body`.
+    assert_eq!(&bytes[8..10], &[0x62, 0x00], "b of body");
+}
+
+#[test]
+fn the_clipboard_bytes_hold_the_whole_text() {
+    let text = "first line\nsecond line 中文";
+    let bytes = clip_stdin_bytes(text);
+    let expected = "FFFE".to_owned()
+        + &text
+            .encode_utf16()
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|unit| format!("{:02X}{:02X}", unit & 0xFF, unit >> 8))
+            .collect::<String>();
+    let actual: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+    assert_eq!(actual, expected);
 }
