@@ -131,6 +131,14 @@ impl WindowModel {
         self.link = LinkState::Reconnecting;
     }
 
+    /// Quit clicked (ticket #12): the banner names the stop — the tray
+    /// header's own word, one shared state (`LinkState::Quitting`) —
+    /// and every row's last-known state loses its freshness claim,
+    /// exactly as when the link broke. Idempotent.
+    pub fn quitting(&mut self) {
+        self.link = LinkState::Quitting;
+    }
+
     /// The link's state, for the render's color choice.
     pub fn link(&self) -> LinkState {
         self.link.clone()
@@ -143,6 +151,7 @@ impl WindowModel {
             LinkState::Connecting => "Daemon: connecting…".to_owned(),
             LinkState::Connected => "Daemon: connected".to_owned(),
             LinkState::Reconnecting => "Daemon: reconnecting…".to_owned(),
+            LinkState::Quitting => "Daemon: shutting down…".to_owned(),
         }
     }
 
@@ -182,7 +191,9 @@ impl WindowModel {
                 }
                 StreamState::Failed { detail } => format!("stopped — {detail}"),
             },
-            LinkState::Connecting | LinkState::Reconnecting => "unknown (daemon away)".to_owned(),
+            LinkState::Connecting | LinkState::Reconnecting | LinkState::Quitting => {
+                "unknown (daemon away)".to_owned()
+            }
         }
     }
 }
@@ -207,7 +218,10 @@ pub fn render(
     let mut header = egui::RichText::new(model.status_line()).strong();
     header = match model.link() {
         LinkState::Connected => header,
-        LinkState::Connecting => header.color(egui::Color32::YELLOW),
+        // Transitional states get the warm color; the absence gets red.
+        // Quitting is transitional too — the stop is underway, and the
+        // window is on its way out with the process.
+        LinkState::Connecting | LinkState::Quitting => header.color(egui::Color32::YELLOW),
         LinkState::Reconnecting => header.color(egui::Color32::LIGHT_RED),
     };
     ui.label(header);
@@ -386,6 +400,27 @@ mod tests {
         );
         assert_eq!(rows[0].server, "http://127.0.0.1:8080");
         assert_eq!(rows[0].token_hint, "abcdef123456...");
+    }
+
+    #[test]
+    fn quitting_names_the_stop_and_dethrones_stale_states() {
+        // Ticket #12: during Quit's bounded wait the banner names what
+        // is happening — the tray header's own word, one shared state —
+        // and the rows lose their freshness claim the same way they do
+        // when the link breaks. Nothing updates the window after this.
+        let mut model = WindowModel::connecting();
+        model.apply_snapshot(&snapshot_with_state(StreamState::Running));
+        model.quitting();
+        assert_eq!(
+            model.status_line(),
+            "Daemon: shutting down…",
+            "the banner names the stop while the exchange waits"
+        );
+        let rows = model.rows();
+        assert_eq!(
+            rows[0].state, "unknown (daemon away)",
+            "a last-known running never poses as current during the stop"
+        );
     }
 
     #[test]

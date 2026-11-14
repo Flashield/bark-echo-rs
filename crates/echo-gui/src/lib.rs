@@ -13,6 +13,7 @@ pub mod connection;
 pub mod fonts;
 pub mod history_view;
 pub mod model;
+pub mod shutdown;
 pub mod tray;
 pub mod window;
 

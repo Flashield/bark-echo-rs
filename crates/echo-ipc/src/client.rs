@@ -99,6 +99,22 @@ impl Client {
         }
     }
 
+    /// Ask the daemon for a graceful shutdown (ticket #12): the answer
+    /// is the acceptance, not the completion — the daemon answers
+    /// before it begins stopping, and its graceful stop closes every
+    /// connection. The client's next read after [`Client::shutdown`]
+    /// therefore ends in [`IpcError::Closed`] when the daemon is
+    /// healthy; a client that must observe the lock release or the
+    /// process exit polls the files (the daemon's IPC seam tests do).
+    pub async fn shutdown(&mut self) -> Result<(), IpcError> {
+        match self.call(Request::Shutdown).await? {
+            Response::ShuttingDown => Ok(()),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a shutdown request: {other:?}"
+            ))),
+        }
+    }
+
     /// The recent tail of one Subscription's History Log (ticket #15):
     /// the daemon reads its own daemon-private files (ADR-0004) and
     /// answers with at most `tail` entries, oldest last — the content

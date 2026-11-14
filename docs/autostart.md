@@ -24,6 +24,14 @@ All three samples rely on the same facts about the daemon:
 - Configuration changes (ADR-0001's Subscription list) are read at
   startup: restart the service after `subscribe add` / `subscribe rm`.
 
+With the GUI installed, these facts do more work, not less. Starting
+the Tray Menu (`bark-echo gui`) brings the daemon up when the
+single-instance lock is idle (spawn-if-absent); the Tray Menu's Quit
+asks the daemon for a graceful shutdown — the daemon exits with code 0,
+which none of the samples above resurrect (`Restart=on-failure` and
+`KeepAlive SuccessfulExit=false` leave a clean stop alone). Relaunch
+the GUI to bring the daemon back.
+
 ## Linux: systemd user unit
 
 Save as `~/.config/systemd/user/bark-echo.service` (adjust the binary

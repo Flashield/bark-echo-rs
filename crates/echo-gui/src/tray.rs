@@ -71,8 +71,8 @@ impl TrayMenu {
                 MenuItem::Separator => {
                     menu.append(&tray_icon::menu::PredefinedMenuItem::separator())?;
                 }
-                // The two actions. Quit exits the GUI process in this
-                // ticket (the daemon shutdown is #12); the Management
+                // The two actions. Quit asks the daemon for a graceful
+                // shutdown and then leaves (ticket #12); the Management
                 // Window row is #13's placeholder.
                 MenuItem::OpenManagementWindow => {
                     let item = tray_icon::menu::MenuItem::new("Open Management Window", true, None);

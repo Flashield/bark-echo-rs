@@ -50,6 +50,10 @@ pub enum UiMsg {
     /// The channel broke — the tray names the absence instead of
     /// leaving a stale picture.
     LinkDown,
+    /// The Quit exchange's answer (ticket #12): what the daemon said
+    /// when Quit asked it to stop. The shell exits either way; this
+    /// names how honest the exit is.
+    ShutdownOutcome(crate::shutdown::QuitOutcome),
     /// A [`ClientAsk::HistorySnapshot`] answered: the picked
     /// Subscription's bounded tail, oldest last (ticket #15).
     HistoryLoaded {
