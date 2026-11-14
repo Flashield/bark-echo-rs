@@ -50,6 +50,17 @@ pub enum RunError {
     /// The state file could not be set up at startup.
     #[error(transparent)]
     State(#[from] crate::state::StateError),
+    /// The IPC Channel could not be bound beside the lock (ADR-0004):
+    /// the run refuses to start rather than serve streams nobody can
+    /// query — `status`'s live answer would silently fall back to the
+    /// state file forever.
+    #[error("cannot bind the IPC channel at {path}: {source}")]
+    IpcBind {
+        /// The endpoint the channel was to listen on.
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// Nothing to mirror — the actionable fix is `subscribe add`.
     #[error("no subscriptions configured — add one with `subscribe add` first")]
     NoSubscriptions,
@@ -103,6 +114,41 @@ pub async fn run(
         std::process::id(),
         &ids,
     )?);
+
+    // The IPC Channel hangs beside the lock (ADR-0004): while the run
+    // lives, any local client can ask for the live snapshot. The lock is
+    // already ours, so bind may clean a dead daemon's leftover socket;
+    // a bind failure is a startup failure, not a degraded run.
+    let endpoint = spec.paths.ipc_endpoint();
+    let server = echo_ipc::IpcServer::bind(&endpoint).map_err(|source| RunError::IpcBind {
+        path: endpoint.to_string(),
+        source,
+    })?;
+    let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let channel_state = state.clone();
+    let mut channel = tokio::spawn(echo_ipc::serve(
+        server,
+        async move {
+            let _ = channel_stop_rx.await;
+        },
+        move |request| {
+            let state = channel_state.clone();
+            async move {
+                match request {
+                    echo_ipc::Request::Status => echo_ipc::Response::Status {
+                        snapshot: state.snapshot(),
+                    },
+                    // Only post-handshake requests arrive here; the
+                    // vocabulary has no other request yet (the event
+                    // stream is ticket #11), but an unknown request is
+                    // answered, never fatal.
+                    other => echo_ipc::Response::Error {
+                        message: format!("this daemon does not answer {other:?}"),
+                    },
+                }
+            }
+        },
+    ));
 
     // One supervisor per Subscription; each owns its stream handle and
     // is stopped through its own fence at shutdown.
@@ -178,11 +224,37 @@ pub async fn run(
     }
 
     // Hold the runtime until the owner lets go (ctrl-C in production, a
-    // fence in tests).
-    shutdown.await;
+    // fence in tests). The channel ending early does not end the run:
+    // mirroring streams is the daemon's core job, and `status` falls
+    // back to the state file — but the failure is logged loudly, and
+    // the owner still decides when the run is over.
+    tokio::pin!(shutdown);
+    tokio::select! {
+        _ = &mut shutdown => {}
+        served = &mut channel => {
+            match served {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!(
+                    "the IPC channel stopped: {err}; `status` falls back to the state file"
+                ),
+                Err(join_error) => eprintln!(
+                    "the IPC channel task failed: {join_error}; `status` falls back to the state file"
+                ),
+            }
+            // The owner has not spoken yet; the run holds until it does.
+            (&mut shutdown).await;
+        }
+    }
 
-    // Graceful stop: every supervisor closes its stream before the lock
-    // is released with this function's scope.
+    // Graceful stop: the channel closes first (its connections die with
+    // the aborted tasks), then every supervisor closes its stream — all
+    // before the lock is released with this function's scope.
+    let _ = channel_stop_tx.send(());
+    match channel.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("the IPC channel ended with an error: {err}"),
+        Err(join_error) => eprintln!("the IPC channel task failed: {join_error}"),
+    }
     for fence in &fences {
         let _ = fence.send(()).await;
     }

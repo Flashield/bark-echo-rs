@@ -1,78 +1,27 @@
-//! The daemon's runtime state file (ADR-0002 MVP: `status` reads files
-//! the runtime writes — no IPC yet): per-Subscription stream state,
+//! The daemon's runtime state file: per-Subscription stream state,
 //! written atomically on every change. The vocabulary matches the
 //! ticket's face — starting, running, disconnected, token invalid,
 //! failed — and every record carries the processed notification's id so
 //! `status` can show the History Log cursor alongside the live state.
+//!
+//! The shape is [`echo_ipc::StatusSnapshot`] — the same snapshot the
+//! daemon serves over the IPC Channel while it runs (ADR-0004, spec
+//! story 24): one vocabulary owned by `echo-ipc`, so the file the
+//! daemon persists and the answer its channel gives cannot fork.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-
-/// Per-Subscription stream state as the runtime sees it (ticket #5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
-pub enum StreamState {
-    /// Spawned, no `: connected` handshake yet.
-    Starting,
-    /// Handshake completed — pushes published now are delivered (§3.3).
-    Running,
-    /// The connection dropped or a connect failed; retrying with backoff.
-    Disconnected {
-        /// What happened, as the receive loop phrased it.
-        detail: String,
-    },
-    /// 401 `stream token invalid` (§5): actionable — re-subscribe this
-    /// Subscription (spec story 21). Never retried.
-    TokenInvalid,
-    /// The loop stopped for another reason (Basic Auth teapot, History
-    /// Log failure). The detail names it.
-    Failed {
-        /// What stopped the loop, as the receive loop phrased it.
-        detail: String,
-    },
-}
-
-impl StreamState {
-    /// The state's name — the word `status` prints.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            StreamState::Starting => "starting",
-            StreamState::Running => "running",
-            StreamState::Disconnected { .. } => "disconnected",
-            StreamState::TokenInvalid => "token invalid",
-            StreamState::Failed { .. } => "failed",
-        }
-    }
-}
-
-/// One Subscription's runtime line in the state file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscriptionRuntime {
-    /// How the stream is doing right now.
-    pub state: StreamState,
-    /// The id of the last processed notification — the History Log's
-    /// cursor (GLOSSARY).
-    pub last_message_id: Option<i64>,
-    /// Unix seconds of the last change to this line.
-    pub updated_at: i64,
-}
+// The state vocabulary is the wire vocabulary (ADR-0004): echo-ipc owns
+// StreamState and the snapshot shape; the daemon writes them to disk and
+// serves them over the channel.
+pub use echo_ipc::message::{StatusSnapshot, StreamState, SubscriptionRuntime};
 
 /// The whole state file: which process is running it and how every
-/// Subscription's stream is doing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DaemonState {
-    /// The daemon process's pid — ties the file to `ps` output.
-    pub pid: u32,
-    /// Unix seconds when this daemon instance started.
-    pub started_at: i64,
-    /// Per-Subscription lines, keyed by Subscription id (the Stream
-    /// Token's `token_id`).
-    pub subscriptions: BTreeMap<String, SubscriptionRuntime>,
-}
+/// Subscription's stream is doing. The same bytes describe the channel's
+/// status snapshot.
+pub type DaemonState = StatusSnapshot;
 
 /// Failures of reading or persisting the state file.
 #[derive(Debug, thiserror::Error)]

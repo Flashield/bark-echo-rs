@@ -779,6 +779,7 @@ dependencies = [
  "bark-server-rs",
  "clap",
  "echo-core",
+ "echo-ipc",
  "keyring",
  "notify-rust",
  "reqwest",
