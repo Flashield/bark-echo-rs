@@ -13,6 +13,7 @@ pub mod connection;
 pub mod fonts;
 pub mod model;
 pub mod tray;
+pub mod window;
 
 pub use app::run;
 pub use connection::UiMsg;
