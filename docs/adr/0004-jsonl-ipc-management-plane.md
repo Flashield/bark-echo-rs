@@ -8,7 +8,13 @@ arrive unsolicited. Since ticket #13 the status snapshot's
 per-Subscription lines also carry the Subscription list's public
 identity (label, server URL, token hint — the config's non-secret
 fields), so the GUI's opening is the one `status` request; a separate
-list snapshot never became a message type. The daemon is the only
+list snapshot never became a message type. The Push Composer's send is
+one request-response (ticket #16): its context is one Subscription the
+user picks — the daemon sends through that Subscription's server with
+its own stored Basic Auth credentials — plus the Composer's explicit
+target Device Key field; an any-server-with-temporary-credentials send
+stays the `push` command's territory, so the wire never carries a
+credential. The daemon is the only
 writer of bark-echo state:
 while it runs, `subscribe add/rm` from the GUI and the CLI ride the IPC
 Channel and take effect immediately (it mutates the Subscription list,

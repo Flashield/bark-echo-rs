@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use echo_ipc::PROTOCOL_VERSION;
 use echo_ipc::message::{
-    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
-    StreamState, SubscriptionRuntime,
+    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, SendPush,
+    SendPushOutcome, StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 
 fn plain_intent(id: i64) -> NotificationIntent {
@@ -282,4 +282,129 @@ fn a_history_appended_event_round_trips_the_log_line_vocabulary() {
     );
     let back: Event = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, event);
+}
+
+// ---- The Push Composer's send (ticket #16) ----
+
+#[test]
+fn a_send_push_request_round_trips_with_its_ext_params() {
+    // The Composer's send is one request (ADR-0004): which Subscription
+    // it rides, the target Device's Device Key, the alert fields, and
+    // the Ext Params (GLOSSARY) verbatim.
+    let frame = RequestFrame {
+        id: 11,
+        request: Request::SendPush {
+            push: SendPush {
+                subscription_id: "tok".to_owned(),
+                device_key: "device-key-1".to_owned(),
+                title: Some("from the Composer".to_owned()),
+                subtitle: None,
+                body: Some("你好".to_owned()),
+                ext_params: BTreeMap::from([
+                    ("url".to_owned(), "https://example.com".to_owned()),
+                    ("sound".to_owned(), "bell".to_owned()),
+                ]),
+            },
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(json.contains(r#""type":"send_push""#), "{json}");
+    assert!(
+        json.contains(r#""subscription_id":"tok""#)
+            && json.contains(r#""device_key":"device-key-1""#),
+        "the send's context and target ride the request: {json}"
+    );
+    assert!(
+        json.contains(r#""url":"https://example.com""#),
+        "Ext Params ride the request verbatim: {json}"
+    );
+    // The GUI holds no credentials (spec story 13): no secret field
+    // exists on this request's wire shape — the daemon fills in its own.
+    assert!(
+        !json.contains("token") && !json.contains("password") && !json.contains("auth"),
+        "no credential material exists in the send request: {json}"
+    );
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn a_send_push_request_without_optional_fields_round_trips() {
+    // Only the Subscription, the target Device Key — the alert fields
+    // and Ext Params stay absent, the `push` command's minimal face.
+    let frame = RequestFrame {
+        id: 12,
+        request: Request::SendPush {
+            push: SendPush {
+                subscription_id: "tok".to_owned(),
+                device_key: "device-key-1".to_owned(),
+                title: None,
+                subtitle: None,
+                body: None,
+                ext_params: BTreeMap::new(),
+            },
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn a_push_sent_response_round_trips_the_servers_verdict() {
+    // The answer is the bark server's own verdict: accepted, or refused
+    // with its code and message — which the window shows verbatim, never
+    // a paraphrase (ticket #16's readable-rejection rule).
+    let accepted = ResponseFrame {
+        id: 4,
+        response: Response::PushSent {
+            outcome: SendPushOutcome::Sent,
+        },
+    };
+    let json = serde_json::to_string(&accepted).expect("serialize");
+    assert!(json.contains(r#""type":"push_sent""#), "{json}");
+    assert!(json.contains(r#""kind":"sent""#), "{json}");
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, accepted);
+
+    let rejected = ResponseFrame {
+        id: 5,
+        response: Response::PushSent {
+            outcome: SendPushOutcome::Rejected {
+                code: Some(400),
+                message: "failed to get [key] device token from database".to_owned(),
+            },
+        },
+    };
+    let json = serde_json::to_string(&rejected).expect("serialize");
+    assert!(json.contains(r#""kind":"rejected""#), "{json}");
+    assert!(
+        json.contains(r#""code":400"#),
+        "the envelope code rides: {json}"
+    );
+    assert!(
+        json.contains("failed to get [key] device token from database"),
+        "the server's message rides verbatim: {json}"
+    );
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, rejected);
+}
+
+#[test]
+fn a_push_sent_rejection_without_an_envelope_code_round_trips() {
+    // The Basic Auth refusal (protocol §1.4) answers 418 in plain text,
+    // no envelope — the classification rides, the code still names it.
+    let frame = ResponseFrame {
+        id: 6,
+        response: Response::PushSent {
+            outcome: SendPushOutcome::Rejected {
+                code: Some(418),
+                message: "bark server refused the Basic Auth credentials (418): missing or wrong user/password"
+                    .to_owned(),
+            },
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
 }
