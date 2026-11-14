@@ -234,6 +234,132 @@ async fn the_history_snapshot_answers_with_the_daemons_own_log_tail() {
     server.shutdown().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn the_viewers_initial_content_is_what_log_tail_prints() {
+    // The acceptance line (ticket #15): what the viewer opens with is
+    // what `log --tail N` shows for the same Subscription. The CLI
+    // child prints the human lines; the daemon answers the entries —
+    // and the two agree through the same formatter the CLI uses.
+    //
+    // Platform fact (unix-only): the CLI subprocess relocates its whole
+    // install with HOME/XDG_CONFIG_HOME (tests/common Harness::spawn's
+    // unix arm), which is how this test points a real `bark-echo log`
+    // child at the same install the in-process daemon serves. Windows
+    // relocates via %APPDATA%\bark-echo instead (Harness's windows arm)
+    // and has no XDG twin — the same daemon handler answers both
+    // platforms, and Windows' channel face stays covered by the other
+    // ipc_seam tests plus tests/log_cli.rs.
+    let harness = common::Harness::new();
+    let paths = harness.paths();
+
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "log-tail-agrees").await;
+    {
+        use echo_daemon::secrets::{PlainFileStore, SecretKey, SecretKind, SecretStore};
+        let store = PlainFileStore::new(paths.secrets_file());
+        let key = SecretKey {
+            server: server.base_url.clone(),
+            token_id: token_id.clone(),
+        };
+        store
+            .set(&key, SecretKind::DeviceKey, &device_key)
+            .expect("store device key");
+        store
+            .set(&key, SecretKind::StreamToken, &secret)
+            .expect("store stream token");
+    }
+    let config = echo_daemon::config::Config {
+        subscriptions: vec![echo_daemon::config::Subscription {
+            id: token_id.clone(),
+            server: server.base_url.clone(),
+            label: "desktop".to_owned(),
+            token_hint: format!("{}...", &secret[..12]),
+            device_hint: format!("{}...", &device_key[..8]),
+        }],
+        servers: Vec::new(),
+    };
+    // The CLI child reads the Subscription list from the files (its
+    // headless path); the daemon gets the same list injected.
+    config
+        .save(&paths.config_file())
+        .expect("write the config the CLI will read");
+
+    let (fence_tx, fence_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon_paths = paths.clone();
+    let runner = tokio::spawn(async move {
+        echo_daemon::run::run(
+            echo_daemon::run::DaemonSpec {
+                paths: daemon_paths.clone(),
+                config,
+                store: Arc::new(echo_daemon::secrets::PlainFileStore::new(
+                    daemon_paths.secrets_file(),
+                )),
+                renderer: Arc::new(SilentRenderer),
+            },
+            async move {
+                let _ = fence_rx.await;
+            },
+        )
+        .await
+    });
+
+    common::wait_active_streams(&server, 1).await;
+    let endpoint = paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+    for body in ["first", "second", "third"] {
+        push_to(&server, &device_key, body).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match client.history_snapshot(&token_id, 100).await {
+            Ok(entries) if entries.len() == 3 => break,
+            Ok(_) | Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the daemon's answer never showed three entries"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    // The two faces of one fact: the channel answer the viewer opens
+    // with, and the lines the CLI prints — `log --tail 2`, same
+    // Subscription, same files behind it.
+    let stdout = harness
+        .run(&["--plain-secrets", "log", "--sub", "desktop", "--tail", "2"])
+        .await
+        .stdout_or_die("log --tail 2");
+    let entries = client
+        .history_snapshot(&token_id, 2)
+        .await
+        .expect("the viewer's tail");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        entries.len(),
+        "one line per entry: {stdout} vs {entries:?}"
+    );
+    for (line, entry) in lines.iter().zip(&entries) {
+        assert_eq!(
+            line,
+            &echo_daemon::history::format_entry(entry),
+            "the viewer's opening content is what log --tail 2 prints"
+        );
+    }
+    assert_eq!(entries[0].body, "second", "the tail is the newest end");
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_channel_answers_with_the_live_per_subscription_state() {
     let server = common::TestServer::spawn().await;
