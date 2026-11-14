@@ -795,6 +795,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-gui"
+version = "0.1.0"
+dependencies = [
+ "echo-ipc",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "echo-ipc"
 version = "0.1.0"
 dependencies = [

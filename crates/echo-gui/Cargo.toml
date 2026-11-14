@@ -1,0 +1,12 @@
+[package]
+name = "echo-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The GUI is a thin renderer over the echo-ipc client's state (ADR-0004,
+# spec Testing Decisions: "echo-gui gets no seam — GUI logic is an
+# echo-ipc client state machine covered by the IPC seam").
+echo-ipc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
