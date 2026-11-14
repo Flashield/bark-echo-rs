@@ -4,8 +4,10 @@
 //! transport-agnostic connect/bind — JSON Lines over a Unix domain
 //! socket (Linux/macOS) or a named pipe (Windows).
 
+mod connection;
 pub(crate) mod framing;
 pub mod message;
+pub mod transport;
 
 pub use message::{
     Request, RequestFrame, Response, ResponseFrame, StatusSnapshot, StreamState,
