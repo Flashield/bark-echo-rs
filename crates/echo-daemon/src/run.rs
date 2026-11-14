@@ -132,6 +132,12 @@ pub async fn run(
     let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
     let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let channel_state = state.clone();
+    // The Composer's sends (ticket #16) ride the same channel: the
+    // handler needs the Subscription list to resolve a send's context
+    // and the store for its Basic Auth — both the daemon's own, behind
+    // Arcs the handler clones per request.
+    let channel_config = Arc::new(spec.config.clone());
+    let channel_store = spec.store.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
         server,
         async move {
@@ -140,15 +146,26 @@ pub async fn run(
         event_hub.clone(),
         move |request| {
             let state = channel_state.clone();
+            let config = channel_config.clone();
+            let store = channel_store.clone();
             async move {
                 match request {
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
                         snapshot: state.snapshot(),
                     },
-                    // Only post-handshake requests arrive here; the
-                    // vocabulary has no other request yet (the event
-                    // stream is ticket #11), but an unknown request is
-                    // answered, never fatal.
+                    // The Push Composer's send (ticket #16): performed
+                    // here, with the daemon's own secrets — the wire
+                    // carries none. The server's verdict goes back
+                    // verbatim; a send that could not be attempted is
+                    // the error answer.
+                    echo_ipc::Request::SendPush { push } => {
+                        match crate::composer::handle_send(&config, store.as_ref(), push).await {
+                            Ok(outcome) => echo_ipc::Response::PushSent { outcome },
+                            Err(message) => echo_ipc::Response::Error { message },
+                        }
+                    }
+                    // Only post-handshake requests arrive here; an
+                    // unknown request is answered, never fatal.
                     other => echo_ipc::Response::Error {
                         message: format!("this daemon does not answer {other:?}"),
                     },
