@@ -1,10 +1,22 @@
 //! The eframe application shell (ADR-0003: egui/eframe, glow renderer):
-//! a tray-only app — the event loop runs without a visible window (the
-//! Management Window is #13) and everything the user touches is the
-//! Tray Menu. The shell is thin by contract: it drains the connection
-//! loop's messages into the model, hands model changes to the tray, and
-//! dispatches menu clicks. Every nontrivial decision lives in the
+//! one window that lives hidden while the Tray Menu is the whole
+//! surface, and shows the Management Window (#13) when the tray item
+//! asks. The shell is thin by contract: it drains the connection loop's
+//! messages into the two models (tray and window — siblings, each its
+//! own state machine), hands tray changes to the tray, dispatches menu
+//! clicks, and draws the window. Every nontrivial decision lives in a
 //! model, every transport rule in the connection loop.
+//!
+//! The window's close button hides it, it never ends the app (the tray
+//! persists; reopening works repeatedly) — eframe 0.37's close contract,
+//! read off its source: a close of the root viewport (the X button, or
+//! our own `ViewportCommand::Close`) ends the application unless the
+//! pass that sees the request sends `ViewportCommand::CancelClose` —
+//! the check runs in both paths, `update` for a visible window and
+//! `update_logic_only` for a hidden one. So the shell distinguishes the
+//! two asks by its `quitting` flag: a close while not quitting is
+//! cancelled and answered with `Visible(false)`; a close after Quit is
+//! let through.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +29,7 @@ use crate::connection::{UiMsg, spawn_connection_loop};
 use crate::fonts;
 use crate::model::TrayModel;
 use crate::tray::TrayMenu;
+use crate::window::{WindowModel, render};
 
 /// How soon the shell wakes again when nothing happens: menu clicks and
 /// channel messages both surface through the polled channels, and this
@@ -44,11 +57,15 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     spawn_connection_loop(endpoint, sender, stop.clone());
 
     let options = eframe::NativeOptions {
-        // Tray-only: no window yet — the Tray Menu is the whole surface
-        // of ticket #11. The title stays (it names the process to the
-        // window system and becomes eframe's persistence id).
+        // The one window starts hidden (the Tray Menu is the app's
+        // always-available face) and becomes the Management Window when
+        // the tray item asks; `run_native`'s app id stays "bark-echo"
+        // (the persistence key), while the runtime title is set on every
+        // show. The size is the Management Window's opening shape — the
+        // hidden shell never paints at it.
         viewport: egui::ViewportBuilder::default()
             .with_title("bark-echo")
+            .with_inner_size([560.0, 420.0])
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
         event_loop_builder: Some(Box::new(|builder| {
@@ -83,11 +100,22 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     .map_err(|err| GuiError::Start(err.to_string()))
 }
 
-/// The shell: the model's owner on the UI thread.
+/// The shell: the models' owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
     stop: Arc<AtomicBool>,
     model: TrayModel,
+    /// The Management Window's picture, fed the same connection stream
+    /// as the tray model — whether the window is open or not. Keeping
+    /// it current while hidden is what makes opening the window show a
+    /// live picture instead of a fetch: the connection loop's snapshot
+    /// rides every (re)connect and the events keep it current, so no
+    /// on-open request is needed (and none exists to send — the
+    /// connection loop owns the client).
+    window: WindowModel,
+    /// Set by the tray's Quit so the close interception below knows
+    /// this close means exit, not hide.
+    quitting: bool,
     /// Built on the first update, not in the constructor: macOS wants
     /// the tray created while the event loop is already running
     /// (tray-icon's platform note; winit's earliest safe point), and
@@ -102,6 +130,8 @@ impl TrayApp {
             receiver,
             stop,
             model: TrayModel::connecting(),
+            window: WindowModel::connecting(),
+            quitting: false,
             tray: None,
         }
     }
@@ -120,8 +150,8 @@ impl Drop for TrayApp {
 impl eframe::App for TrayApp {
     // The shell's whole beat runs in `logic`: eframe calls it before
     // every repaint and — the reason it is the right hook here — also
-    // while the window is hidden, which this tray-only window always
-    // is. No painting happens in it; the window has no UI to show.
+    // while the window is hidden, which it is whenever the Tray Menu is
+    // the only surface. No painting happens in it; painting is `ui`'s.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.tray.is_none() {
             // The tray is built here, not in the constructor: macOS
@@ -136,20 +166,25 @@ impl eframe::App for TrayApp {
             }
         }
 
-        // The channel's news, all of it, into the model.
+        // The channel's news, all of it, into both models — the tray's
+        // glance and the window's list eat the same snapshot-then-
+        // events stream (the window's stays current while hidden).
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
+                    self.window.apply_snapshot(&snapshot);
                     dirty = true;
                 }
                 UiMsg::Event(event) => {
                     self.model.apply_event(&event);
+                    self.window.apply_event(&event);
                     dirty = true;
                 }
                 UiMsg::LinkDown => {
                     self.model.connection_lost();
+                    self.window.connection_lost();
                     dirty = true;
                 }
             }
@@ -166,19 +201,48 @@ impl eframe::App for TrayApp {
             while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                 if tray.is_quit(&event) {
                     // Ticket #11's Quit: exit the GUI process. Asking
-                    // the daemon for a graceful shutdown is #12.
+                    // the daemon for a graceful shutdown is #12. The
+                    // flag tells the close handling below to let this
+                    // one through.
+                    self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 } else if tray.is_open_management(&event) {
-                    // Placeholder: the Management Window is ticket #13.
+                    // The Management Window (ticket #13): reveal the
+                    // one viewport as itself. The title names the
+                    // surface (GLOSSARY) — `run_native`'s app id stays
+                    // "bark-echo", so persistence is untouched. Focus
+                    // raises an existing window; egui 0.37 notes it has
+                    // no effect on Wayland (compositor's call there),
+                    // which is fine — showing still works.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        "bark-echo — Management Window".to_owned(),
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
+        }
+
+        // The close button asks to close; the app answers. A close
+        // that is not a Quit is the Management Window being dismissed:
+        // cancel the exit (eframe 0.37: the app ends unless this pass
+        // sends CancelClose — both the visible and the hidden path
+        // check for it) and hide the viewport instead. The tray, the
+        // connection loop, and both models keep running; reopening is
+        // another Visible(true).
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         ctx.request_repaint_after(WAKE_UP);
     }
 
-    // Required by the trait, empty by design: the window is invisible
-    // (tray-only), so there is nothing to draw. Every user-visible
-    // thing is the native tray menu, driven from `logic`.
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+    // The Management Window's paint pass, reached only while the
+    // viewport is visible (eframe runs no paint at all while hidden).
+    // Thin by contract: the model owns every word; this lays them out.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        render(ui, &self.window);
+    }
 }
