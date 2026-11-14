@@ -790,6 +790,8 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
