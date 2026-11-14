@@ -1,8 +1,8 @@
 //! echo-gui: the GUI stage's crate (ADR-0003 — egui/eframe with the
-//! glow renderer). Ticket #11's face is the Tray Menu: an always-present
-//! tray icon whose menu lists each Subscription's label with its live
-//! stream state, updated by the daemon's pushed events — a thin
-//! renderer over the echo-ipc client's state machine, never a second
+//! glow renderer). The Tray Menu (ticket #11) is the always-present
+//! face; the Management Window (tickets #13 and #14) lists each
+//! Subscription and adds and removes them over the channel — thin
+//! renderers over the echo-ipc client's state machines, never a second
 //! runtime.
 //!
 //! Entry: [`app::run`] on the main thread — the binary's `gui`
@@ -10,12 +10,14 @@
 
 pub mod app;
 pub mod connection;
+pub mod crud;
 pub mod fonts;
 pub mod model;
 pub mod tray;
 pub mod window;
 
 pub use app::run;
-pub use connection::UiMsg;
+pub use connection::{CrudCommand, UiMsg};
+pub use crud::CrudModel;
 pub use model::{LinkState, MenuItem, SubscriptionLine, TrayModel};
 pub use window::{RowView, WindowModel};

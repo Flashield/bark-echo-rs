@@ -20,12 +20,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use echo_ipc::Endpoint;
 
-use crate::connection::{UiMsg, spawn_connection_loop};
+use crate::connection::{CrudCommand, UiMsg, spawn_connection_loop};
+use crate::crud::{self, CrudModel};
 use crate::fonts;
 use crate::model::TrayModel;
 use crate::tray::TrayMenu;
@@ -53,8 +54,12 @@ pub enum GuiError {
 /// [`spawn_connection_loop`]) and arrives here over the mpsc receiver.
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
+    // The Management Window's CRUD actions travel the other way (ticket
+    // #14): the connection loop owns the client, so the form's submits
+    // ride it — plain channel, same thread split.
+    let (crud_sender, crud_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_connection_loop(endpoint, sender, stop.clone());
+    spawn_connection_loop(endpoint, sender, stop.clone(), crud_receiver);
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
@@ -94,7 +99,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, stop)))
+            Ok(Box::new(TrayApp::new(receiver, stop, crud_sender)))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))
@@ -113,6 +118,12 @@ struct TrayApp {
     /// on-open request is needed (and none exists to send — the
     /// connection loop owns the client).
     window: WindowModel,
+    /// The CRUD face (ticket #14): the add form and the remove
+    /// confirmation as their own state machine; its composed commands
+    /// go to the connection loop over the sender below, its outcomes
+    /// come back through the receiver.
+    crud: CrudModel,
+    crud_commands: Sender<CrudCommand>,
     /// Set by the tray's Quit so the close interception below knows
     /// this close means exit, not hide.
     quitting: bool,
@@ -125,12 +136,18 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(receiver: Receiver<UiMsg>, stop: Arc<AtomicBool>) -> Self {
+    fn new(
+        receiver: Receiver<UiMsg>,
+        stop: Arc<AtomicBool>,
+        crud_commands: Sender<CrudCommand>,
+    ) -> Self {
         Self {
             receiver,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
+            crud: CrudModel::new(),
+            crud_commands,
             quitting: false,
             tray: None,
         }
@@ -187,6 +204,14 @@ impl eframe::App for TrayApp {
                     self.window.connection_lost();
                     dirty = true;
                 }
+                // The window's CRUD outcomes (ticket #14): success
+                // closes the form (the fresh snapshot that follows
+                // repaints the rows), a refusal keeps it editable with
+                // the daemon's words showing.
+                UiMsg::ActionResult(outcome) => {
+                    self.crud.action_finished(outcome);
+                    dirty = true;
+                }
             }
         }
         if dirty
@@ -241,8 +266,31 @@ impl eframe::App for TrayApp {
 
     // The Management Window's paint pass, reached only while the
     // viewport is visible (eframe runs no paint at all while hidden).
-    // Thin by contract: the model owns every word; this lays them out.
+    // Thin by contract: the models own every word; this lays them out
+    // and forwards the two asks — a row's Remove click to the CRUD
+    // model, and the CRUD model's composed commands to the connection
+    // loop (ticket #14).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        render(ui, &self.window);
+        let remove_clicked = render(ui, &self.window);
+        for id in remove_clicked {
+            let label = self
+                .window
+                .rows()
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.label.clone())
+                .unwrap_or_default();
+            self.crud.begin_remove(&id, &label);
+        }
+        if let Some(command) = crud::render(ui, &mut self.crud)
+            && let Err(err) = self.crud_commands.send(command)
+        {
+            // The connection loop is gone with the app; the model's
+            // in-flight lock clears on the next action_finished, which
+            // a restarted loop's flow will bring.
+            eprintln!("the connection loop is gone: {err}");
+            self.crud
+                .action_finished(Err("the GUI's channel loop stopped — try again".to_owned()));
+        }
     }
 }

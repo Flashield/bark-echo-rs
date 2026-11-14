@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use echo_gui::connection::{UiMsg, run_connection_loop};
-use echo_ipc::message::{Event, Request, Response, StatusSnapshot, StreamState};
+use echo_gui::connection::{CrudCommand, UiMsg, run_connection_loop};
+use echo_ipc::message::{AddSource, Event, Request, Response, StatusSnapshot, StreamState};
 use echo_ipc::{Endpoint, IpcServer, serve};
 
 type BoxedHandler =
@@ -93,12 +93,20 @@ async fn the_loop_snapshots_hears_events_and_self_heals_after_a_daemon_restart()
     let endpoint = Endpoint::in_config_dir(dir.path());
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    let (_commands_tx, commands_rx) = mpsc::channel();
     let loop_stop = stop.clone();
     let loop_endpoint = endpoint.clone();
     let loop_task = tokio::spawn(async move {
         // A fast reconnect delay: the behavior under test is the shape of
         // the loop, not the production pause between attempts.
-        run_connection_loop(loop_endpoint, tx, loop_stop, Duration::from_millis(50)).await
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            loop_stop,
+            Duration::from_millis(50),
+            commands_rx,
+        )
+        .await
     });
 
     // The GUI starts before the daemon: reaching for it is the loop's
@@ -153,4 +161,133 @@ async fn the_loop_snapshots_hears_events_and_self_heals_after_a_daemon_restart()
 
     stop.store(true, Ordering::Relaxed);
     loop_task.abort();
+}
+
+/// A handler that answers Status and applies the CRUD vocabulary the
+/// way the daemon does: an add echoes a typed `SubscriptionAdded`, a
+/// remove a typed `SubscriptionRemoved`, refusals as errors.
+fn crud_handler() -> BoxedHandler {
+    Box::new(move |request| {
+        Box::pin(async move {
+            match request {
+                Request::Status => Response::Status {
+                    snapshot: StatusSnapshot {
+                        pid: 4242,
+                        started_at: 0,
+                        subscriptions: BTreeMap::new(),
+                    },
+                },
+                Request::SubscribeAdd { label, .. } => Response::SubscriptionAdded {
+                    id: "tok-new".to_owned(),
+                    label,
+                    server: "http://127.0.0.1:8080".to_owned(),
+                    token_hint: "abcdef123456...".to_owned(),
+                    device_key: "AbCdEf1234567890GhIjKl".to_owned(),
+                },
+                Request::SubscribeRemove { id } => {
+                    if id == "tok-new" {
+                        Response::SubscriptionRemoved {
+                            id,
+                            label: "hot-add".to_owned(),
+                        }
+                    } else {
+                        Response::Error {
+                            message: format!("no Subscription with id `{id}`"),
+                        }
+                    }
+                }
+                other => Response::Error {
+                    message: format!("unexpected {other:?}"),
+                },
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    })
+}
+
+#[tokio::test]
+async fn the_window_s_crud_actions_ride_the_loop_and_get_their_outcomes() {
+    // Ticket #14: the form's submits travel the connection loop — the
+    // loop owns the client — and come back as an outcome plus a fresh
+    // snapshot, so the rows repaint with the change without a reopen.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Endpoint::in_config_dir(dir.path());
+    let (hub, _keep) = tokio::sync::broadcast::channel::<Event>(16);
+    let server = IpcServer::bind(&endpoint).expect("bind");
+    let (serve_stop, serve_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(serve(
+        server,
+        async move {
+            let _ = serve_stop_rx.await;
+        },
+        hub,
+        crud_handler(),
+    ));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (commands_tx, commands_rx) = mpsc::channel();
+    let loop_stop = stop.clone();
+    let loop_endpoint = endpoint.clone();
+    let _loop_task = tokio::spawn(async move {
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            loop_stop,
+            Duration::from_millis(50),
+            commands_rx,
+        )
+        .await
+    });
+
+    wait_for(&rx, "the opening snapshot", |msg| {
+        matches!(msg, UiMsg::Snapshot(_))
+    })
+    .await;
+
+    // The add: the outcome is the success half — the refusal would
+    // carry the daemon's words.
+    commands_tx
+        .send(CrudCommand::Add {
+            server: "http://127.0.0.1:8080".to_owned(),
+            source: AddSource::Own,
+            label: "hot-add".to_owned(),
+            basic_auth: None,
+        })
+        .expect("send the add");
+    let outcome = wait_for(&rx, "the add's outcome", |msg| {
+        matches!(msg, UiMsg::ActionResult(_))
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        UiMsg::ActionResult(Ok(())),
+        "the add succeeded on the fake daemon"
+    );
+    // The fresh snapshot follows the outcome.
+    wait_for(&rx, "the post-add snapshot", |msg| {
+        matches!(msg, UiMsg::Snapshot(_))
+    })
+    .await;
+
+    // The remove of an unknown id: the daemon's refusal surfaces
+    // verbatim for the form to show.
+    commands_tx
+        .send(CrudCommand::Remove {
+            id: "no-such-id".to_owned(),
+        })
+        .expect("send the remove");
+    let outcome = wait_for(&rx, "the refusal's outcome", |msg| {
+        matches!(msg, UiMsg::ActionResult(_))
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        UiMsg::ActionResult(Err(
+            "the daemon refused the request: no Subscription with id `no-such-id`".to_owned()
+        )),
+        "the daemon's reason rides verbatim"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = serve_stop.send(());
 }

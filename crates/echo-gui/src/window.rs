@@ -193,7 +193,10 @@ impl WindowModel {
 /// Called by the shell's `ui` for the visible window; while the window
 /// is hidden eframe runs no paint pass at all (App::logic only), so
 /// nothing here costs anything until the user opens it.
-pub fn render(ui: &mut egui::Ui, model: &WindowModel) {
+/// Returns the ids of the Subscriptions whose Remove button was
+/// clicked this frame — the shell hands them to the CRUD model, whose
+/// confirmation asks before anything is sent (ticket #14).
+pub fn render(ui: &mut egui::Ui, model: &WindowModel) -> Vec<String> {
     // The daemon banner: the link's truth first, colored when it is not
     // the quiet "connected" — the absence is a state, never a blank.
     let mut header = egui::RichText::new(model.status_line()).strong();
@@ -205,13 +208,14 @@ pub fn render(ui: &mut egui::Ui, model: &WindowModel) {
     ui.label(header);
     ui.separator();
 
+    let mut remove_clicked = Vec::new();
     egui::ScrollArea::vertical().show(ui, |ui| {
         let rows = model.rows();
         if rows.is_empty() {
             // Worth saying only when the daemon had its say; while the
             // link is down the banner above already names the absence.
             if model.link() == LinkState::Connected {
-                ui.label("No Subscriptions yet — add one with `subscribe add`.");
+                ui.label("No Subscriptions yet — add one below.");
             }
             return;
         }
@@ -221,9 +225,13 @@ pub fn render(ui: &mut egui::Ui, model: &WindowModel) {
             ui.label(format!("Server: {}", row.server));
             ui.label(format!("Token hint: {}", row.token_hint));
             ui.label(format!("Realtime Stream: {}", row.state));
+            if ui.button("Remove").clicked() {
+                remove_clicked.push(row.id.clone());
+            }
             ui.separator();
         }
     });
+    remove_clicked
 }
 
 #[cfg(test)]
