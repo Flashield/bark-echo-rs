@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use echo_ipc::Endpoint;
 
-use crate::connection::{UiMsg, spawn_connection_loop};
+use crate::composer::ComposerModel;
+use crate::connection::{GuiRequest, UiMsg, spawn_connection_loop};
 use crate::fonts;
 use crate::model::TrayModel;
 use crate::tray::TrayMenu;
@@ -53,19 +54,24 @@ pub enum GuiError {
 /// [`spawn_connection_loop`]) and arrives here over the mpsc receiver.
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
+    // The GUI's own asks (the Composer's send, ticket #16) travel the
+    // other way: the shell hands them here, the connection loop
+    // performs them on the one client.
+    let (requests, request_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_connection_loop(endpoint, sender, stop.clone());
+    spawn_connection_loop(endpoint, sender, request_receiver, stop.clone());
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
         // always-available face) and becomes the Management Window when
         // the tray item asks; `run_native`'s app id stays "bark-echo"
         // (the persistence key), while the runtime title is set on every
-        // show. The size is the Management Window's opening shape — the
-        // hidden shell never paints at it.
+        // show. The size is the Management Window's opening shape —
+        // the Push Composer's form above the Subscription list (ticket
+        // #16); the hidden shell never paints at it.
         viewport: egui::ViewportBuilder::default()
             .with_title("bark-echo")
-            .with_inner_size([560.0, 420.0])
+            .with_inner_size([640.0, 700.0])
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
         event_loop_builder: Some(Box::new(|builder| {
@@ -94,7 +100,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, stop)))
+            Ok(Box::new(TrayApp::new(receiver, requests, stop)))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))
@@ -103,6 +109,9 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
 /// The shell: the models' owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
+    /// The asks' door to the connection loop — the Composer's send
+    /// goes through it (ticket #16); no other component holds a client.
+    requests: std::sync::mpsc::Sender<GuiRequest>,
     stop: Arc<AtomicBool>,
     model: TrayModel,
     /// The Management Window's picture, fed the same connection stream
@@ -113,6 +122,10 @@ struct TrayApp {
     /// on-open request is needed (and none exists to send — the
     /// connection loop owns the client).
     window: WindowModel,
+    /// The Push Composer's form (ticket #16), fed the same stream:
+    /// the picker's lines from the snapshot, its send's verdicts from
+    /// the loop's answers. Its fields persist while the window hides.
+    composer: ComposerModel,
     /// Set by the tray's Quit so the close interception below knows
     /// this close means exit, not hide.
     quitting: bool,
@@ -125,12 +138,18 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(receiver: Receiver<UiMsg>, stop: Arc<AtomicBool>) -> Self {
+    fn new(
+        receiver: Receiver<UiMsg>,
+        requests: std::sync::mpsc::Sender<GuiRequest>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             receiver,
+            requests,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
+            composer: ComposerModel::new(),
             quitting: false,
             tray: None,
         }
@@ -166,25 +185,33 @@ impl eframe::App for TrayApp {
             }
         }
 
-        // The channel's news, all of it, into both models — the tray's
-        // glance and the window's list eat the same snapshot-then-
-        // events stream (the window's stays current while hidden).
+        // The channel's news, all of it, into the models — the tray's
+        // glance, the window's list, and the Composer's picker eat the
+        // same snapshot-then-events stream (they all stay current
+        // while hidden); the Composer's send answers arrive here too.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
                     self.window.apply_snapshot(&snapshot);
+                    self.composer.apply_snapshot(&snapshot);
                     dirty = true;
                 }
                 UiMsg::Event(event) => {
                     self.model.apply_event(&event);
                     self.window.apply_event(&event);
+                    self.composer.apply_event(&event);
+                    dirty = true;
+                }
+                UiMsg::SendFinished(result) => {
+                    self.composer.apply_send_result(&result);
                     dirty = true;
                 }
                 UiMsg::LinkDown => {
                     self.model.connection_lost();
                     self.window.connection_lost();
+                    self.composer.connection_lost();
                     dirty = true;
                 }
             }
@@ -241,8 +268,17 @@ impl eframe::App for TrayApp {
 
     // The Management Window's paint pass, reached only while the
     // viewport is visible (eframe runs no paint at all while hidden).
-    // Thin by contract: the model owns every word; this lays them out.
+    // Thin by contract: the models own every word; this lays them out —
+    // the Push Composer's form on top (ticket #16), the Subscription
+    // list filling the rest.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(send) = crate::composer::render(ui, &mut self.composer) {
+            // The send rides the connection loop's client; the shell
+            // only forwards it (the model's busy state keeps the clicks
+            // one at a time).
+            let _ = self.requests.send(GuiRequest::SendPush(send));
+        }
+        ui.separator();
         render(ui, &self.window);
     }
 }

@@ -9,6 +9,7 @@
 //! subcommand calls it.
 
 pub mod app;
+pub mod composer;
 pub mod connection;
 pub mod fonts;
 pub mod model;
@@ -16,6 +17,7 @@ pub mod tray;
 pub mod window;
 
 pub use app::run;
+pub use composer::{ComposerModel, ComposerSubscription, SendState};
 pub use connection::UiMsg;
 pub use model::{LinkState, MenuItem, SubscriptionLine, TrayModel};
 pub use window::{RowView, WindowModel};
