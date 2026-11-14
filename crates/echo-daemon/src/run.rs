@@ -142,6 +142,9 @@ pub async fn run(
     // Arcs the handler clones per request.
     let channel_config = Arc::new(spec.config.clone());
     let channel_store = spec.store.clone();
+    // The History Log snapshot (ticket #15) reads the daemon's own
+    // log files, so the handler carries the paths too.
+    let channel_paths = spec.paths.clone();
     // The handler's own clone: the original stays with this function —
     // the select below waits on the same Notify.
     let handler_notify = shutdown_requested.clone();
@@ -153,6 +156,7 @@ pub async fn run(
         event_hub.clone(),
         move |request| {
             let state = channel_state.clone();
+            let paths = channel_paths.clone();
             let config = channel_config.clone();
             let store = channel_store.clone();
             let shutdown_requested = handler_notify.clone();
@@ -185,6 +189,10 @@ pub async fn run(
                         shutdown_requested.notify_one();
                         echo_ipc::Response::ShuttingDown
                     }
+                    echo_ipc::Request::HistorySnapshot {
+                        subscription_id,
+                        tail,
+                    } => history_snapshot_response(&paths, &config, &subscription_id, tail),
                     // Only post-handshake requests arrive here; an
                     // unknown request is answered, never fatal.
                     other => echo_ipc::Response::Error {
@@ -332,6 +340,43 @@ pub async fn run(
         let _ = supervisor.await;
     }
     Ok(())
+}
+
+/// Answer a [`echo_ipc::Request::HistorySnapshot`] (ticket #15): the
+/// daemon reads its own daemon-private History Log for the Subscription
+/// (ADR-0004 — the GUI never touches a file) and answers with the
+/// content semantics of the CLI's `log --tail N`: all complete entries,
+/// oldest last, the last `tail` of them. A Subscription the daemon does
+/// not hold is refused, not answered with a silently empty log — so no
+/// path outside its own Subscription logs is ever served, whatever a
+/// client puts in the id.
+fn history_snapshot_response(
+    paths: &Paths,
+    config: &Config,
+    subscription_id: &str,
+    tail: u32,
+) -> echo_ipc::Response {
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|held| held.id == subscription_id)
+    else {
+        return echo_ipc::Response::Error {
+            message: format!("no Subscription with id `{subscription_id}`"),
+        };
+    };
+    let log = HistoryLog::new(paths.history_log(&subscription.id));
+    match log.entries() {
+        Ok(entries) => {
+            let start = entries.len().saturating_sub(tail as usize);
+            echo_ipc::Response::HistorySnapshot {
+                entries: entries[start..].to_vec(),
+            }
+        }
+        Err(err) => echo_ipc::Response::Error {
+            message: format!("cannot read the History Log: {err}"),
+        },
+    }
 }
 
 /// One Subscription's runtime: forward the stream's intents into the

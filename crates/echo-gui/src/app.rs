@@ -2,10 +2,11 @@
 //! one window that lives hidden while the Tray Menu is the whole
 //! surface, and shows the Management Window (#13) when the tray item
 //! asks. The shell is thin by contract: it drains the connection loop's
-//! messages into the two models (tray and window — siblings, each its
-//! own state machine), hands tray changes to the tray, dispatches menu
-//! clicks, and draws the window. Every nontrivial decision lives in a
-//! model, every transport rule in the connection loop.
+//! messages into the models (tray and window and the History Log
+//! viewer — siblings, each its own state machine), hands tray changes
+//! to the tray, dispatches menu clicks, and draws the window. Every
+//! nontrivial decision lives in a model, every transport rule in the
+//! connection loop.
 //!
 //! The window's close button hides it, it never ends the app (the tray
 //! persists; reopening works repeatedly) — eframe 0.37's close contract,
@@ -31,8 +32,9 @@ use std::time::Duration;
 use echo_ipc::Endpoint;
 
 use crate::composer::ComposerModel;
-use crate::connection::{GuiRequest, UiMsg, spawn_connection_loop};
+use crate::connection::{ClientAsk, UiMsg, spawn_connection_loop};
 use crate::fonts;
+use crate::history_view::HistoryView;
 use crate::model::TrayModel;
 use crate::shutdown::{QUIT_BUDGET, QuitOutcome, spawn_quit};
 use crate::tray::TrayMenu;
@@ -60,20 +62,16 @@ pub enum GuiError {
 /// [`spawn_connection_loop`]) and arrives here over the mpsc receiver.
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    // The GUI's own asks (the Composer's send, ticket #16) travel the
-    // other way: the shell hands them here, the connection loop
-    // performs them on the one client.
-    let (requests, request_receiver) = std::sync::mpsc::channel();
+    // The surfaces' asks ride the reverse direction: a History Log pick
+    // (ticket #15) or the Composer's send (ticket #16) becomes one ask
+    // the connection loop serves over its own client — no surface ever
+    // touches the channel itself.
+    let (asks, ask_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     // The endpoint and sender ride on: the Quit exchange (ticket #12)
     // opens its own one-shot connection and paints through the same
     // queue the connection loop uses.
-    spawn_connection_loop(
-        endpoint.clone(),
-        sender.clone(),
-        request_receiver,
-        stop.clone(),
-    );
+    spawn_connection_loop(endpoint.clone(), sender.clone(), ask_receiver, stop.clone());
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
@@ -115,7 +113,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
             Ok(Box::new(TrayApp::new(
-                receiver, requests, sender, endpoint, stop,
+                receiver, asks, sender, endpoint, stop,
             )))
         }),
     )
@@ -125,9 +123,10 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
 /// The shell: the models' owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
-    /// The asks' door to the connection loop — the Composer's send
-    /// goes through it (ticket #16); no other component holds a client.
-    requests: Sender<GuiRequest>,
+    /// The surfaces' door to the connection loop — the Composer's send
+    /// (ticket #16) and the History Log view's pick (ticket #15) go
+    /// through it; no surface ever holds a client.
+    asks: Sender<ClientAsk>,
     /// The queue Quit's exchange answers into — the same one the
     /// connection loop paints from.
     sender: Sender<UiMsg>,
@@ -149,6 +148,9 @@ struct TrayApp {
     /// the picker's lines from the snapshot, its send's verdicts from
     /// the loop's answers. Its fields persist while the window hides.
     composer: ComposerModel,
+    /// The picked Subscription's History Log viewer (ticket #15): fed
+    /// the same stream, its one request going out over `asks`.
+    history: HistoryView,
     /// Set by the first Quit click (ticket #12): the exchange runs, the
     /// reconnect loop is told to stand down, further clicks and channel
     /// news are drained without effect. Not the close-means-exit flag —
@@ -169,20 +171,21 @@ struct TrayApp {
 impl TrayApp {
     fn new(
         receiver: Receiver<UiMsg>,
-        requests: Sender<GuiRequest>,
+        asks: Sender<ClientAsk>,
         sender: Sender<UiMsg>,
         endpoint: Endpoint,
         stop: Arc<AtomicBool>,
     ) -> Self {
         Self {
             receiver,
-            requests,
+            asks,
             sender,
             endpoint,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
             composer: ComposerModel::new(),
+            history: HistoryView::default(),
             quit_in_progress: false,
             quitting: false,
             tray: None,
@@ -220,12 +223,14 @@ impl eframe::App for TrayApp {
         }
 
         // The channel's news, all of it, into the models — the tray's
-        // glance, the window's list, and the Composer's picker eat the
-        // same snapshot-then-events stream (they all stay current while
-        // hidden); the Composer's send answers arrive here too — or
-        // everything is drained without effect once Quit is underway:
-        // the connection loop is winding down behind the stop flag, and
-        // nothing it says can matter to a shell on its way out.
+        // glance, the window's list, the Composer's picker, and the
+        // History Log viewer eat the same snapshot-then-events stream
+        // (each stays current while hidden); the viewer re-asks on every
+        // fresh authority, and the Composer's send verdicts arrive here
+        // as messages too. Or everything is drained without effect once
+        // Quit is underway: the connection loop is winding down behind
+        // the stop flag, and nothing it says can matter to a shell on
+        // its way out.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
@@ -256,12 +261,18 @@ impl eframe::App for TrayApp {
                     self.model.apply_snapshot(&snapshot);
                     self.window.apply_snapshot(&snapshot);
                     self.composer.apply_snapshot(&snapshot);
+                    if let Some(id) = self.history.daemon_back() {
+                        let _ = self.asks.send(ClientAsk::HistorySnapshot {
+                            subscription_id: id,
+                        });
+                    }
                     dirty = true;
                 }
                 UiMsg::Event(event) => {
                     self.model.apply_event(&event);
                     self.window.apply_event(&event);
                     self.composer.apply_event(&event);
+                    self.history.apply_append(&event);
                     dirty = true;
                 }
                 UiMsg::SendFinished(result) => {
@@ -272,6 +283,21 @@ impl eframe::App for TrayApp {
                     self.model.connection_lost();
                     self.window.connection_lost();
                     self.composer.connection_lost();
+                    self.history.connection_lost();
+                    dirty = true;
+                }
+                UiMsg::HistoryLoaded {
+                    subscription_id,
+                    entries,
+                } => {
+                    self.history.snapshot_loaded(&subscription_id, &entries);
+                    dirty = true;
+                }
+                UiMsg::HistoryUnavailable {
+                    subscription_id,
+                    reason,
+                } => {
+                    self.history.snapshot_failed(&subscription_id, &reason);
                     dirty = true;
                 }
             }
@@ -362,15 +388,15 @@ impl eframe::App for TrayApp {
     // viewport is visible (eframe runs no paint at all while hidden).
     // Thin by contract: the models own every word; this lays them out —
     // the Push Composer's form on top (ticket #16), the Subscription
-    // list filling the rest.
+    // list with its History Log viewer filling the rest.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if let Some(send) = crate::composer::render(ui, &mut self.composer) {
             // The send rides the connection loop's client; the shell
             // only forwards it (the model's busy state keeps the clicks
             // one at a time).
-            let _ = self.requests.send(GuiRequest::SendPush(send));
+            let _ = self.asks.send(ClientAsk::SendPush(send));
         }
         ui.separator();
-        render(ui, &self.window);
+        render(ui, &self.window, &mut self.history, &self.asks);
     }
 }

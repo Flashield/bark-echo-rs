@@ -1,11 +1,12 @@
 //! The GUI's connection to the daemon (ADR-0004): one echo-ipc client
 //! driven for the GUI's lifetime — connect, take the opening snapshot,
 //! then listen to the daemon's pushed events until the channel breaks;
-//! then retry. Every change the tray must paint leaves as a
-//! [`UiMsg`]; the GUI's own asks — the Composer's send (ticket #16) —
-//! come in as [`GuiRequest`]s and are performed on this connection,
-//! since no other component ever holds a client. Nothing here knows
-//! about menus or windows.
+//! then retry. Every change a surface must paint leaves as a
+//! [`UiMsg`]; the surfaces' own asks — the History Log view's pick
+//! (ticket #15), the Composer's send (ticket #16) — come in as
+//! [`ClientAsk`]s and are served on this connection, since no other
+//! component ever holds a client. Nothing here knows about menus or
+//! windows.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,16 +15,44 @@ use std::time::Duration;
 
 use echo_ipc::{Client, Endpoint};
 
+use crate::history_view::HISTORY_TAIL;
+
 /// How long between reconnect attempts in production: fast enough that a
 /// restarted daemon is covered again within seconds, slow enough to stay
 /// invisible next to the tray's "reconnecting…" line.
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// How often the listener re-checks the stop flag while the channel is
-/// quiet — the granularity at which a Quit can end the loop.
+/// quiet — the granularity at which a Quit can end the loop, a pick
+/// gets its answer, and a send goes out.
 const STOP_POLL: Duration = Duration::from_millis(200);
 
-/// A change the tray must paint.
+/// An ask the UI wants made over the connection's own client (the
+/// loop owns the client; the surfaces never touch the channel —
+/// ADR-0004). Served between events on the same connection. The two
+/// outage semantics differ by kind, and both are named:
+/// [`ClientAsk::HistorySnapshot`] is a read — it waits out an outage
+/// and is served the moment the daemon returns; [`ClientAsk::SendPush`]
+/// is a side effect — it is failed at the link-down beat, because "did
+/// not go out" must be the truth the moment it is known, never a Push
+/// that leaves after the user was told it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAsk {
+    /// The picked Subscription's recent History Log lines (ticket #15):
+    /// a bounded tail — [`HISTORY_TAIL`] — answered over the channel.
+    HistorySnapshot {
+        /// The Subscription whose tail to load (its Stream Token's
+        /// `token_id`).
+        subscription_id: String,
+    },
+    // ---- The Push Composer's send (ticket #16) ----
+    /// Send one Push on the Composer's behalf. Answered as exactly one
+    /// [`UiMsg::SendFinished`].
+    SendPush(echo_ipc::message::SendPush),
+}
+
+/// A change a surface must paint (the tray's glance, the window's list
+/// and History Log viewer, the Composer's form).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiMsg {
     /// The opening snapshot of a (re)connected channel — fresh
@@ -32,10 +61,10 @@ pub enum UiMsg {
     /// A daemon-pushed event (ticket #11): a stream state flip or a
     /// History Log append.
     Event(echo_ipc::message::Event),
-    /// A [`GuiRequest::SendPush`] was answered (ticket #16): the bark
+    /// A [`ClientAsk::SendPush`] was answered (ticket #16): the bark
     /// server's verdict, or — `Err` — why the send never went out (the
-    /// daemon away, the channel broken). Every queued send is answered
-    /// exactly once; the Composer's state machine never hangs.
+    /// daemon away, the channel broken). Every send is answered exactly
+    /// once; the Composer's state machine never hangs.
     SendFinished(Result<echo_ipc::message::SendPushOutcome, String>),
     /// The channel broke — the tray names the absence instead of
     /// leaving a stale picture.
@@ -44,33 +73,51 @@ pub enum UiMsg {
     /// when Quit asked it to stop. The shell exits either way; this
     /// names how honest the exit is.
     ShutdownOutcome(crate::shutdown::QuitOutcome),
-}
-
-/// An ask the GUI's surfaces hand to the connection loop: work that
-/// needs the one client, performed on the connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GuiRequest {
-    /// Send one Push on the Composer's behalf (ticket #16). Answered as
-    /// exactly one [`UiMsg::SendFinished`].
-    SendPush(echo_ipc::message::SendPush),
+    /// A [`ClientAsk::HistorySnapshot`] answered: the picked
+    /// Subscription's bounded tail, oldest last (ticket #15).
+    HistoryLoaded {
+        /// The Subscription the answer belongs to.
+        subscription_id: String,
+        /// The entries, oldest last.
+        entries: Vec<echo_ipc::message::NotificationIntent>,
+    },
+    /// The History Log snapshot request failed — named, not blank
+    /// (ticket #15): the daemon refused it or the channel broke.
+    HistoryUnavailable {
+        /// The Subscription the failed ask belonged to.
+        subscription_id: String,
+        /// What went wrong, as the channel phrased it.
+        reason: String,
+    },
 }
 
 /// Drive the connection loop until `stop` flips: connect (retry every
 /// `reconnect_delay`), take the opening snapshot, listen for events,
-/// and perform the queued [`GuiRequest`]s on the live connection. Every
-/// outcome becomes a [`UiMsg`]; the loop never panics on a dead daemon
-/// — an unreachable daemon is a state, not a crash.
+/// and serve the surfaces' asks on the same connection. Every outcome
+/// becomes a [`UiMsg`]; the loop never panics on a dead daemon — an
+/// unreachable daemon is a state, not a crash.
 pub async fn run_connection_loop(
     endpoint: Endpoint,
     sender: Sender<UiMsg>,
-    requests: Receiver<GuiRequest>,
+    asks: Receiver<ClientAsk>,
     stop: Arc<AtomicBool>,
     reconnect_delay: Duration,
 ) {
+    // A History Log pick that queued during an outage is kept here and
+    // served the moment the daemon returns (dropping it would strand
+    // the picked view forever); a Composer send never waits out an
+    // outage — the link-down beat fails it instead. Each [`ClientAsk`]
+    // kind states which fate is its own.
+    let mut deferred: Vec<ClientAsk> = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
+        // Anything queued while we were between connects meets its fate
+        // now: a send failed, a pick kept for the daemon's return. The
+        // beat matters — the user may already have been told the link
+        // went down, and a Push leaving afterwards would be a ghost.
+        partition_queue(&asks, &sender, &mut deferred);
         if let Ok(mut client) = Client::connect(&endpoint).await {
             // Connected but the snapshot refused: the daemon is not
             // itself yet — fall through to the retry.
@@ -78,8 +125,20 @@ pub async fn run_connection_loop(
                 let _ = sender.send(UiMsg::Snapshot(snapshot));
                 // The channel is up: listen until it breaks. The stop
                 // check rides a short timeout so Quit works while the
-                // daemon is quiet.
+                // daemon is quiet, and the surfaces' asks are drained
+                // on the same beat — a pick is answered and a send goes
+                // out within one poll.
                 loop {
+                    // The outage-deferred picks first, then everything
+                    // newly queued. Events that arrive while an ask is
+                    // being served queue in the client's demux and
+                    // surface on the next listen.
+                    for ask in std::mem::take(&mut deferred) {
+                        serve_ask(&mut client, &sender, ask).await;
+                    }
+                    while let Ok(ask) = asks.try_recv() {
+                        serve_ask(&mut client, &sender, ask).await;
+                    }
                     match tokio::time::timeout(STOP_POLL, client.next_event()).await {
                         Ok(Ok(event)) => {
                             let _ = sender.send(UiMsg::Event(event));
@@ -87,34 +146,17 @@ pub async fn run_connection_loop(
                         Ok(Err(_)) => break,
                         Err(_timeout) => {}
                     }
-                    // The Composer's sends ride this same connection
-                    // (ticket #16): every queued request is performed
-                    // here and answered exactly once. Events that arrive
-                    // while a send waits are queued by the client's
-                    // demux and surface on the next listen.
-                    while let Ok(request) = requests.try_recv() {
-                        let GuiRequest::SendPush(push) = request;
-                        let outcome = client.send_push(push).await.map_err(|err| err.to_string());
-                        let _ = sender.send(UiMsg::SendFinished(outcome));
-                    }
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
                 }
             }
         }
-        // The link is down: a queued send cannot go out — answer it
-        // here, so a send never vanishes into the outage (the tray's
-        // "never stale silence" rule, applied to the form). The
-        // irrefutable pattern is deliberate: adding a variant to
-        // [`GuiRequest`] breaks this compile and forces the new ask a
-        // downed-link answer too.
-        while let Ok(request) = requests.try_recv() {
-            let GuiRequest::SendPush(_) = request;
-            let _ = sender.send(UiMsg::SendFinished(Err(
-                "the daemon is away — the Push did not go out".to_owned(),
-            )));
-        }
+        // The link is down: the same fate for anything newly queued —
+        // a send answered with why it did not go out (the tray's
+        // "never stale silence" rule, applied to the form), a pick kept
+        // for the daemon's return.
+        partition_queue(&asks, &sender, &mut deferred);
         let _ = sender.send(UiMsg::LinkDown);
         if stop.load(Ordering::Relaxed) {
             return;
@@ -123,15 +165,68 @@ pub async fn run_connection_loop(
     }
 }
 
+/// Drain the ask queue, giving each ask the fate its kind stated: a
+/// Composer send is answered with why it cannot go out while the link
+/// is down; a History Log pick is kept in `deferred` for the daemon's
+/// return. Every ask kind must be named here — a new [`ClientAsk`]
+/// variant breaks this match and forces the downed-link question.
+fn partition_queue(
+    asks: &Receiver<ClientAsk>,
+    sender: &Sender<UiMsg>,
+    deferred: &mut Vec<ClientAsk>,
+) {
+    while let Ok(ask) = asks.try_recv() {
+        match ask {
+            ClientAsk::SendPush(_) => {
+                let _ = sender.send(UiMsg::SendFinished(Err(
+                    "the daemon is away — the Push did not go out".to_owned(),
+                )));
+            }
+            ask @ ClientAsk::HistorySnapshot { .. } => deferred.push(ask),
+        }
+    }
+}
+
+/// Serve one ask on the live connection, answering exactly once.
+async fn serve_ask(client: &mut Client, sender: &Sender<UiMsg>, ask: ClientAsk) {
+    match ask {
+        ClientAsk::HistorySnapshot { subscription_id } => {
+            match client
+                .history_snapshot(&subscription_id, HISTORY_TAIL)
+                .await
+            {
+                Ok(entries) => {
+                    let _ = sender.send(UiMsg::HistoryLoaded {
+                        subscription_id,
+                        entries,
+                    });
+                }
+                Err(err) => {
+                    let _ = sender.send(UiMsg::HistoryUnavailable {
+                        subscription_id,
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+        // The Composer's send (ticket #16): performed here, on the one
+        // client, and answered exactly once.
+        ClientAsk::SendPush(push) => {
+            let outcome = client.send_push(push).await.map_err(|err| err.to_string());
+            let _ = sender.send(UiMsg::SendFinished(outcome));
+        }
+    }
+}
+
 /// Run the loop on its own thread with its own tiny runtime: the GUI's
 /// event loop owns the main thread (macOS requires the tray there —
 /// ADR-0003), so the channel work lives elsewhere and reaches it over
-/// the mpsc sender, while the GUI's asks go the other way through
-/// `requests`.
+/// the mpsc sender, while the surfaces' asks go the other way through
+/// `asks`.
 pub fn spawn_connection_loop(
     endpoint: Endpoint,
     sender: Sender<UiMsg>,
-    requests: Receiver<GuiRequest>,
+    asks: Receiver<ClientAsk>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -142,7 +237,7 @@ pub fn spawn_connection_loop(
         runtime.block_on(run_connection_loop(
             endpoint,
             sender,
-            requests,
+            asks,
             stop,
             RECONNECT_DELAY,
         ));

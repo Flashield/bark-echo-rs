@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use echo_gui::connection::{GuiRequest, UiMsg, run_connection_loop};
+use echo_gui::connection::{ClientAsk, UiMsg, run_connection_loop};
 use echo_ipc::message::{Event, Request, Response, SendPush, StatusSnapshot, StreamState};
 use echo_ipc::{Endpoint, IpcServer, serve};
 
@@ -93,7 +93,7 @@ async fn the_loop_snapshots_hears_events_and_self_heals_after_a_daemon_restart()
     let endpoint = Endpoint::in_config_dir(dir.path());
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let (_requests_tx, requests_rx) = mpsc::channel();
+    let (_asks_tx, asks_rx) = mpsc::channel();
     let loop_stop = stop.clone();
     let loop_endpoint = endpoint.clone();
     let loop_task = tokio::spawn(async move {
@@ -102,7 +102,7 @@ async fn the_loop_snapshots_hears_events_and_self_heals_after_a_daemon_restart()
         run_connection_loop(
             loop_endpoint,
             tx,
-            requests_rx,
+            asks_rx,
             loop_stop,
             Duration::from_millis(50),
         )
@@ -163,6 +163,155 @@ async fn the_loop_snapshots_hears_events_and_self_heals_after_a_daemon_restart()
     loop_task.abort();
 }
 
+// ---- The History Log view's ask rides the loop (ticket #15) ----
+
+/// The status snapshot plus the History Log tail the canned daemon
+/// answers with: two entries, oldest last — what the viewer opens with
+/// (ticket #15).
+fn history_handler() -> BoxedHandler {
+    Box::new(|request| {
+        Box::pin(async move {
+            match request {
+                Request::Status => Response::Status {
+                    snapshot: snapshot_with(StreamState::Running),
+                },
+                Request::HistorySnapshot { .. } => Response::HistorySnapshot {
+                    entries: vec![
+                        echo_ipc::NotificationIntent {
+                            id: 40,
+                            title: "first".to_owned(),
+                            subtitle: String::new(),
+                            body: "push".to_owned(),
+                            click_action: None,
+                            created_at: 1_700_000_000,
+                        },
+                        echo_ipc::NotificationIntent {
+                            id: 41,
+                            title: "second".to_owned(),
+                            subtitle: String::new(),
+                            body: "push".to_owned(),
+                            click_action: None,
+                            created_at: 1_700_000_060,
+                        },
+                    ],
+                },
+                other => Response::Error {
+                    message: format!("this test daemon answers status and history, got {other:?}"),
+                },
+            }
+        })
+    })
+}
+
+#[tokio::test]
+async fn the_loop_serves_the_window_s_history_ask_and_the_answer_comes_back() {
+    // Ticket #15's initial content: the window's pick becomes one ask
+    // the loop serves over its client, and the bounded tail comes back
+    // as a message — the viewer never talks to the channel itself and
+    // never reads a file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Endpoint::in_config_dir(dir.path());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
+    let loop_stop = stop.clone();
+    let loop_endpoint = endpoint.clone();
+    let loop_task = tokio::spawn(async move {
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            ask_rx,
+            loop_stop,
+            Duration::from_millis(50),
+        )
+        .await
+    });
+
+    let (_hub, serve_stop) = serve_on(&endpoint, history_handler()).await;
+    wait_for(&rx, "the opening snapshot", |msg| {
+        matches!(msg, UiMsg::Snapshot(_))
+    })
+    .await;
+
+    ask_tx
+        .send(ClientAsk::HistorySnapshot {
+            subscription_id: "tok".to_owned(),
+        })
+        .expect("send the ask");
+    let msg = wait_for(&rx, "the history answer", |msg| {
+        matches!(msg, UiMsg::HistoryLoaded { .. })
+    })
+    .await;
+    let UiMsg::HistoryLoaded {
+        subscription_id,
+        entries,
+    } = msg
+    else {
+        panic!("unreachable")
+    };
+    assert_eq!(subscription_id, "tok");
+    assert_eq!(entries.len(), 2, "the answer as the daemon bounded it");
+    assert_eq!(entries[0].id, 40, "oldest last");
+    assert_eq!(entries[1].id, 41);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = serve_stop;
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn an_ask_made_while_the_daemon_is_away_is_served_when_it_returns() {
+    // The pick happened before the daemon existed: the ask waits in the
+    // channel instead of being dropped — dropping it would strand the
+    // picked view in Loading forever — and is served the moment the
+    // daemon returns.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Endpoint::in_config_dir(dir.path());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
+    let loop_stop = stop.clone();
+    let loop_endpoint = endpoint.clone();
+    let loop_task = tokio::spawn(async move {
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            ask_rx,
+            loop_stop,
+            Duration::from_millis(50),
+        )
+        .await
+    });
+
+    // No daemon yet: the loop is between connects, LinkDown and all.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ask_tx
+        .send(ClientAsk::HistorySnapshot {
+            subscription_id: "tok".to_owned(),
+        })
+        .expect("send the ask while away");
+
+    let _serve = serve_on(&endpoint, history_handler()).await;
+    wait_for(&rx, "the opening snapshot", |msg| {
+        matches!(msg, UiMsg::Snapshot(_))
+    })
+    .await;
+    let msg = wait_for(&rx, "the queued ask's answer", |msg| {
+        matches!(msg, UiMsg::HistoryLoaded { .. })
+    })
+    .await;
+    let UiMsg::HistoryLoaded {
+        subscription_id, ..
+    } = msg
+    else {
+        panic!("unreachable")
+    };
+    assert_eq!(subscription_id, "tok");
+
+    stop.store(true, Ordering::Relaxed);
+    loop_task.abort();
+}
+
 // ---- The Push Composer's send rides the loop (ticket #16) ----
 
 fn a_send() -> SendPush {
@@ -203,28 +352,28 @@ async fn a_composer_send_rides_the_loop_and_the_verdict_comes_back() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let (requests_tx, requests_rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
     let loop_stop = stop.clone();
     let loop_endpoint = endpoint.clone();
     let loop_task = tokio::spawn(async move {
         run_connection_loop(
             loop_endpoint,
             tx,
-            requests_rx,
+            ask_rx,
             loop_stop,
             Duration::from_millis(50),
         )
         .await
     });
 
-    // Connected before asking: the request queues once the loop is
+    // Connected before asking: the ask queues once the loop is
     // listening, the way the shell forwards a Send click.
     wait_for(&rx, "the opening snapshot", |msg| {
         matches!(msg, UiMsg::Snapshot(_))
     })
     .await;
-    requests_tx
-        .send(GuiRequest::SendPush(a_send()))
+    ask_tx
+        .send(ClientAsk::SendPush(a_send()))
         .expect("queue the send");
     let msg = wait_for(&rx, "the send's verdict", |msg| {
         matches!(msg, UiMsg::SendFinished(_))
@@ -250,27 +399,29 @@ async fn a_send_queued_while_the_daemon_is_away_is_failed_not_lost() {
     // No daemon anywhere: the queued send is answered with why it did
     // not go out — the Composer's state machine never hangs on
     // Sending, and the absence is named (the tray's "never stale
-    // silence" rule, applied to the form).
+    // silence" rule, applied to the form). Unlike a History Log pick —
+    // a read that may wait out an outage — a Push is a side effect: it
+    // must never leave after the user was told it failed.
     let dir = tempfile::tempdir().expect("temp dir");
     let endpoint = Endpoint::in_config_dir(dir.path());
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let (requests_tx, requests_rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
     let loop_stop = stop.clone();
     let loop_endpoint = endpoint.clone();
     let loop_task = tokio::spawn(async move {
         run_connection_loop(
             loop_endpoint,
             tx,
-            requests_rx,
+            ask_rx,
             loop_stop,
             Duration::from_millis(50),
         )
         .await
     });
 
-    requests_tx
-        .send(GuiRequest::SendPush(a_send()))
+    ask_tx
+        .send(ClientAsk::SendPush(a_send()))
         .expect("queue the send");
     let msg = wait_for(&rx, "the failed send", |msg| {
         matches!(msg, UiMsg::SendFinished(_))

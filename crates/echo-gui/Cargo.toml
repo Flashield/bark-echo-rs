@@ -33,6 +33,10 @@ tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 # echo-ipc client state machine covered by the IPC seam").
 echo-ipc = { workspace = true }
 thiserror = { workspace = true }
+# The History Log viewer's stamps (ticket #15): the same `time` crate and
+# RFC 3339 UTC format the CLI's `log` prints with (workspace features),
+# so the view reads like the command it GUI-ifies.
+time = { workspace = true }
 tokio = { workspace = true }
 
 # The macOS-only piece of the event-loop hook (the Accessory activation

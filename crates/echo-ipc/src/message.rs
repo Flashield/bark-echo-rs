@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 // daemon appends `NotificationIntent` lines to the log, and the channel
 // relays appended lines as-is — one type, so the event payload cannot
 // fork the log format (spec story 24). Re-exported here so every
-// consumer of the channel names it from the channel's crate.
-pub use echo_core::intent::NotificationIntent;
+// consumer of the channel names it from the channel's crate, with the
+// resolved `ClickAction` the lines carry (ticket #15's viewer renders
+// them).
+pub use echo_core::intent::{ClickAction, NotificationIntent};
 
 /// One client → daemon frame: the request plus the id its response must
 /// carry. The first frame on every connection is [`Request::Hello`].
@@ -61,6 +63,22 @@ pub enum Request {
     /// stop's announcement. The same path a Ctrl-C rides — one
     /// shutdown vocabulary, not two.
     Shutdown,
+
+    // ---- History Log plane (ticket #15). New planes append their
+    // variants here, at the enum's end — the wire is additive, and a
+    // section comment keeps parallel tickets' additions from colliding.
+    /// Ask for the recent tail of one Subscription's History Log
+    /// (ticket #15): the daemon reads its own files — the logs stay
+    /// daemon-private (ADR-0004) — and answers with the content
+    /// semantics of the CLI's `log --tail N`, over the channel.
+    HistorySnapshot {
+        /// The Subscription whose History Log to read (its Stream
+        /// Token's `token_id`).
+        subscription_id: String,
+        /// At most this many entries: the bounded snapshot that keeps a
+        /// large History Log from weighing on the viewer.
+        tail: u32,
+    },
 }
 
 /// One Composer send's content (ticket #16): the fields of the `push`
@@ -158,6 +176,17 @@ pub enum Response {
     PushSent {
         /// How the send ended.
         outcome: SendPushOutcome,
+    },
+
+    // ---- History Log plane (ticket #15), matching the request plane's
+    // section above.
+    /// The recent History Log lines [`Request::HistorySnapshot`] asked
+    /// for, oldest last — the log file's own line vocabulary (the same
+    /// one [`Event::HistoryAppended`] carries), so the viewer renders
+    /// snapshot lines and live appends as one thing.
+    HistorySnapshot {
+        /// The entries, oldest last.
+        entries: Vec<NotificationIntent>,
     },
 }
 
