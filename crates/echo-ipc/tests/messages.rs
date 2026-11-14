@@ -58,6 +58,24 @@ fn status_request_round_trips() {
 }
 
 #[test]
+fn shutdown_request_round_trips_with_its_type_tag() {
+    // Ticket #12: the Tray Menu's Quit rides the channel like any other
+    // request — an id-carrying frame, answered before the stop begins.
+    let frame = RequestFrame {
+        id: 9,
+        request: Request::Shutdown,
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(
+        json.contains(r#""type":"shutdown""#),
+        "the type tag names the request: {json}"
+    );
+    assert!(json.contains(r#""id":9"#), "the id rides the frame: {json}");
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
 fn snapshot_response_round_trips_with_its_request_id() {
     let frame = ResponseFrame {
         id: 3,
@@ -94,6 +112,24 @@ fn an_error_response_round_trips_with_its_request_id() {
     };
     let json = serde_json::to_string(&frame).expect("serialize");
     assert!(json.contains(r#""type":"error""#), "{json}");
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn the_shutting_down_response_round_trips_with_its_type_tag() {
+    // The daemon's acceptance of a Shutdown: the answer leaves first,
+    // then the graceful stop begins (ADR-0004's Quit contract, ticket
+    // #12) — the channel closing behind it is the stop's announcement.
+    let frame = ResponseFrame {
+        id: 9,
+        response: Response::ShuttingDown,
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(
+        json.contains(r#""type":"shutting_down""#),
+        "the type tag names the answer: {json}"
+    );
     let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, frame);
 }
