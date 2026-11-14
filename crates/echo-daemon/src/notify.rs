@@ -8,7 +8,9 @@
 //! Click actions (protocol §2.2 Ext Params, resolved at the core seam):
 //! a `url` push opens the default browser on click; a `copy` push writes
 //! the text to the clipboard. The action fires when the user activates
-//! the notification ("default" action on the XDG desktop).
+//! the notification — the "default" action on the XDG desktop, the COM
+//! `INotificationActivationCallback` on Windows (toast_activation,
+//! ticket #17).
 
 use echo_core::intent::{ClickAction, NotificationIntent};
 
@@ -31,12 +33,50 @@ pub trait NotificationRenderer: Send + Sync {
 }
 
 /// The real renderer: notify-rust glue with the click action wired to
-/// the notification's default action.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DesktopRenderer;
+/// the notification's activation. On Windows it additionally carries
+/// the toast activation registered at construction (ticket #17): a
+/// click-action toast renders through WinRT under the AUMID so the
+/// click can come back; everything else renders through notify-rust.
+#[derive(Debug, Default)]
+pub struct DesktopRenderer {
+    /// The Windows activation state — `Degraded` (no registration
+    /// attempted or failed) everywhere else, where there is nothing to
+    /// register.
+    #[cfg(windows)]
+    activation: crate::toast_activation::Activation,
+}
+
+impl DesktopRenderer {
+    /// The production renderer. On Windows this first attempts the
+    /// runtime AUMID + COM registration (ticket #17) — a failure is
+    /// logged actionably and degrades to the behavior every other
+    /// platform has; it never blocks the daemon from starting and never
+    /// costs a notification.
+    pub fn new() -> DesktopRenderer {
+        #[cfg(windows)]
+        return DesktopRenderer {
+            activation: crate::toast_activation::register(),
+        };
+        #[cfg(not(windows))]
+        return DesktopRenderer {};
+    }
+}
 
 impl NotificationRenderer for DesktopRenderer {
     fn render(&self, intent: &NotificationIntent) -> Result<(), RenderError> {
+        // Windows: when the AUMID registered cleanly, a click-action
+        // toast renders through the activation path — notify-rust's
+        // Windows backend cannot express the launch argument the COM
+        // callback decodes (ticket #17). Every other toast, and every
+        // toast on a machine where registration failed, keeps
+        // notify-rust and the long-standing behavior.
+        #[cfg(windows)]
+        if intent.click_action.is_some() {
+            if let crate::toast_activation::Activation::Ready(ready) = &self.activation {
+                return crate::toast_activation::show_click_toast(ready, intent)
+                    .map_err(RenderError::Show);
+            }
+        }
         let (summary, body) = render_parts(intent);
         let mut notification = notify_rust::Notification::new();
         notification.summary(&summary).body(&body);
@@ -45,11 +85,12 @@ impl NotificationRenderer for DesktopRenderer {
         if intent.click_action.is_some() {
             notification.action("default", action_label(intent));
         }
-        // The handle carries the async activation events where the
-        // platform has them. Windows toast activations live outside
-        // notify-rust's event model — the tray stage owns them
-        // (ADR-0002) — so there the handle is not needed (the toast is
-        // already shown by show() itself).
+        // The handle carries the async activation events on the
+        // platforms that deliver them through notify-rust (macOS/Linux).
+        // Windows click toasts that reach this notify-rust path have no
+        // activation channel back — this is the degraded registration
+        // case — and need no handle (the toast is already shown by
+        // show() itself).
         #[cfg(not(target_os = "windows"))]
         let handle = notification
             .show()
@@ -74,11 +115,13 @@ impl NotificationRenderer for DesktopRenderer {
         }
         #[cfg(target_os = "windows")]
         if intent.click_action.is_some() {
-            // Windows toasts deliver activations outside notify-rust's
-            // event model — the tray stage owns click actions (ADR-0002).
-            // The action is dropped, loudly enough to debug.
+            // Only reachable when the activation degraded at startup
+            // (the Ready path returned above): the toast fired through
+            // notify-rust as before this ticket, and the click has no
+            // channel back. Loud enough to debug, quiet enough to keep
+            // the notification.
             eprintln!(
-                "click action: dropped — windows toast activations need the tray stage (ADR-0002)"
+                "click action: dropped — toast activation is not registered (AUMID registration failed at startup; see the activation log)"
             );
         }
         Ok(())
@@ -119,7 +162,7 @@ pub(crate) fn render_parts(intent: &NotificationIntent) -> (String, String) {
 /// platforms that watch the notification's activation events call it
 /// from their wait thread (macOS/Linux); Windows calls it from the COM
 /// toast-activation callback (toast_activation, ticket #17).
-fn perform_click(action: &ClickAction) {
+pub(crate) fn perform_click(action: &ClickAction) {
     match action {
         ClickAction::OpenUrl { url } => {
             if let Err(err) = open_url(url) {

@@ -30,6 +30,7 @@ time = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Data_Xml_Dom",
+    "Win32_Security",
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -38,9 +39,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_UI_Shell",
     "Win32_UI_Shell_PropertiesSystem",
+    "UI_Notifications",
     "Win32_UI_Notifications",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The #[implement] COM macro expands to windows_core paths.
+windows-core = "0.62"
 
 [dev-dependencies]
 # The one test seam (spec Testing Decisions): the real server, embedded

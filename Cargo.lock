@@ -790,6 +790,7 @@ dependencies = [
  "tokio",
  "toml",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

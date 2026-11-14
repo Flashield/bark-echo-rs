@@ -216,6 +216,14 @@ impl BasicAuthArgs {
 
 #[tokio::main]
 async fn main() {
+    // The Windows toast-activation local server (ticket #17): the shell
+    // runs `<exe> --toast-activation` when a toast is clicked while no
+    // daemon is running to receive the click. Serve that one activation
+    // and exit — before the CLI sees arguments it does not know.
+    #[cfg(windows)]
+    if echo_daemon::toast_activation::is_activation_process() {
+        std::process::exit(echo_daemon::toast_activation::serve_activation_process());
+    }
     let cli = Cli::parse();
     if let Err(err) = run(cli).await {
         eprintln!("{err}");
@@ -363,7 +371,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 paths: paths.clone(),
                 config,
                 store,
-                renderer: Arc::new(DesktopRenderer),
+                // `new` registers the Windows toast activation (ticket
+                // #17); elsewhere it is plain construction.
+                renderer: Arc::new(DesktopRenderer::new()),
             };
             run::run(spec, async {
                 let _ = tokio::signal::ctrl_c().await;

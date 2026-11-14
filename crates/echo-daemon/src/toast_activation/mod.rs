@@ -20,6 +20,16 @@
 
 use echo_core::intent::{ClickAction, NotificationIntent};
 
+// The Windows-only I/O (registration, COM server, WinRT toast show) and
+// its re-exports for the renderer and the binary's local-server entry —
+// compiled only for Windows targets.
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::{Activation, register, show_click_toast};
+#[cfg(windows)]
+pub use windows::{is_activation_process, serve_activation_process};
+
 /// The AppUserModelID (AUMID) this machine's daemon registers: the
 /// identity WinRT attaches toasts to. Stable across releases — toasts
 /// sitting in the Action Center activate through the same identity after
