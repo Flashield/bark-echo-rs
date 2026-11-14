@@ -115,6 +115,12 @@ impl WindowModel {
                 row.state = state.clone();
             }
             Event::HistoryAppended { .. } => {}
+            // Hot-apply (ticket #14): a Subscription removed while the
+            // window watches leaves the list at once — a removed name
+            // must not linger as a stale row until the next snapshot.
+            Event::SubscriptionRemoved { subscription_id } => {
+                self.rows.remove(subscription_id);
+            }
         }
     }
 
@@ -381,6 +387,32 @@ mod tests {
         assert_eq!(rows[0].state, "starting");
         assert_eq!(rows[0].server, "", "no identity was described yet");
         assert_eq!(rows[0].token_hint, "");
+    }
+
+    #[test]
+    fn a_removal_event_drops_the_row_at_once() {
+        // Ticket #14: the daemon announces a hot removal; the row
+        // leaves without any poll or reopen — the other rows stand.
+        let mut model = WindowModel::connecting();
+        let mut snapshot = snapshot_with_state(StreamState::Running);
+        snapshot.subscriptions.insert(
+            "tok-b".to_owned(),
+            SubscriptionRuntime {
+                label: "beta".to_owned(),
+                state: StreamState::Running,
+                last_message_id: None,
+                updated_at: 0,
+                server: "http://127.0.0.1:8081".to_owned(),
+                token_hint: "fed654321098...".to_owned(),
+            },
+        );
+        model.apply_snapshot(&snapshot);
+        model.apply_event(&Event::SubscriptionRemoved {
+            subscription_id: "tok".to_owned(),
+        });
+        let rows = model.rows();
+        assert_eq!(rows.len(), 1, "the removed Subscription's row is gone");
+        assert_eq!(rows[0].label, "beta", "the surviving row stands");
     }
 
     #[test]

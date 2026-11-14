@@ -114,6 +114,12 @@ impl TrayModel {
                 );
             }
             Event::HistoryAppended { .. } => {}
+            // Hot-apply (ticket #14): a Subscription removed while the
+            // tray watches leaves the menu at once — a removed name must
+            // not linger as a stale line until the next snapshot.
+            Event::SubscriptionRemoved { subscription_id } => {
+                self.subscriptions.remove(subscription_id);
+            }
         }
     }
 
@@ -343,6 +349,52 @@ mod tests {
                 text: "newcomer — starting".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn a_removal_event_drops_the_line_at_once() {
+        // Ticket #14: the daemon announces a hot removal; the line
+        // leaves without any poll or reopen — the other lines stand.
+        let mut model = TrayModel::connecting();
+        model.apply_snapshot(&with_extra(
+            &snapshot_with("tok-a", "alpha", StreamState::Running),
+            "tok-b",
+            "beta",
+        ));
+        model.apply_event(&Event::SubscriptionRemoved {
+            subscription_id: "tok-a".to_owned(),
+        });
+        let items = model.menu_items();
+        assert_eq!(
+            items.len(),
+            5,
+            "header + one line + separator + open + quit: the removed line is gone"
+        );
+        assert_eq!(
+            items[1],
+            MenuItem::Subscription {
+                id: "tok-b".to_owned(),
+                text: "beta — running".to_owned(),
+            },
+            "the surviving Subscription keeps its line"
+        );
+    }
+
+    /// The snapshot with one extra Subscription line added.
+    fn with_extra(snapshot: &StatusSnapshot, id: &str, label: &str) -> StatusSnapshot {
+        let mut snapshot = snapshot.clone();
+        snapshot.subscriptions.insert(
+            id.to_owned(),
+            echo_ipc::message::SubscriptionRuntime {
+                label: label.to_owned(),
+                state: StreamState::Running,
+                last_message_id: None,
+                updated_at: 0,
+                server: "http://127.0.0.1:8080".to_owned(),
+                token_hint: "abcdef123456...".to_owned(),
+            },
+        );
+        snapshot
     }
 
     #[test]
