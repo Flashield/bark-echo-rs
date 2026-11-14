@@ -21,6 +21,27 @@ justify a server stack or codegen in the daemon, and localhost TCP
 introduces port squatting where UDS file permissions / named pipe ACLs
 are already the access control.
 
+Since ticket #14 the CRUD face is its own vocabulary: `subscribe_add`
+(servers, Device source — own register or mirror by Device Key — the
+required label, the optional operator Basic Auth credentials) and
+`subscribe_remove` (the Subscription id) are requests with typed
+outcomes; a refusal is an error response whose message is the reason —
+the server's own words, shown in the window and printed by the CLI. The
+add answers once that stream's supervisor is up; the remove answers
+once the stream is stopped, its secrets erased, and the config
+persisted. A removal is also announced unsolicited as a
+`subscription_removed` event so watching clients drop the line at once;
+the add needs no event of its own — the new stream's `starting` flip is
+that announcement, and it grows the line in place. Every apply
+serializes in the daemon: file before memory, so a failed save refuses
+the apply whole and the daemon's memory never disagrees with the file.
+
+Hot-apply also reshapes the daemon's own floor: zero Subscriptions is a
+healthy, actionable state — the daemon runs, serves the empty snapshot,
+and CRUD fills it — not a startup refusal ("nothing to mirror"). The
+GUI's spawn-if-absent starts the daemon before any Subscription exists,
+and the window's add form works from there.
+
 Lifecycle: the GUI spawns the daemon when the single-instance lock is
 free; the Tray Menu's quit asks the daemon for a graceful shutdown and
 then exits — a clean exit code composes with autostart supervisors
@@ -36,3 +57,7 @@ directly.
   "restart the service after `subscribe add`" note dies.
 - Secrets never enter the GUI process; connection policy stays
   single-sourced in the daemon.
+- The CLI's `subscribe add/rm` probes the lock: held, the change rides
+  the channel and a channel that never answers is a failure, never a
+  silent fall through to the direct write — racing the single writer is
+  worse than failing. Lock free, the direct write stands byte for byte.
