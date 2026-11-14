@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use echo_ipc::message::{
-    Event, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot, StreamState,
-    SubscriptionRuntime,
+    AddSource, BasicAuthCredentials, Event, Request, RequestFrame, Response, ResponseFrame,
+    StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 use echo_ipc::{Client, Endpoint, IpcError, IpcServer, PROTOCOL_VERSION, connect_raw, serve};
 
@@ -388,6 +388,82 @@ async fn the_daemons_error_response_surfaces_to_the_client() {
     // The connection survives a refused request: the next call still
     // goes through the same client.
     let _still_connected = client.call(Request::Status).await;
+
+    shutdown_cleanly(stop_tx, serve_task).await;
+}
+
+#[tokio::test]
+async fn a_crud_request_travels_the_stack_and_its_typed_answer_comes_back() {
+    // Ticket #14: add/remove ride the same connection as the snapshot —
+    // request/response with ids, the answer typed (`SubscriptionAdded`
+    // carries the push target once). A refusal is an error response on
+    // the same connection, the exchange never fatal.
+    let handler = Box::new(|request: Request| {
+        Box::pin(async move {
+            match request {
+                Request::SubscribeAdd {
+                    server,
+                    source: AddSource::Own,
+                    label,
+                    basic_auth,
+                } => {
+                    assert_eq!(server, "http://127.0.0.1:8080");
+                    assert_eq!(label, "desktop");
+                    assert_eq!(
+                        basic_auth,
+                        Some(BasicAuthCredentials {
+                            user: "operator".to_owned(),
+                            password: "op-secret".to_owned(),
+                        })
+                    );
+                    Response::SubscriptionAdded {
+                        id: "0123abcdef456789".to_owned(),
+                        label,
+                        server,
+                        token_hint: "abcdef123456...".to_owned(),
+                        device_key: "AbCdEf1234567890GhIjKl".to_owned(),
+                    }
+                }
+                Request::SubscribeRemove { id } => {
+                    assert_eq!(id, "0123abcdef456789");
+                    Response::SubscriptionRemoved {
+                        id,
+                        label: "desktop".to_owned(),
+                    }
+                }
+                other => Response::Error {
+                    message: format!("unexpected {other:?}"),
+                },
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    });
+    let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    let added = client
+        .subscribe_add(
+            "http://127.0.0.1:8080",
+            AddSource::Own,
+            "desktop",
+            Some(BasicAuthCredentials {
+                user: "operator".to_owned(),
+                password: "op-secret".to_owned(),
+            }),
+        )
+        .await
+        .expect("the add is answered");
+    assert_eq!(added.id, "0123abcdef456789");
+    assert_eq!(added.label, "desktop");
+    assert_eq!(added.server, "http://127.0.0.1:8080");
+    assert_eq!(added.token_hint, "abcdef123456...");
+    assert_eq!(added.device_key, "AbCdEf1234567890GhIjKl");
+
+    let removed = client
+        .subscribe_remove("0123abcdef456789")
+        .await
+        .expect("the remove is answered");
+    assert_eq!(removed.id, "0123abcdef456789");
+    assert_eq!(removed.label, "desktop");
 
     shutdown_cleanly(stop_tx, serve_task).await;
 }

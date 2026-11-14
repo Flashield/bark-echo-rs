@@ -40,6 +40,67 @@ pub enum Request {
     },
     /// Ask for the daemon's live per-Subscription snapshot.
     Status,
+
+    // --- Subscription CRUD (ticket #14, ADR-0004's hot-apply): the
+    // --- daemon is the single writer of bark-echo state while it runs,
+    // --- so changes ride the channel as requests — it registers/mints
+    // --- on the server, stores the secrets, writes the config, and
+    // --- starts/stops that stream's supervisor immediately.
+    /// Add a Subscription (the CLI's `subscribe add`, the window's add
+    /// form): register or mirror a Device, mint a labelled Stream
+    /// Token, and start the Realtime Stream hot.
+    SubscribeAdd {
+        /// The bark server base URL, e.g. `http://127.0.0.1:8080`.
+        server: String,
+        /// Where the Subscription's Device comes from.
+        source: AddSource,
+        /// The client label naming the Stream Token (GLOSSARY) —
+        /// required; the daemon refuses an empty one before touching
+        /// the server.
+        label: String,
+        /// The operator Basic Auth credentials (§1.4) to present and
+        /// store; `None` rides the already-stored credentials for that
+        /// server. The secrets stay in the daemon (spec story 13).
+        basic_auth: Option<BasicAuthCredentials>,
+    },
+    /// Remove one Subscription by id (its Stream Token's `token_id`,
+    /// as `subscribe list` and the snapshot show it): its Realtime
+    /// Stream stops, its secrets are erased, the config is updated.
+    SubscribeRemove {
+        /// The Subscription to remove.
+        id: String,
+    },
+}
+
+/// Where a new Subscription's Device comes from (GLOSSARY.md: one
+/// Subscription mirrors exactly one Device) — the wire face of the CLI
+/// `--own` / `--device-key` pair and the window's add form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AddSource {
+    /// Register a fresh Stream Device for this desktop and push from
+    /// it — the minted Device Key is the outcome.
+    Own,
+    /// Mirror an existing Device by its Device Key — e.g. a phone; the
+    /// key is the user's own.
+    DeviceKey {
+        /// The Device Key to mirror.
+        device_key: String,
+    },
+}
+
+/// The operator Basic Auth credentials (protocol §1.4) a client hands
+/// the daemon to present and store. The daemon keeps the password in
+/// the secret store; the config file carries the non-secret user and
+/// marker only (spec story 18). An empty field means "not given" — the
+/// credentials the CLI flags build, since a server may enable the check
+/// on user and password independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasicAuthCredentials {
+    /// The operator Basic Auth user.
+    pub user: String,
+    /// The operator Basic Auth password.
+    pub password: String,
 }
 
 /// The daemon-pushed events (ADR-0004, ticket #11): frames without an
@@ -71,6 +132,20 @@ pub enum Event {
         /// The appended History Log line.
         entry: NotificationIntent,
     },
+
+    // --- Subscription CRUD (ticket #14): hot-apply announces its
+    // --- effects, so every watching client — the Tray Menu, a second
+    // --- Management Window — follows without a poll. The add needs no
+    // --- event of its own: the stream's Starting flip arrives as a
+    // --- [`Event::StreamState`], which carries the label and grows the
+    // --- line in place.
+    /// A Subscription was removed while clients watched: its line
+    /// leaves the Tray Menu and the window at once — a removed
+    /// Subscription's name must not linger as a stale row.
+    SubscriptionRemoved {
+        /// The id of the Subscription that is gone.
+        subscription_id: String,
+    },
 }
 
 /// One daemon → client frame: the response plus the answered request's
@@ -97,6 +172,61 @@ pub enum Response {
     /// The request could not be answered as phrased; the message says
     /// what the daemon does know.
     Error { message: String },
+
+    // --- Subscription CRUD (ticket #14): the add/remove answers are
+    // --- typed outcomes; a refusal is [`Response::Error`] with the
+    // --- reason as its message — a refused add never half-applied.
+    /// A [`Request::SubscribeAdd`] succeeded: the Subscription exists
+    /// and its Realtime Stream is starting. The Device Key rides the
+    /// answer — the push target for scripts, shown to the user here
+    /// and never persisted in any client.
+    SubscriptionAdded {
+        /// The new Subscription's id (its Stream Token's `token_id`).
+        id: String,
+        /// The label the Stream Token was minted with.
+        label: String,
+        /// The server the Subscription subscribes to.
+        server: String,
+        /// First 12 characters of the Stream Token + `...` — the hint
+        /// that names the token without re-exposing it (§3.2).
+        token_hint: String,
+        /// The Subscription's Device Key — the push target.
+        device_key: String,
+    },
+    /// A [`Request::SubscribeRemove`] succeeded: the stream stopped,
+    /// the secrets are erased, the config updated.
+    SubscriptionRemoved {
+        /// The removed Subscription's id.
+        id: String,
+        /// The label it carried — for the confirmation line.
+        label: String,
+    },
+}
+
+/// What a successful [`Request::SubscribeAdd`] produced — the
+/// [`Response::SubscriptionAdded`] fields as one value (ticket #14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedSubscription {
+    /// The new Subscription's id (its Stream Token's `token_id`).
+    pub id: String,
+    /// The label the Stream Token was minted with.
+    pub label: String,
+    /// The server the Subscription subscribes to.
+    pub server: String,
+    /// First 12 characters of the Stream Token + `...`.
+    pub token_hint: String,
+    /// The Subscription's Device Key — the push target.
+    pub device_key: String,
+}
+
+/// What a successful [`Request::SubscribeRemove`] removed — the
+/// [`Response::SubscriptionRemoved`] fields as one value (ticket #14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedSubscription {
+    /// The removed Subscription's id.
+    pub id: String,
+    /// The label it carried.
+    pub label: String,
 }
 
 /// The daemon's live view of every Subscription — the snapshot

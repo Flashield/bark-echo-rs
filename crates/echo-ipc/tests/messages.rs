@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use echo_ipc::PROTOCOL_VERSION;
 use echo_ipc::message::{
-    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
-    StreamState, SubscriptionRuntime,
+    AddSource, BasicAuthCredentials, Event, NotificationIntent, Request, RequestFrame, Response,
+    ResponseFrame, StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 
 fn plain_intent(id: i64) -> NotificationIntent {
@@ -256,6 +256,116 @@ fn a_stream_state_event_round_trips_without_an_id() {
         json,
         r#"{"type":"stream_state","subscription_id":"tok","label":"desktop","state":{"kind":"running"}}"#,
         "the event names itself, its Subscription, and the state in the runtime's vocabulary"
+    );
+    let back: Event = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, event);
+}
+
+// --- Subscription CRUD (ticket #14): add and remove ride the channel
+// --- as requests; the daemon is the single writer (ADR-0004) and
+// --- answers with typed outcomes — a refusal is an error response
+// --- whose message is the reason.
+
+#[test]
+fn a_subscribe_add_request_round_trips_in_both_device_modes() {
+    let own = RequestFrame {
+        id: 5,
+        request: Request::SubscribeAdd {
+            server: "http://127.0.0.1:8080".to_owned(),
+            source: AddSource::Own,
+            label: "desktop".to_owned(),
+            basic_auth: None,
+        },
+    };
+    let json = serde_json::to_string(&own).expect("serialize");
+    assert!(json.contains(r#""type":"subscribe_add""#), "{json}");
+    assert!(
+        json.contains(r#""kind":"own""#),
+        "the source names its mode: {json}"
+    );
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, own);
+
+    // Mirror mode carries the Device Key (GLOSSARY) to mirror, and the
+    // optional operator Basic Auth (§1.4) rides whole when given.
+    let mirror = RequestFrame {
+        id: 6,
+        request: Request::SubscribeAdd {
+            server: "https://api.day.app".to_owned(),
+            source: AddSource::DeviceKey {
+                device_key: "AbCdEf1234567890GhIjKl".to_owned(),
+            },
+            label: "the iPhone".to_owned(),
+            basic_auth: Some(BasicAuthCredentials {
+                user: "operator".to_owned(),
+                password: "op-secret".to_owned(),
+            }),
+        },
+    };
+    let json = serde_json::to_string(&mirror).expect("serialize");
+    assert!(json.contains(r#""kind":"device_key""#), "{json}");
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, mirror);
+}
+
+#[test]
+fn a_subscribe_remove_request_round_trips() {
+    let frame = RequestFrame {
+        id: 8,
+        request: Request::SubscribeRemove {
+            id: "0123abcdef456789".to_owned(),
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(json.contains(r#""type":"subscribe_remove""#), "{json}");
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn the_crud_responses_round_trip_with_their_request_ids() {
+    let added = ResponseFrame {
+        id: 5,
+        response: Response::SubscriptionAdded {
+            id: "0123abcdef456789".to_owned(),
+            label: "desktop".to_owned(),
+            server: "http://127.0.0.1:8080".to_owned(),
+            token_hint: "abcdef123456...".to_owned(),
+            // The Device Key is the push target — it rides the answer
+            // once, the same way `subscribe add` prints it (ticket #3).
+            device_key: "AbCdEf1234567890GhIjKl".to_owned(),
+        },
+    };
+    let json = serde_json::to_string(&added).expect("serialize");
+    assert!(json.contains(r#""type":"subscription_added""#), "{json}");
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, added);
+
+    let removed = ResponseFrame {
+        id: 8,
+        response: Response::SubscriptionRemoved {
+            id: "0123abcdef456789".to_owned(),
+            label: "desktop".to_owned(),
+        },
+    };
+    let json = serde_json::to_string(&removed).expect("serialize");
+    assert!(json.contains(r#""type":"subscription_removed""#), "{json}");
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, removed);
+}
+
+#[test]
+fn a_removal_event_round_trips_without_an_id() {
+    // A Subscription removed while clients watched (ticket #14): the
+    // tray and the window must drop the line at once, so the daemon
+    // announces the removal unsolicited — no id, nothing to answer.
+    let event = Event::SubscriptionRemoved {
+        subscription_id: "tok".to_owned(),
+    };
+    let json = serde_json::to_string(&event).expect("serialize");
+    assert_eq!(
+        json, r#"{"type":"subscription_removed","subscription_id":"tok"}"#,
+        "the event names itself and the Subscription that is gone"
     );
     let back: Event = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, event);

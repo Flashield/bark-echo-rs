@@ -10,7 +10,10 @@ use std::collections::VecDeque;
 use crate::connection::Connection;
 use crate::error::IpcError;
 use crate::handshake;
-use crate::message::{Event, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot};
+use crate::message::{
+    AddSource, AddedSubscription, BasicAuthCredentials, Event, RemovedSubscription, Request,
+    RequestFrame, Response, ResponseFrame, StatusSnapshot,
+};
 use crate::transport::{self, ClientStream, Endpoint};
 
 /// A connected client of the daemon's channel.
@@ -93,6 +96,63 @@ impl Client {
             Response::Status { snapshot } => Ok(snapshot),
             other => Err(IpcError::Protocol(format!(
                 "unexpected response to a status request: {other:?}"
+            ))),
+        }
+    }
+
+    /// Add a Subscription (ticket #14): the daemon registers/mints on
+    /// the server, stores the secrets, writes the config, and starts
+    /// the Realtime Stream hot — the answer means the supervisor is up.
+    /// [`IpcError::Rejected`] carries the daemon's reason (an unknown
+    /// Device Key, a refused label, ...); a refused add never
+    /// half-applied.
+    pub async fn subscribe_add(
+        &mut self,
+        server: &str,
+        source: AddSource,
+        label: &str,
+        basic_auth: Option<BasicAuthCredentials>,
+    ) -> Result<AddedSubscription, IpcError> {
+        match self
+            .call(Request::SubscribeAdd {
+                server: server.to_owned(),
+                source,
+                label: label.to_owned(),
+                basic_auth,
+            })
+            .await?
+        {
+            Response::SubscriptionAdded {
+                id,
+                label,
+                server,
+                token_hint,
+                device_key,
+            } => Ok(AddedSubscription {
+                id,
+                label,
+                server,
+                token_hint,
+                device_key,
+            }),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a subscribe-add request: {other:?}"
+            ))),
+        }
+    }
+
+    /// Remove one Subscription by id (ticket #14): the stream stops,
+    /// the secrets are erased, the config updated — all before the
+    /// answer goes out. [`IpcError::Rejected`] carries the daemon's
+    /// reason (an unknown id names `subscribe list`).
+    pub async fn subscribe_remove(&mut self, id: &str) -> Result<RemovedSubscription, IpcError> {
+        match self
+            .call(Request::SubscribeRemove { id: id.to_owned() })
+            .await?
+        {
+            Response::SubscriptionRemoved { id, label } => Ok(RemovedSubscription { id, label }),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a subscribe-remove request: {other:?}"
             ))),
         }
     }
