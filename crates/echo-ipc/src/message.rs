@@ -129,6 +129,20 @@ pub struct SubscriptionRuntime {
     pub last_message_id: Option<i64>,
     /// Unix seconds of the last change to this line.
     pub updated_at: i64,
+    /// The Subscription's server base URL — public config data (the
+    /// config TOML holds non-secret fields only), riding the snapshot
+    /// since ticket #13 so the Management Window can list it without the
+    /// GUI touching a bark-echo file (ADR-0004). `#[serde(default)]` for
+    /// files written before the identity rode the snapshot; the next
+    /// daemon run rewrites them.
+    #[serde(default)]
+    pub server: String,
+    /// The Stream Token's public hint (first 12 characters + `...`,
+    /// config.rs) — names the token without re-exposing it (protocol
+    /// §3.2); the secret itself never leaves the daemon (spec story 13).
+    /// Same `#[serde(default)]` story as `server`.
+    #[serde(default)]
+    pub token_hint: String,
 }
 
 /// Per-Subscription stream state as the runtime sees it (ticket #5's

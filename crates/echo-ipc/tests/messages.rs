@@ -72,6 +72,8 @@ fn snapshot_response_round_trips_with_its_request_id() {
                         state: StreamState::Running,
                         last_message_id: Some(41),
                         updated_at: 1_700_000_042,
+                        server: "http://127.0.0.1:8080".to_owned(),
+                        token_hint: "abcdef123456...".to_owned(),
                     },
                 )]),
             },
@@ -146,6 +148,8 @@ fn the_snapshot_holds_one_line_per_subscription() {
                     state: StreamState::Starting,
                     last_message_id: None,
                     updated_at: 0,
+                    server: "http://127.0.0.1:8080".to_owned(),
+                    token_hint: "123456abcdef...".to_owned(),
                 },
             ),
             (
@@ -155,6 +159,8 @@ fn the_snapshot_holds_one_line_per_subscription() {
                     state: StreamState::Running,
                     last_message_id: Some(7),
                     updated_at: 0,
+                    server: "https://api.day.app".to_owned(),
+                    token_hint: "fed654321098...".to_owned(),
                 },
             ),
         ]),
@@ -166,6 +172,53 @@ fn the_snapshot_holds_one_line_per_subscription() {
     // every line without touching the config.
     assert_eq!(snapshot.subscriptions["tok-b"].label, "desktop");
     assert_eq!(snapshot.subscriptions["tok-a"].label, "kitchen");
+    // And so does the public identity (ticket #13): server URL and token
+    // hint for the Management Window's list.
+    assert_eq!(snapshot.subscriptions["tok-b"].server, "https://api.day.app");
+    assert_eq!(snapshot.subscriptions["tok-b"].token_hint, "fed654321098...");
+}
+
+#[test]
+fn the_snapshot_line_carries_the_subscriptions_public_identity() {
+    // The Management Window (ticket #13) lists label / server URL / token
+    // hint per Subscription. These are the config file's public fields
+    // (echo-daemon config.rs — the TOML holds non-secret data only), so
+    // they ride the snapshot and the GUI never touches a bark-echo file
+    // (ADR-0004); the secrets behind the hints stay in the daemon.
+    let runtime = SubscriptionRuntime {
+        label: "desktop".to_owned(),
+        state: StreamState::Running,
+        last_message_id: Some(41),
+        updated_at: 1_700_000_042,
+        server: "http://127.0.0.1:8080".to_owned(),
+        token_hint: "abcdef123456...".to_owned(),
+    };
+    let json = serde_json::to_string(&runtime).expect("serialize");
+    assert!(
+        json.contains(r#""server":"http://127.0.0.1:8080""#),
+        "the server URL rides the line: {json}"
+    );
+    assert!(
+        json.contains(r#""token_hint":"abcdef123456...""#),
+        "the token hint rides the line: {json}"
+    );
+    let back: SubscriptionRuntime = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, runtime);
+}
+
+#[test]
+fn a_state_file_written_before_the_public_identity_still_parses() {
+    // The runtime state file is the snapshot's persisted face; files
+    // from before ticket #13 carry no server or token hint. Graceful
+    // default, not an error — the next daemon run rewrites them. The
+    // same rule `label` set in ticket #11.
+    let runtime: SubscriptionRuntime =
+        serde_json::from_str(r#"{"state":{"kind":"running"},"last_message_id":7,"updated_at":0}"#)
+            .expect("parse a pre-identity line");
+    assert_eq!(runtime.label, "");
+    assert_eq!(runtime.server, "", "absent identity defaults empty, never invented");
+    assert_eq!(runtime.token_hint, "");
+    assert_eq!(runtime.state, StreamState::Running);
 }
 
 #[test]
