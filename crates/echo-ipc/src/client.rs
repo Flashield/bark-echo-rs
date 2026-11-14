@@ -10,7 +10,9 @@ use std::collections::VecDeque;
 use crate::connection::Connection;
 use crate::error::IpcError;
 use crate::handshake;
-use crate::message::{Event, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot};
+use crate::message::{
+    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
+};
 use crate::transport::{self, ClientStream, Endpoint};
 
 /// A connected client of the daemon's channel.
@@ -93,6 +95,31 @@ impl Client {
             Response::Status { snapshot } => Ok(snapshot),
             other => Err(IpcError::Protocol(format!(
                 "unexpected response to a status request: {other:?}"
+            ))),
+        }
+    }
+
+    /// The recent tail of one Subscription's History Log (ticket #15):
+    /// the daemon reads its own daemon-private files (ADR-0004) and
+    /// answers with at most `tail` entries, oldest last — the content
+    /// semantics of the CLI's `log --tail N`, over the channel. Events
+    /// broadcast while the answer is in flight queue for
+    /// [`Client::next_event`] as with any exchange.
+    pub async fn history_snapshot(
+        &mut self,
+        subscription_id: &str,
+        tail: u32,
+    ) -> Result<Vec<NotificationIntent>, IpcError> {
+        match self
+            .call(Request::HistorySnapshot {
+                subscription_id: subscription_id.to_owned(),
+                tail,
+            })
+            .await?
+        {
+            Response::HistorySnapshot { entries } => Ok(entries),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a History Log snapshot request: {other:?}"
             ))),
         }
     }

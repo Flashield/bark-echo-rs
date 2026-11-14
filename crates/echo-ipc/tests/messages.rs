@@ -262,6 +262,56 @@ fn a_stream_state_event_round_trips_without_an_id() {
 }
 
 #[test]
+fn a_history_snapshot_request_round_trips_with_its_subscription_and_tail() {
+    // Ticket #15: the viewer's opening content is a bounded tail of one
+    // Subscription's History Log, asked over the channel — the GUI never
+    // reads the file (ADR-0004). The type tag names the request; the
+    // Subscription and the bound ride as fields.
+    let frame = RequestFrame {
+        id: 5,
+        request: Request::HistorySnapshot {
+            subscription_id: "tok".to_owned(),
+            tail: 200,
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(
+        json.contains(r#""type":"history_snapshot""#),
+        "the type tag names the request: {json}"
+    );
+    assert!(
+        json.contains(r#""subscription_id":"tok""#) && json.contains(r#""tail":200"#),
+        "the ask carries its Subscription and its bound: {json}"
+    );
+    let back: RequestFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
+fn a_history_snapshot_response_round_trips_the_log_line_vocabulary() {
+    // The answer is the log file's own lines — the HistoryAppended
+    // event's vocabulary, oldest last — so the viewer renders snapshot
+    // lines and live appends as one thing, all of it channel-borne.
+    let frame = ResponseFrame {
+        id: 12,
+        response: Response::HistorySnapshot {
+            entries: vec![plain_intent(40), plain_intent(41)],
+        },
+    };
+    let json = serde_json::to_string(&frame).expect("serialize");
+    assert!(
+        json.contains(r#""type":"history_snapshot""#) && json.contains(r#""id":12"#),
+        "the response names itself and echoes the request's id: {json}"
+    );
+    assert!(
+        json.contains(r#""body":"the body""#) && json.contains(r#""title":"the title""#),
+        "the entries ride as the log's own lines: {json}"
+    );
+    let back: ResponseFrame = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, frame);
+}
+
+#[test]
 fn a_history_appended_event_round_trips_the_log_line_vocabulary() {
     // The History Log's line (GLOSSARY) and the event's entry are one
     // vocabulary: the entry's bytes are what the log file holds, so the

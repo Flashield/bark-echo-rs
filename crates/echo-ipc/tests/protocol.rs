@@ -20,6 +20,19 @@ use echo_ipc::{Client, Endpoint, IpcError, IpcServer, PROTOCOL_VERSION, connect_
 type BoxedHandler =
     Box<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync + 'static>;
 
+/// One History Log line as the log file holds it (GLOSSARY) — the
+/// vocabulary the History plane's answers carry.
+fn intent(id: i64) -> echo_ipc::NotificationIntent {
+    echo_ipc::NotificationIntent {
+        id,
+        title: "the title".to_owned(),
+        subtitle: String::new(),
+        body: "the body".to_owned(),
+        click_action: None,
+        created_at: 1_700_000_000,
+    }
+}
+
 fn canned_snapshot() -> StatusSnapshot {
     StatusSnapshot {
         pid: 4242,
@@ -360,6 +373,60 @@ async fn responses_must_carry_the_request_id() {
         matches!(outcome, Err(IpcError::Protocol(_))),
         "an id that matches no request is a protocol error: {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn a_history_snapshot_request_reaches_the_daemon_and_answers_with_entries() {
+    // Ticket #15 over the real transport (this suite runs unchanged on
+    // Windows CI): the History plane's request is an ordinary
+    // request/response exchange — its id matches, its Subscription and
+    // tail reach the handler, and the answer carries the entries.
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
+    let handler = Box::new(move |request: Request| {
+        let seen_tx = seen_tx.clone();
+        Box::pin(async move {
+            let _ = seen_tx.send(request.clone());
+            match request {
+                Request::HistorySnapshot { .. } => Response::HistorySnapshot {
+                    entries: vec![intent(40), intent(41), intent(42), intent(43)],
+                },
+                other => Response::Error {
+                    message: format!("this handler answers HistorySnapshot only, got {other:?}"),
+                },
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    });
+    let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    let entries = client
+        .history_snapshot("tok", 3)
+        .await
+        .expect("history snapshot");
+    assert_eq!(
+        entries.len(),
+        4,
+        "the answer is whatever the daemon chose to send"
+    );
+    assert_eq!(entries[0].id, 40, "oldest first");
+    assert_eq!(entries[3].id, 43);
+    // The daemon side saw exactly what the viewer asked for.
+    match seen_rx
+        .recv()
+        .await
+        .expect("the request reached the handler")
+    {
+        Request::HistorySnapshot {
+            subscription_id,
+            tail,
+        } => {
+            assert_eq!(subscription_id, "tok");
+            assert_eq!(tail, 3);
+        }
+        other => panic!("a history snapshot request went out, got {other:?}"),
+    }
+
+    shutdown_cleanly(stop_tx, serve_task).await;
 }
 
 #[tokio::test]

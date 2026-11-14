@@ -40,6 +40,22 @@ pub enum Request {
     },
     /// Ask for the daemon's live per-Subscription snapshot.
     Status,
+
+    // ---- History Log plane (ticket #15). New planes append their
+    // variants here, at the enum's end — the wire is additive, and a
+    // section comment keeps parallel tickets' additions from colliding.
+    /// Ask for the recent tail of one Subscription's History Log
+    /// (ticket #15): the daemon reads its own files — the logs stay
+    /// daemon-private (ADR-0004) — and answers with the content
+    /// semantics of the CLI's `log --tail N`, over the channel.
+    HistorySnapshot {
+        /// The Subscription whose History Log to read (its Stream
+        /// Token's `token_id`).
+        subscription_id: String,
+        /// At most this many entries: the bounded snapshot that keeps a
+        /// large History Log from weighing on the viewer.
+        tail: u32,
+    },
 }
 
 /// The daemon-pushed events (ADR-0004, ticket #11): frames without an
@@ -97,6 +113,17 @@ pub enum Response {
     /// The request could not be answered as phrased; the message says
     /// what the daemon does know.
     Error { message: String },
+
+    // ---- History Log plane (ticket #15), matching the request plane's
+    // section above.
+    /// The recent History Log lines [`Request::HistorySnapshot`] asked
+    /// for, oldest last — the log file's own line vocabulary (the same
+    /// one [`Event::HistoryAppended`] carries), so the viewer renders
+    /// snapshot lines and live appends as one thing.
+    HistorySnapshot {
+        /// The entries, oldest last.
+        entries: Vec<NotificationIntent>,
+    },
 }
 
 /// The daemon's live view of every Subscription — the snapshot
