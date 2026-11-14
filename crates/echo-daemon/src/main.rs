@@ -105,6 +105,13 @@ enum Command {
     /// Per-Subscription stream state plus the server's live statistics
     /// (/info): delivery health at a glance.
     Status,
+    /// The Tray Menu (GLOSSARY): the GUI's always-present tray presence,
+    /// each Subscription's label with its live stream state, updating
+    /// from the daemon's pushed events (issue #11). Runs until Quit;
+    /// shows the daemon's absence as the reconnecting state instead of
+    /// silence. The Management Window (#13) and the daemon-shutdown
+    /// wiring in Quit (#12) come with their tickets.
+    Gui,
 }
 
 #[derive(Subcommand)]
@@ -383,6 +390,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status => {
             let report = status::report(&paths, &config, store.as_ref()).await?;
             print!("{}", report.render());
+        }
+        Command::Gui => {
+            // The event loop owns this thread, and the thread is the
+            // main one (eframe/winit and macOS's tray requirement). The
+            // channel work runs on the GUI crate's own thread, so no
+            // async runtime is needed here.
+            echo_gui::run(paths.ipc_endpoint())?;
         }
     }
     Ok(())

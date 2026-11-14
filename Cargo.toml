@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 echo-core = { path = "crates/echo-core" }
+echo-gui = { path = "crates/echo-gui" }
 echo-ipc = { path = "crates/echo-ipc" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

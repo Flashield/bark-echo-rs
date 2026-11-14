@@ -4,10 +4,16 @@
 //! stream state, updated by the daemon's pushed events — a thin
 //! renderer over the echo-ipc client's state machine, never a second
 //! runtime.
+//!
+//! Entry: [`app::run`] on the main thread — the binary's `gui`
+//! subcommand calls it.
 
+pub mod app;
 pub mod connection;
 pub mod fonts;
 pub mod model;
+pub mod tray;
 
+pub use app::run;
 pub use connection::UiMsg;
 pub use model::{LinkState, MenuItem, SubscriptionLine, TrayModel};
