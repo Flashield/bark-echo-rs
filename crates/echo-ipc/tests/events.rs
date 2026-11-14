@@ -25,7 +25,15 @@ fn canned_snapshot_response() -> Response {
         snapshot: echo_ipc::message::StatusSnapshot {
             pid: 4242,
             started_at: 1_700_000_000,
-            subscriptions: BTreeMap::new(),
+            subscriptions: BTreeMap::from([(
+                "tok".to_owned(),
+                echo_ipc::message::SubscriptionRuntime {
+                    label: "desktop".to_owned(),
+                    state: StreamState::Running,
+                    last_message_id: None,
+                    updated_at: 1_700_000_042,
+                },
+            )]),
         },
     }
 }

@@ -299,3 +299,131 @@ async fn malformed_bytes_never_hurt_the_daemon() {
 
     server.shutdown().await;
 }
+
+/// Connect with a deadline: the daemon binds the channel a beat after
+/// the run task starts (lock first, then the endpoint), and a client —
+/// the future Tray Menu — starts whenever it starts.
+async fn connect_when_listening(endpoint: &echo_ipc::Endpoint) -> Client {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match Client::connect(endpoint).await {
+            Ok(client) => return client,
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the channel never came up at {endpoint}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_push_lands_as_a_history_event_and_a_server_death_as_a_state_flip() {
+    // Ticket #11: the daemon pushes unsolicited events — a History Log
+    // append the moment the line is on disk, a stream state flip the
+    // moment the runtime records it. A client that never sends a single
+    // request still hears both, in the tray's vocabulary (label included).
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "events").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+
+    // The event listener never asks for anything: it just listens.
+    let mut listener = connect_when_listening(&endpoint).await;
+    // A second client drives the snapshot while the listener stays quiet.
+    let mut poller = connect_when_listening(&endpoint).await;
+    let snapshot = wait_snapshot(&mut poller, "running", |snapshot| {
+        snapshot
+            .subscriptions
+            .get(&token_id)
+            .map(|runtime| runtime.state == StreamState::Running)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        snapshot.subscriptions[&token_id].label, "desktop",
+        "the snapshot names the Subscription so a fresh client can render it"
+    );
+
+    // A push lands through the embedded server: the append arrives as an
+    // event on the channel — not as a response to anything.
+    push_to(&server, &device_key, "pushed as an event").await;
+    // Draining past the connect-time stream flips until the append: the
+    // listener subscribed before the push, so the append must come.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), listener.next_event())
+            .await
+            .expect("an event within 10s")
+            .expect("the channel stayed open");
+        match event {
+            echo_ipc::message::Event::HistoryAppended {
+                subscription_id,
+                label,
+                entry,
+            } => {
+                assert_eq!(subscription_id, token_id);
+                assert_eq!(label, "desktop");
+                assert_eq!(entry.body, "pushed as an event");
+                let appended_id = entry.id;
+                let after = wait_snapshot(&mut poller, "the processed id", |snapshot| {
+                    snapshot.subscriptions[&token_id].last_message_id.is_some()
+                })
+                .await;
+                assert_eq!(
+                    after.subscriptions[&token_id].last_message_id,
+                    Some(appended_id),
+                    "the event's line is the push the snapshot's cursor follows"
+                );
+                break;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the History event never arrived: {other:?}"
+                );
+            }
+        }
+    }
+
+    // The embedded server dies: the stream flips to disconnected and the
+    // flip is announced — the tray's "never stale silence" rule.
+    server.shutdown().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), listener.next_event())
+            .await
+            .expect("an event within 10s")
+            .expect("the channel stayed open");
+        match event {
+            echo_ipc::message::Event::StreamState {
+                subscription_id,
+                label,
+                state,
+            } => {
+                assert_eq!(subscription_id, token_id);
+                assert_eq!(label, "desktop");
+                assert!(
+                    matches!(state, StreamState::Disconnected { .. }),
+                    "the server's death flips the state: {state:?}"
+                );
+                break;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the state-flip event never arrived: {other:?}"
+                );
+            }
+        }
+    }
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+}

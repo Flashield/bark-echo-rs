@@ -144,6 +144,11 @@ pub struct StreamConfig {
     /// Where connection-state changes ([`StreamEvent`]) surface, `None`
     /// when the caller only consumes intents. Sends are best-effort.
     pub events: Option<mpsc::Sender<StreamEvent>>,
+    /// Where an appended History Log line is announced — right after the
+    /// write succeeded, carrying the appended line (ticket #11). The
+    /// daemon relays these as channel events. Best-effort, like
+    /// [`StreamConfig::events`]; `None` when the caller has no use.
+    pub appends: Option<mpsc::Sender<NotificationIntent>>,
 }
 
 /// Why the receive loop ended.
@@ -383,6 +388,13 @@ async fn run(config: StreamConfig, intents: mpsc::Sender<NotificationIntent>) ->
                         }
                         if let Err(err) = config.history_log.append(&intent) {
                             return StreamEnd::HistoryWriteFailed(err.to_string());
+                        }
+                        // Announced here — the only place an append happens —
+                        // so a listener never hears about a line that is not
+                        // on the log yet. Best-effort: a gone or lagging
+                        // listener never disturbs the loop.
+                        if let Some(appends) = &config.appends {
+                            let _ = appends.send(intent.clone()).await;
                         }
                         processed = id;
                     }

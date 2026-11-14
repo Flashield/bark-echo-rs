@@ -10,8 +10,15 @@ fn a_fresh_writer_starts_every_subscription_as_starting() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("daemon-state.json");
 
-    let writer = StateWriter::create(&path, 4242, &["tok-a".to_owned(), "tok-b".to_owned()])
-        .expect("create state");
+    let writer = StateWriter::create(
+        &path,
+        4242,
+        &[
+            ("tok-a".to_owned(), "kitchen".to_owned()),
+            ("tok-b".to_owned(), "desktop".to_owned()),
+        ],
+    )
+    .expect("create state");
 
     let snapshot = writer.snapshot();
     assert_eq!(snapshot.pid, 4242);
@@ -32,7 +39,8 @@ fn a_fresh_writer_starts_every_subscription_as_starting() {
 fn every_update_persists_atomically_and_reads_back() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("daemon-state.json");
-    let writer = StateWriter::create(&path, 7, &["tok".to_owned()]).expect("create");
+    let writer =
+        StateWriter::create(&path, 7, &[("tok".to_owned(), "desktop".to_owned())]).expect("create");
 
     writer.set("tok", StreamState::Running).expect("persist");
     let read = StateFile::read(&path).expect("read").expect("present");

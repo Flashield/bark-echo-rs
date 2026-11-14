@@ -37,6 +37,7 @@ fn stream_config(
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: None,
+        appends: None,
     }
 }
 
@@ -214,6 +215,49 @@ async fn history_log_stays_empty_until_the_first_intent_is_emitted() {
 }
 
 #[tokio::test]
+async fn an_appended_history_line_is_announced_once_it_is_on_disk() {
+    // Ticket #11: the daemon relays History Log appends as channel
+    // events. The core announces at the only place an append happens —
+    // right after the log write succeeded — carrying the appended line
+    // itself. The test client proves the announced line is readable in
+    // the file the moment the announcement arrives.
+    let harness = common::Subscribed::spawn().await;
+    let (appends_tx, mut appends) = tokio::sync::mpsc::channel(64);
+    let mut config = config_for(&harness);
+    config.appends = Some(appends_tx);
+    let (handle, mut intents) = RealtimeStream::spawn(config);
+
+    common::wait_active_streams(&harness.server, 1).await;
+    harness
+        .push(serde_json::json!({ "body": "announced" }))
+        .await;
+
+    // The intent surfaces as always, and the append is announced with
+    // the same line.
+    let intent = next_intent(&mut intents).await;
+    let announced = tokio::time::timeout(Duration::from_secs(5), appends.recv())
+        .await
+        .expect("append announced within 5s")
+        .expect("receive loop still running");
+    assert_eq!(announced.id, intent.id, "one announcement per append");
+    assert_eq!(announced.body, "announced");
+
+    // And the announced line is already readable in the log: the
+    // announcement means the append happened, not that it will.
+    let log = HistoryLog::new(harness.history_path());
+    let entries = log.entries().expect("history entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.id == announced.id && entry.body == "announced"),
+        "the announced line is on disk: {entries:?}"
+    );
+
+    handle.stop().await;
+    harness.server.shutdown().await;
+}
+
+#[tokio::test]
 async fn keep_alive_comments_and_the_handshake_produce_no_intents() {
     // A server that emits `: keep-alive` every second (protocol §3.4);
     // assembled by hand because Subscribed::spawn uses default settings.
@@ -274,6 +318,7 @@ async fn a_silent_connection_is_declared_dead_and_reconnected_by_the_idle_watchd
     let config = StreamConfig {
         keepalive_interval: Some(Duration::from_millis(100)),
         events: Some(events_tx),
+        appends: None,
         ..config_for_wire(&base_url, &dir)
     };
     let started = Instant::now();
@@ -314,6 +359,7 @@ async fn with_keepalives_disabled_no_watchdog_runs_and_silence_is_tolerated() {
     let config = StreamConfig {
         keepalive_interval: None,
         events: Some(events_tx),
+        appends: None,
         ..config_for_wire(&base_url, &dir)
     };
     let (handle, _intents) = RealtimeStream::spawn(config);
@@ -681,6 +727,7 @@ async fn basic_auth_credentials_ride_alongside_the_stream_token() {
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: None,
+        appends: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
     common::wait_active_streams_with(&server, 1, Some((OPERATOR_USER, OPERATOR_PASSWORD))).await;
@@ -715,6 +762,7 @@ async fn a_basic_auth_rejection_ends_the_loop_instead_of_spin_retrying() {
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: None,
+        appends: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
 

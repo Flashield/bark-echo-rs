@@ -43,6 +43,7 @@ fn config_with_events(
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: Some(events_tx),
+        appends: None,
     };
     (config, events_rx)
 }
@@ -135,6 +136,7 @@ async fn a_token_invalidated_mid_stream_rejects_the_reconnect_with_token_invalid
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: Some(events_tx),
+        appends: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
 
@@ -204,6 +206,7 @@ async fn other_rejections_stay_auth_rejected_not_token_invalid() {
         backoff: fast_backoff(),
         keepalive_interval: None,
         events: None,
+        appends: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
 
@@ -263,6 +266,7 @@ async fn connection_transitions_surface_as_connected_and_disconnected_events() {
             backoff: fast_backoff(),
             keepalive_interval: None,
             events: Some(events_tx),
+            appends: None,
         };
         (config, events_rx)
     };

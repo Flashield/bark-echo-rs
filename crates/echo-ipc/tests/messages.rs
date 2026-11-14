@@ -68,6 +68,7 @@ fn snapshot_response_round_trips_with_its_request_id() {
                 subscriptions: BTreeMap::from([(
                     "tok-a".to_owned(),
                     SubscriptionRuntime {
+                        label: "desktop".to_owned(),
                         state: StreamState::Running,
                         last_message_id: Some(41),
                         updated_at: 1_700_000_042,
@@ -141,6 +142,7 @@ fn the_snapshot_holds_one_line_per_subscription() {
             (
                 "tok-a".to_owned(),
                 SubscriptionRuntime {
+                    label: "kitchen".to_owned(),
                     state: StreamState::Starting,
                     last_message_id: None,
                     updated_at: 0,
@@ -149,6 +151,7 @@ fn the_snapshot_holds_one_line_per_subscription() {
             (
                 "tok-b".to_owned(),
                 SubscriptionRuntime {
+                    label: "desktop".to_owned(),
                     state: StreamState::Running,
                     last_message_id: Some(7),
                     updated_at: 0,
@@ -159,6 +162,22 @@ fn the_snapshot_holds_one_line_per_subscription() {
     assert_eq!(snapshot.subscriptions.len(), 2);
     assert_eq!(snapshot.subscriptions["tok-b"].state, StreamState::Running);
     assert_eq!(snapshot.subscriptions["tok-a"].last_message_id, None);
+    // The label rides the snapshot (ticket #11): a fresh client can name
+    // every line without touching the config.
+    assert_eq!(snapshot.subscriptions["tok-b"].label, "desktop");
+    assert_eq!(snapshot.subscriptions["tok-a"].label, "kitchen");
+}
+
+#[test]
+fn a_state_file_written_before_labels_still_parses() {
+    // The runtime state file is the snapshot's persisted face; files
+    // from before ticket #11 lack the label. Graceful default, not an
+    // error — the next daemon run rewrites them.
+    let runtime: SubscriptionRuntime =
+        serde_json::from_str(r#"{"state":{"kind":"running"},"last_message_id":7,"updated_at":0}"#)
+            .expect("parse a pre-label line");
+    assert_eq!(runtime.label, "");
+    assert_eq!(runtime.state, StreamState::Running);
 }
 
 #[test]

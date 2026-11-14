@@ -76,11 +76,14 @@ pub struct StateWriter {
 
 impl StateWriter {
     /// Create (or overwrite) the state file at `path` for a fresh daemon
-    /// run: every listed Subscription starts as [`StreamState::Starting`].
+    /// run: every listed `(id, label)` starts as
+    /// [`StreamState::Starting`]. The label rides the snapshot (ticket
+    /// #11) so channel clients — the Tray Menu — can name each line
+    /// without touching the config.
     pub fn create(
         path: &Path,
         pid: u32,
-        subscription_ids: &[String],
+        subscriptions: &[(String, String)],
     ) -> Result<StateWriter, StateError> {
         let now = unix_now();
         let writer = StateWriter {
@@ -88,12 +91,13 @@ impl StateWriter {
             state: Mutex::new(DaemonState {
                 pid,
                 started_at: now,
-                subscriptions: subscription_ids
+                subscriptions: subscriptions
                     .iter()
-                    .map(|id| {
+                    .map(|(id, label)| {
                         (
                             id.clone(),
                             SubscriptionRuntime {
+                                label: label.clone(),
                                 state: StreamState::Starting,
                                 last_message_id: None,
                                 updated_at: now,

@@ -112,7 +112,12 @@ pub async fn run(
     let state = Arc::new(StateWriter::create(
         &spec.paths.state_file(),
         std::process::id(),
-        &ids,
+        &spec
+            .config
+            .subscriptions
+            .iter()
+            .map(|subscription| (subscription.id.clone(), subscription.label.clone()))
+            .collect::<Vec<_>>(),
     )?);
 
     // The IPC Channel hangs beside the lock (ADR-0004): while the run
@@ -124,6 +129,12 @@ pub async fn run(
         path: endpoint.to_string(),
         source,
     })?;
+    // The event hub (ticket #11): every state flip and History Log
+    // append the runtime makes is broadcast here, and `serve` relays it
+    // to every connected client. Capacity: a burst of pushes appends a
+    // line each; a client further behind than this is dropped by `serve`
+    // and re-snapshots on reconnect — never served stale.
+    let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
     let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let channel_state = state.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
@@ -131,6 +142,7 @@ pub async fn run(
         async move {
             let _ = channel_stop_rx.await;
         },
+        event_hub.clone(),
         move |request| {
             let state = channel_state.clone();
             async move {
@@ -168,7 +180,9 @@ pub async fn run(
                 // the others still must. Record and move on.
                 record(
                     &state,
+                    &event_hub,
                     &subscription.id,
+                    &subscription.label,
                     StreamState::Failed {
                         detail: err.to_string(),
                     },
@@ -190,7 +204,9 @@ pub async fn run(
             Err(err) => {
                 record(
                     &state,
+                    &event_hub,
                     &subscription.id,
+                    &subscription.label,
                     StreamState::Failed {
                         detail: err.to_string(),
                     },
@@ -200,6 +216,7 @@ pub async fn run(
         };
 
         let (events_tx, events_rx) = mpsc::channel(64);
+        let (appends_tx, appends_rx) = mpsc::channel(64);
         let config = StreamConfig {
             base_url: subscription.server.clone(),
             stream_token: secret,
@@ -210,15 +227,21 @@ pub async fn run(
             // watchdog declares a silent connection dead at 45 s.
             keepalive_interval: Some(std::time::Duration::from_secs(15)),
             events: Some(events_tx),
+            appends: Some(appends_tx),
         };
         let (handle, intents) = RealtimeStream::spawn(config);
         supervisors.push(tokio::spawn(supervise(
-            subscription.id.clone(),
+            Supervised {
+                id: subscription.id.clone(),
+                label: subscription.label.clone(),
+                state: state.clone(),
+                renderer: spec.renderer.clone(),
+                event_hub: event_hub.clone(),
+            },
             handle,
             intents,
             events_rx,
-            state.clone(),
-            spec.renderer.clone(),
+            appends_rx,
             fence_rx,
         )));
     }
@@ -269,27 +292,78 @@ pub async fn run(
 /// either the fence (shutdown) or the loop's own end. A self-ended loop
 /// is classified into its terminal state — token invalid means
 /// re-subscribe, never retry.
-async fn supervise(
+/// Everything one supervised Subscription's loop touches beyond its
+/// stream channels: who it is (id, label — the channel's and the
+/// snapshot's name for it), where its flips are recorded, what renders
+/// its intents, and which hub hears its flips and appends (ticket #11).
+struct Supervised {
+    /// The Subscription's id (its Stream Token's `token_id`).
     id: String,
+    /// The Subscription's client label.
+    label: String,
+    /// The state file writer the flips are recorded into.
+    state: Arc<StateWriter>,
+    /// The renderer the intents flow into.
+    renderer: Arc<dyn NotificationRenderer>,
+    /// The channel's event hub the flips and appends are announced on.
+    event_hub: tokio::sync::broadcast::Sender<echo_ipc::Event>,
+}
+
+/// One Subscription's runtime: forward the stream's intents into the
+/// renderer, its connection-state changes into the state file — each
+/// flip announced on the channel as it is recorded — and its History
+/// Log appends onto the channel as events, until either the fence
+/// (shutdown) or the loop's own end. A self-ended loop is classified
+/// into its terminal state — token invalid means re-subscribe, never
+/// retry.
+async fn supervise(
+    subscription: Supervised,
     handle: echo_core::stream::StreamHandle,
     mut intents: mpsc::Receiver<NotificationIntent>,
     mut events: mpsc::Receiver<StreamEvent>,
-    state: Arc<StateWriter>,
-    renderer: Arc<dyn NotificationRenderer>,
+    mut appends: mpsc::Receiver<NotificationIntent>,
     mut fence: mpsc::Receiver<()>,
 ) {
+    let Supervised {
+        id,
+        label,
+        state,
+        renderer,
+        event_hub,
+    } = subscription;
     loop {
         tokio::select! {
             _ = fence.recv() => break,
             change = events.recv() => match change {
                 Some(StreamEvent::Connected) => {
-                    record(&state, &id, StreamState::Running);
+                    record(&state, &event_hub, &id, &label, StreamState::Running);
                 }
                 Some(StreamEvent::Disconnected { detail }) => {
-                    record(&state, &id, StreamState::Disconnected { detail });
+                    record(
+                        &state,
+                        &event_hub,
+                        &id,
+                        &label,
+                        StreamState::Disconnected { detail },
+                    );
                 }
                 // The loop ended by itself; the terminal state is
                 // resolved below.
+                None => break,
+            },
+            // The core announces an append only after the line is durably
+            // on disk (echo-core's own rule); relaying it here makes the
+            // channel's event the line's echo (ticket #11).
+            appended = appends.recv() => match appended {
+                Some(entry) => {
+                    let _ = event_hub.send(echo_ipc::Event::HistoryAppended {
+                        subscription_id: id.clone(),
+                        label: label.clone(),
+                        entry,
+                    });
+                }
+                // The receive loop is gone; its state close follows on the
+                // events channel (both senders live in that task).
                 None => break,
             },
             intent = intents.recv() => match intent {
@@ -316,12 +390,14 @@ async fn supervise(
         StreamEnd::TokenInvalid => {
             // 401 `stream token invalid` (§5): actionable, not retryable
             // (spec story 21).
-            record(&state, &id, StreamState::TokenInvalid);
+            record(&state, &event_hub, &id, &label, StreamState::TokenInvalid);
         }
         StreamEnd::AuthRejected { status, message } => {
             record(
                 &state,
+                &event_hub,
                 &id,
+                &label,
                 StreamState::Failed {
                     detail: format!("the server rejected the credentials ({status}): {message}"),
                 },
@@ -330,7 +406,9 @@ async fn supervise(
         StreamEnd::HistoryWriteFailed(err) => {
             record(
                 &state,
+                &event_hub,
                 &id,
+                &label,
                 StreamState::Failed {
                     detail: format!("history log write failed: {err}"),
                 },
@@ -342,10 +420,25 @@ async fn supervise(
     }
 }
 
-/// Record a state change, tolerating a persist hiccup (the daemon keeps
-/// running; `status` may lag).
-fn record(state: &StateWriter, id: &str, change: StreamState) {
-    if let Err(err) = state.set(id, change) {
+/// Record a state change and announce the flip on the channel — the
+/// Tray Menu learns a flip at the moment the runtime records it, not at
+/// its next poll (ticket #11). Tolerates a persist hiccup (the daemon
+/// keeps running; `status` may lag); the announcement is best-effort —
+/// a moment with no listeners costs nothing, the opening snapshot
+/// covers a fresh client.
+fn record(
+    state: &StateWriter,
+    events: &tokio::sync::broadcast::Sender<echo_ipc::Event>,
+    id: &str,
+    label: &str,
+    change: StreamState,
+) {
+    if let Err(err) = state.set(id, change.clone()) {
         eprintln!("state file update failed: {err}");
     }
+    let _ = events.send(echo_ipc::Event::StreamState {
+        subscription_id: id.to_owned(),
+        label: label.to_owned(),
+        state: change,
+    });
 }

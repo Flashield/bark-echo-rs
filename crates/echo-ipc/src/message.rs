@@ -116,6 +116,12 @@ pub struct StatusSnapshot {
 /// One Subscription's runtime line in the snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionRuntime {
+    /// The Subscription's client label — the Tray Menu's line name
+    /// (ticket #11). `#[serde(default)]` because state files written
+    /// before labels rode the snapshot must still parse; the next daemon
+    /// run rewrites them with labels.
+    #[serde(default)]
+    pub label: String,
     /// How the stream is doing right now.
     pub state: StreamState,
     /// The id of the last processed notification — the History Log's

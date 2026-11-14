@@ -50,6 +50,7 @@ async fn info_reports_the_live_statistics_the_status_face_needs() {
         backoff: echo_core::stream::BackoffConfig::default(),
         keepalive_interval: None,
         events: None,
+        appends: None,
     };
     let (_handle, _intents) = echo_core::stream::RealtimeStream::spawn(config);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

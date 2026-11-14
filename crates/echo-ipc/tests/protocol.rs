@@ -27,6 +27,7 @@ fn canned_snapshot() -> StatusSnapshot {
         subscriptions: BTreeMap::from([(
             "tok".to_owned(),
             SubscriptionRuntime {
+                label: "desktop".to_owned(),
                 state: StreamState::Running,
                 last_message_id: Some(7),
                 updated_at: 1_700_000_042,
