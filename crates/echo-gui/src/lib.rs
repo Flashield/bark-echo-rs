@@ -12,6 +12,7 @@ pub mod app;
 pub mod connection;
 pub mod fonts;
 pub mod model;
+pub mod shutdown;
 pub mod tray;
 
 pub use app::run;

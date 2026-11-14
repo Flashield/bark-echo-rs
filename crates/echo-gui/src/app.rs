@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use echo_ipc::Endpoint;
@@ -16,6 +16,7 @@ use echo_ipc::Endpoint;
 use crate::connection::{UiMsg, spawn_connection_loop};
 use crate::fonts;
 use crate::model::TrayModel;
+use crate::shutdown::{QUIT_BUDGET, QuitOutcome, spawn_quit};
 use crate::tray::TrayMenu;
 
 /// How soon the shell wakes again when nothing happens: menu clicks and
@@ -41,7 +42,7 @@ pub enum GuiError {
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_connection_loop(endpoint, sender, stop.clone());
+    spawn_connection_loop(endpoint.clone(), sender.clone(), stop.clone());
 
     let options = eframe::NativeOptions {
         // Tray-only: no window yet — the Tray Menu is the whole surface
@@ -77,7 +78,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, stop)))
+            Ok(Box::new(TrayApp::new(receiver, sender, endpoint, stop)))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))
@@ -86,8 +87,19 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
 /// The shell: the model's owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
+    /// The queue Quit's exchange answers into — the same one the
+    /// connection loop paints from.
+    sender: Sender<UiMsg>,
+    /// The channel endpoint, kept for the Quit exchange's one-shot
+    /// connection (the connection loop's connection belongs to its
+    /// watching job, not to Quit's).
+    endpoint: Endpoint,
     stop: Arc<AtomicBool>,
     model: TrayModel,
+    /// Set by the first Quit click: the exchange runs, the reconnect
+    /// loop is told to stand down, further clicks and channel news are
+    /// drained without effect.
+    quitting: bool,
     /// Built on the first update, not in the constructor: macOS wants
     /// the tray created while the event loop is already running
     /// (tray-icon's platform note; winit's earliest safe point), and
@@ -97,11 +109,19 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(receiver: Receiver<UiMsg>, stop: Arc<AtomicBool>) -> Self {
+    fn new(
+        receiver: Receiver<UiMsg>,
+        sender: Sender<UiMsg>,
+        endpoint: Endpoint,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             receiver,
+            sender,
+            endpoint,
             stop,
             model: TrayModel::connecting(),
+            quitting: false,
             tray: None,
         }
     }
@@ -136,10 +156,33 @@ impl eframe::App for TrayApp {
             }
         }
 
-        // The channel's news, all of it, into the model.
+        // The channel's news, all of it, into the model — or drained
+        // without effect once Quit is underway: the connection loop is
+        // winding down behind the stop flag, and nothing it says can
+        // matter to a tray on its way out.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
+                UiMsg::ShutdownOutcome(outcome) => {
+                    // Quit's last word — honest about what the daemon
+                    // said, and the GUI exits either way (ticket #12:
+                    // a stuck or dead daemon must not hold the tray
+                    // hostage).
+                    match outcome {
+                        QuitOutcome::Confirmed => {}
+                        QuitOutcome::DaemonAbsent => {
+                            eprintln!("no daemon answered the quit request; the Tray Menu exits")
+                        }
+                        QuitOutcome::Unconfirmed => eprintln!(
+                            "the daemon did not confirm a graceful shutdown within {:?}; \
+                             the Tray Menu exits anyway",
+                            QUIT_BUDGET
+                        ),
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                _ if self.quitting => {}
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
                     dirty = true;
@@ -161,16 +204,45 @@ impl eframe::App for TrayApp {
             eprintln!("the tray menu could not refresh: {err}");
         }
 
-        // The user's clicks, all of them.
-        if let Some(tray) = &self.tray {
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                if tray.is_quit(&event) {
-                    // Ticket #11's Quit: exit the GUI process. Asking
-                    // the daemon for a graceful shutdown is #12.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                } else if tray.is_open_management(&event) {
-                    // Placeholder: the Management Window is ticket #13.
+        // The user's clicks, all of them. The tray's ids are read
+        // through short per-event borrows — a Quit click needs the tray
+        // mutable right after, for the shutting-down refresh.
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            let is_quit = self
+                .tray
+                .as_ref()
+                .map(|tray| tray.is_quit(&event))
+                .unwrap_or(false);
+            let is_open_management = self
+                .tray
+                .as_ref()
+                .map(|tray| tray.is_open_management(&event))
+                .unwrap_or(false);
+            if is_quit {
+                // Quit (ticket #12): ask the daemon for a graceful
+                // shutdown, wait a bounded while for its confirmation,
+                // then exit. The exchange runs on its own thread with
+                // its own one-shot connection — this thread only paints
+                // the state and refuses re-entry: a second Quit click
+                // is the same instruction, not a new one.
+                if !self.quitting {
+                    self.quitting = true;
+                    self.model.quitting();
+                    if let Some(tray) = &mut self.tray
+                        && let Err(err) = tray.refresh(&self.model)
+                    {
+                        eprintln!("the tray menu could not refresh: {err}");
+                    }
+                    // The reconnect loop stands down before the
+                    // exchange starts: its job is watching a daemon
+                    // that is on its way out, and a retry behind Quit's
+                    // back would re-attach to it and paint noise over
+                    // the shutting-down tray.
+                    self.stop.store(true, Ordering::Relaxed);
+                    spawn_quit(self.endpoint.clone(), self.sender.clone());
                 }
+            } else if is_open_management {
+                // Placeholder: the Management Window is ticket #13.
             }
         }
 
