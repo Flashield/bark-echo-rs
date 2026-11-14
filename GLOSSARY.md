@@ -23,3 +23,20 @@ A one-shot fetch of a Subscription's retained Messages from the server's
 store-and-forward store (replay from a chosen cursor), landed in the
 History Log without notifications.
 _Avoid_: sync, backfill, fetch
+
+**Tray Menu**:
+The GUI's always-available system-tray presence: a glance at each
+Subscription's stream state plus the quick actions (open the Management
+Window, quit).
+_Avoid_: status icon, systray app, quick menu
+
+**Management Window**:
+The GUI window for managing Subscriptions (add/list/remove), watching
+each Realtime Stream's live state, and browsing a Subscription's
+History Log.
+_Avoid_: dashboard, main window, settings panel
+
+**Push Composer**:
+The GUI form that sends a Push, mirroring the `push` command's fields
+and its Ext Param passthrough.
+_Avoid_: send dialog, push form, quick send
