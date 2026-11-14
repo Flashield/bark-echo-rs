@@ -14,7 +14,9 @@ pub mod fonts;
 pub mod model;
 pub mod shutdown;
 pub mod tray;
+pub mod window;
 
 pub use app::run;
 pub use connection::UiMsg;
 pub use model::{LinkState, MenuItem, SubscriptionLine, TrayModel};
+pub use window::{RowView, WindowModel};

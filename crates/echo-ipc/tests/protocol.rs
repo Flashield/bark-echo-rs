@@ -31,6 +31,8 @@ fn canned_snapshot() -> StatusSnapshot {
                 state: StreamState::Running,
                 last_message_id: Some(7),
                 updated_at: 1_700_000_042,
+                server: "http://127.0.0.1:8080".to_owned(),
+                token_hint: "abcdef123456...".to_owned(),
             },
         )]),
     }
