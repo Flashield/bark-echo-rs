@@ -15,6 +15,7 @@ use echo_core::server::ServerClient;
 use echo_daemon::auth;
 use echo_daemon::config::Config;
 use echo_daemon::history;
+use echo_daemon::lock::DaemonLock;
 use echo_daemon::notify::DesktopRenderer;
 use echo_daemon::paths::Paths;
 use echo_daemon::run::{self, DaemonSpec};
@@ -292,29 +293,45 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Operator Basic Auth (§1.4, story 18): the client presents
                 // the credentials for minting; `add` then stores the
                 // password and lays the user + marker into the config.
-                let client = ServerClient::new(&server);
-                let client = match (&auth_user, &auth_password) {
-                    (None, None) => client,
-                    (user, password) => client.with_basic_auth(
-                        user.clone().unwrap_or_default(),
-                        password.clone().unwrap_or_default(),
-                    ),
-                };
                 let auth = (auth_user.is_some() || auth_password.is_some()).then(|| {
                     echo_core::stream::BasicAuth {
-                        user: auth_user.unwrap_or_default(),
-                        password: auth_password.unwrap_or_default(),
+                        user: auth_user.clone().unwrap_or_default(),
+                        password: auth_password.clone().unwrap_or_default(),
                     }
                 });
-                let added =
-                    subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
-                        .await?;
-                config.save(&paths.config_file())?;
-                println!("device key: {}", added.device_key);
-                println!(
-                    "subscription {} added (label: {}, token hint: {})",
-                    added.subscription.id, added.subscription.label, added.subscription.token_hint
-                );
+                // A daemon holding the lock is the single writer
+                // (ADR-0004): the change rides the channel and takes
+                // effect without a restart. Without a daemon, today's
+                // direct-write path stands (spec story 21).
+                if DaemonLock::probe(&paths.lock_file())? {
+                    let added =
+                        subscribe::add_via_channel(&paths, &server, source, &label, auth).await?;
+                    println!("device key: {}", added.device_key);
+                    println!(
+                        "subscription {} added (label: {}, token hint: {})",
+                        added.id, added.label, added.token_hint
+                    );
+                } else {
+                    let client = ServerClient::new(&server);
+                    let client = match (&auth_user, &auth_password) {
+                        (None, None) => client,
+                        (user, password) => client.with_basic_auth(
+                            user.clone().unwrap_or_default(),
+                            password.clone().unwrap_or_default(),
+                        ),
+                    };
+                    let added =
+                        subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
+                            .await?;
+                    config.save(&paths.config_file())?;
+                    println!("device key: {}", added.device_key);
+                    println!(
+                        "subscription {} added (label: {}, token hint: {})",
+                        added.subscription.id,
+                        added.subscription.label,
+                        added.subscription.token_hint
+                    );
+                }
             }
             SubscribeCommand::List => {
                 let subscriptions = subscribe::list(&config);
@@ -332,12 +349,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             SubscribeCommand::Rm { id } => {
-                let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
-                config.save(&paths.config_file())?;
-                println!(
-                    "subscription {} removed (label: {})",
-                    removed.id, removed.label
-                );
+                // The same lock-held fork as `add` (ADR-0004): the
+                // daemon applies the removal hot when it holds the
+                // lock; the direct write otherwise.
+                if DaemonLock::probe(&paths.lock_file())? {
+                    let removed = subscribe::remove_via_channel(&paths, &id).await?;
+                    println!(
+                        "subscription {} removed (label: {})",
+                        removed.id, removed.label
+                    );
+                } else {
+                    let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
+                    config.save(&paths.config_file())?;
+                    println!(
+                        "subscription {} removed (label: {})",
+                        removed.id, removed.label
+                    );
+                }
             }
         },
         Command::Token { command } => match command {

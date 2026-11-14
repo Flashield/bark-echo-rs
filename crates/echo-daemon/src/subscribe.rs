@@ -3,10 +3,18 @@
 //! config (ADR-0001), the secret store, and the server's Device/Token
 //! plane. Files and process output stay with the caller (the CLI); this
 //! module owns the *what*, not the *where*.
+//!
+//! When a daemon holds the single-instance lock, add and remove ride
+//! the IPC Channel instead (ticket #14, ADR-0004): the daemon is the
+//! single writer and applies the change hot. Without a daemon, the
+//! caller keeps today's direct-write path.
+
+use std::time::{Duration, Instant};
 
 use echo_core::server::{ServerClient, ServerError};
 
 use crate::config::{Config, Subscription};
+use crate::paths::Paths;
 use crate::secrets::{SecretError, SecretKey, SecretKind, SecretStore};
 
 /// Where a new Subscription's Device comes from (GLOSSARY.md: one
@@ -125,4 +133,96 @@ pub fn remove(
 /// First 8 characters + `...` — matches the config's `device_hint` shape.
 fn device_hint(device_key: &str) -> String {
     format!("{}...", &device_key[..device_key.len().min(8)])
+}
+
+/// How long a channel ride waits for the daemon to answer: long enough
+/// to absorb a starting daemon (the lock is held a beat before the
+/// endpoint is bound), short enough to stay snappy — the budget
+/// `status` rides with, and one attempt's cap so a wedged daemon
+/// cannot wedge the command.
+const CHANNEL_BUDGET: Duration = Duration::from_secs(2);
+const CHANNEL_ATTEMPT: Duration = Duration::from_secs(1);
+const CHANNEL_RETRY: Duration = Duration::from_millis(50);
+
+/// Why a channel ride failed (ticket #14). The daemon's own refusals
+/// come through as [`IpcError::Rejected`] carrying its message — the
+/// actionable part, printed as-is.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    /// A daemon holds the lock, but the channel did not answer within
+    /// the budget. Falling through to the direct write would race the
+    /// single writer, so the command fails instead — stop that daemon
+    /// or retry.
+    #[error(
+        "a daemon holds the lock but its IPC channel did not answer — \
+         stop that instance or retry"
+    )]
+    Unreachable,
+    /// The exchange itself failed (a refusal, a protocol break, a
+    /// transport error).
+    #[error(transparent)]
+    Ipc(#[from] echo_ipc::IpcError),
+}
+
+/// `subscribe add` when a daemon holds the lock (ticket #14): the
+/// request rides the IPC Channel and the daemon — the single writer —
+/// applies it hot, answering once the supervisor is up. The wire shape
+/// is the CLI flags' exact face (`--own` / `--device-key`, the label,
+/// the optional Basic Auth credentials).
+pub async fn add_via_channel(
+    paths: &Paths,
+    server: &str,
+    source: AddSource,
+    label: &str,
+    auth: Option<echo_core::stream::BasicAuth>,
+) -> Result<echo_ipc::message::AddedSubscription, ChannelError> {
+    let wire_source = match source {
+        AddSource::Own => echo_ipc::message::AddSource::Own,
+        AddSource::DeviceKey(device_key) => echo_ipc::message::AddSource::DeviceKey { device_key },
+    };
+    let wire_auth = auth.map(|credentials| echo_ipc::message::BasicAuthCredentials {
+        user: credentials.user,
+        password: credentials.password,
+    });
+    let endpoint = paths.ipc_endpoint();
+    let deadline = Instant::now() + CHANNEL_BUDGET;
+    loop {
+        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
+            let mut client = echo_ipc::Client::connect(&endpoint).await?;
+            client
+                .subscribe_add(server, wire_source.clone(), label, wire_auth.clone())
+                .await
+        });
+        match attempt.await {
+            Ok(Ok(added)) => return Ok(added),
+            // The daemon refused and said why (a bad Device Key, a
+            // refused label, ...): retrying cannot change the answer.
+            Ok(Err(err @ echo_ipc::IpcError::Rejected(_))) => return Err(err.into()),
+            _ if Instant::now() >= deadline => return Err(ChannelError::Unreachable),
+            _ => tokio::time::sleep(CHANNEL_RETRY).await,
+        }
+    }
+}
+
+/// `subscribe rm` when a daemon holds the lock (ticket #14): the
+/// request rides the IPC Channel; the daemon stops that stream, erases
+/// the secrets, and updates the config before answering.
+pub async fn remove_via_channel(
+    paths: &Paths,
+    id: &str,
+) -> Result<echo_ipc::message::RemovedSubscription, ChannelError> {
+    let endpoint = paths.ipc_endpoint();
+    let deadline = Instant::now() + CHANNEL_BUDGET;
+    loop {
+        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
+            let mut client = echo_ipc::Client::connect(&endpoint).await?;
+            client.subscribe_remove(id).await
+        });
+        match attempt.await {
+            Ok(Ok(removed)) => return Ok(removed),
+            Ok(Err(err @ echo_ipc::IpcError::Rejected(_))) => return Err(err.into()),
+            _ if Instant::now() >= deadline => return Err(ChannelError::Unreachable),
+            _ => tokio::time::sleep(CHANNEL_RETRY).await,
+        }
+    }
 }
