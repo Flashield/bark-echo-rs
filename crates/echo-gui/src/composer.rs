@@ -119,18 +119,16 @@ impl ComposerModel {
             label,
             ..
         } = event
-        {
-            if !self
+            && !self
                 .subscriptions
                 .iter()
                 .any(|line| line.id == *subscription_id)
-            {
-                self.subscriptions.push(ComposerSubscription {
-                    id: subscription_id.clone(),
-                    label: label.clone(),
-                    server: String::new(),
-                });
-            }
+        {
+            self.subscriptions.push(ComposerSubscription {
+                id: subscription_id.clone(),
+                label: label.clone(),
+                server: String::new(),
+            });
         }
     }
 
@@ -241,6 +239,12 @@ impl ComposerModel {
             ),
             SendState::Failed(message) => (message.clone(), egui::Color32::LIGHT_RED),
         }
+    }
+}
+
+impl Default for ComposerModel {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

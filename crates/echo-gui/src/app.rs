@@ -68,7 +68,12 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     // The endpoint and sender ride on: the Quit exchange (ticket #12)
     // opens its own one-shot connection and paints through the same
     // queue the connection loop uses.
-    spawn_connection_loop(endpoint.clone(), sender.clone(), request_receiver, stop.clone());
+    spawn_connection_loop(
+        endpoint.clone(),
+        sender.clone(),
+        request_receiver,
+        stop.clone(),
+    );
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
@@ -109,7 +114,9 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, requests, sender, endpoint, stop)))
+            Ok(Box::new(TrayApp::new(
+                receiver, requests, sender, endpoint, stop,
+            )))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))

@@ -9,11 +9,15 @@ edition.workspace = true
 # them), default features off because the default renderer is wgpu.
 # `accesskit` and `default_fonts` are eframe defaults kept on purpose:
 # accessibility is part of the choice, and the CJK fallback in fonts.rs
-# builds on the bundled defaults.
+# builds on the bundled defaults. `system_fonts` is the ADR-0003 second
+# layer — the on-demand per-missing-glyph loader covering what the one
+# startup font file misses (the startup load stays the deterministic
+# foundation).
 eframe = { version = "0.37", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
+    "system_fonts",
     "wayland",
     "x11",
 ] }

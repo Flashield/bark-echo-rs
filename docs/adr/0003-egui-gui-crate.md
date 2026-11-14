@@ -31,7 +31,13 @@ stalled for a year with no external stability contract. Research:
   the explicit startup load stays the deterministic foundation (the
   first frame renders user-defined Subscription labels from a font the
   GUI chose), with the on-demand loader covering what one font file
-  misses.
+  misses. The feature is enabled (without it the loader is a warning
+  stub, and machines whose CJK font sits outside the startup
+  candidates' paths — Debian's `fonts-droid-fallback`, for one — would
+  show tofu). It costs no system-library dependency: its Linux font
+  discovery (fontique) reaches fontconfig through `dlopen`, so a
+  machine without fontconfig degrades to the startup font, never to a
+  binary that does not start.
 - The tray/notification stack is tray-icon + muda + notify-rust
   regardless of this choice; the Windows toast click action remains an
   AUMID + COM activation registration work item (windows-rs), not a

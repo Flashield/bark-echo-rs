@@ -39,8 +39,9 @@ pub fn cjk_font_candidates() -> &'static [&'static str] {
 /// Platform fact: Linux has no one CJK font path — distributions differ
 /// in packaging (Debian's `fonts-noto-cjk` lands under
 /// `opentype/noto`, Fedora's under `noto-cjk`; WenQuanYi and AR PL are
-/// the common lightweight alternatives). Every plausible location of a
-/// desktop install's CJK font is a candidate.
+/// the common lightweight alternatives, and Debian's
+/// `fonts-droid-fallback` lands under `truetype/droid`). Every
+/// plausible location of a desktop install's CJK font is a candidate.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn cjk_font_candidates() -> &'static [&'static str] {
     &[
@@ -49,6 +50,7 @@ pub fn cjk_font_candidates() -> &'static [&'static str] {
         "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     ]
 }
 
