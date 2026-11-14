@@ -4,7 +4,12 @@ The GUI stage's local channel (ADR-0002) carries one JSON Lines
 connection per client — the GUI, and the CLI's live queries. Requests
 and responses carry an id; daemon-pushed events carry none. Openings are
 snapshot requests; changes (a stream state flip, a History Log append)
-arrive unsolicited. The daemon is the only writer of bark-echo state:
+arrive unsolicited. Since ticket #13 the status snapshot's
+per-Subscription lines also carry the Subscription list's public
+identity (label, server URL, token hint — the config's non-secret
+fields), so the GUI's opening is the one `status` request; a separate
+list snapshot never became a message type. The daemon is the only
+writer of bark-echo state:
 while it runs, `subscribe add/rm` from the GUI and the CLI ride the IPC
 Channel and take effect immediately (it mutates the Subscription list,
 its secrets, and starts/stops that stream's supervisor); with no daemon
