@@ -7,6 +7,9 @@ edition.workspace = true
 # The GUI is a thin renderer over the echo-ipc client's state (ADR-0004,
 # spec Testing Decisions: "echo-gui gets no seam — GUI logic is an
 # echo-ipc client state machine covered by the IPC seam").
+# egui 0.37 per ADR-0003 (the renderer and text stack; the eframe shell
+# arrives with the app crate slice and unifies on this version).
+egui = "0.37"
 echo-ipc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

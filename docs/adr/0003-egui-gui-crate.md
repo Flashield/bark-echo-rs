@@ -25,7 +25,13 @@ stalled for a year with no external stability contract. Research:
 - egui ships no CJK glyphs by default: system fonts are loaded
   explicitly, and typing Chinese into the Push Composer is a first-week
   acceptance test on all three platforms (Linux Wayland IME has a known
-  regression, egui#5544 — dev boxes run X11/XWayland).
+  regression, egui#5544 — dev boxes run X11/XWayland). Since the choice
+  was made, eframe 0.37 grew on-demand system font loading per missing
+  glyph (the `system_fonts` feature, `system_font_fallback: true`) —
+  the explicit startup load stays the deterministic foundation (the
+  first frame renders user-defined Subscription labels from a font the
+  GUI chose), with the on-demand loader covering what one font file
+  misses.
 - The tray/notification stack is tray-icon + muda + notify-rust
   regardless of this choice; the Windows toast click action remains an
   AUMID + COM activation registration work item (windows-rs), not a

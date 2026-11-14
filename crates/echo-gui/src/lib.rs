@@ -6,6 +6,7 @@
 //! runtime.
 
 pub mod connection;
+pub mod fonts;
 pub mod model;
 
 pub use connection::UiMsg;
