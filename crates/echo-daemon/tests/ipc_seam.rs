@@ -185,6 +185,21 @@ async fn the_channel_answers_with_the_live_per_subscription_state() {
         "nothing has been processed yet"
     );
 
+    // The line carries the Subscription's public identity (ticket #13):
+    // the Management Window lists label / server / token hint matching
+    // the persisted config, and the GUI touches no bark-echo files
+    // (ADR-0004) — so the channel must deliver them.
+    let line = &snapshot.subscriptions[&token_id];
+    let config = env
+        .config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.id == token_id)
+        .expect("the configured subscription");
+    assert_eq!(line.label, config.label);
+    assert_eq!(line.server, config.server);
+    assert_eq!(line.token_hint, config.token_hint);
+
     // A push lands; the channel's cursor follows the daemon's live
     // state — and agrees with the state file's cursor.
     push_to(&server, &device_key, "through the channel").await;

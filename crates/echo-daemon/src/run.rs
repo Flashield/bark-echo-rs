@@ -112,12 +112,7 @@ pub async fn run(
     let state = Arc::new(StateWriter::create(
         &spec.paths.state_file(),
         std::process::id(),
-        &spec
-            .config
-            .subscriptions
-            .iter()
-            .map(|subscription| (subscription.id.clone(), subscription.label.clone()))
-            .collect::<Vec<_>>(),
+        &spec.config.subscriptions,
     )?);
 
     // The IPC Channel hangs beside the lock (ADR-0004): while the run

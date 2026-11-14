@@ -76,14 +76,17 @@ pub struct StateWriter {
 
 impl StateWriter {
     /// Create (or overwrite) the state file at `path` for a fresh daemon
-    /// run: every listed `(id, label)` starts as
+    /// run: every listed Subscription starts as
     /// [`StreamState::Starting`]. The label rides the snapshot (ticket
-    /// #11) so channel clients — the Tray Menu — can name each line
-    /// without touching the config.
+    /// #11) so channel clients — the Tray Menu — can name each line,
+    /// and the public identity (server URL, token hint) rides with it
+    /// (ticket #13) so the Management Window lists the Subscription as
+    /// configured — all of it the config's non-secret fields; the
+    /// secrets behind the hints stay out of the file and the channel.
     pub fn create(
         path: &Path,
         pid: u32,
-        subscriptions: &[(String, String)],
+        subscriptions: &[crate::config::Subscription],
     ) -> Result<StateWriter, StateError> {
         let now = unix_now();
         let writer = StateWriter {
@@ -93,14 +96,16 @@ impl StateWriter {
                 started_at: now,
                 subscriptions: subscriptions
                     .iter()
-                    .map(|(id, label)| {
+                    .map(|subscription| {
                         (
-                            id.clone(),
+                            subscription.id.clone(),
                             SubscriptionRuntime {
-                                label: label.clone(),
+                                label: subscription.label.clone(),
                                 state: StreamState::Starting,
                                 last_message_id: None,
                                 updated_at: now,
+                                server: subscription.server.clone(),
+                                token_hint: subscription.token_hint.clone(),
                             },
                         )
                     })

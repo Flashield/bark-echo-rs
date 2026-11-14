@@ -174,8 +174,14 @@ fn the_snapshot_holds_one_line_per_subscription() {
     assert_eq!(snapshot.subscriptions["tok-a"].label, "kitchen");
     // And so does the public identity (ticket #13): server URL and token
     // hint for the Management Window's list.
-    assert_eq!(snapshot.subscriptions["tok-b"].server, "https://api.day.app");
-    assert_eq!(snapshot.subscriptions["tok-b"].token_hint, "fed654321098...");
+    assert_eq!(
+        snapshot.subscriptions["tok-b"].server,
+        "https://api.day.app"
+    );
+    assert_eq!(
+        snapshot.subscriptions["tok-b"].token_hint,
+        "fed654321098..."
+    );
 }
 
 #[test]
@@ -216,7 +222,10 @@ fn a_state_file_written_before_the_public_identity_still_parses() {
         serde_json::from_str(r#"{"state":{"kind":"running"},"last_message_id":7,"updated_at":0}"#)
             .expect("parse a pre-identity line");
     assert_eq!(runtime.label, "");
-    assert_eq!(runtime.server, "", "absent identity defaults empty, never invented");
+    assert_eq!(
+        runtime.server, "",
+        "absent identity defaults empty, never invented"
+    );
     assert_eq!(runtime.token_hint, "");
     assert_eq!(runtime.state, StreamState::Running);
 }

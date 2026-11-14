@@ -3,7 +3,20 @@
 //! atomically on every change, rendered by `status` alongside the live
 //! server statistics.
 
+use echo_daemon::config::Subscription;
 use echo_daemon::state::{StateFile, StateWriter, StreamState};
+
+/// One configured Subscription: the writer's input (its public identity
+/// is what the state file carries).
+fn subscription(id: &str, label: &str) -> Subscription {
+    Subscription {
+        id: id.to_owned(),
+        server: format!("http://{id}.example.test:8080"),
+        label: label.to_owned(),
+        token_hint: format!("{id}hint..."),
+        device_hint: "devhint...".to_owned(),
+    }
+}
 
 #[test]
 fn a_fresh_writer_starts_every_subscription_as_starting() {
@@ -14,8 +27,8 @@ fn a_fresh_writer_starts_every_subscription_as_starting() {
         &path,
         4242,
         &[
-            ("tok-a".to_owned(), "kitchen".to_owned()),
-            ("tok-b".to_owned(), "desktop".to_owned()),
+            subscription("tok-a", "kitchen"),
+            subscription("tok-b", "desktop"),
         ],
     )
     .expect("create state");
@@ -33,14 +46,22 @@ fn a_fresh_writer_starts_every_subscription_as_starting() {
     let read = StateFile::read(&path).expect("read back").expect("present");
     assert_eq!(read.pid, 4242);
     assert_eq!(read.subscriptions.len(), 2);
+
+    // The public identity rides the file (ticket #13): the Management
+    // Window lists it as configured, without reading the config itself.
+    assert_eq!(
+        read.subscriptions["tok-a"].server,
+        "http://tok-a.example.test:8080"
+    );
+    assert_eq!(read.subscriptions["tok-a"].token_hint, "tok-ahint...");
+    assert_eq!(read.subscriptions["tok-b"].label, "desktop");
 }
 
 #[test]
 fn every_update_persists_atomically_and_reads_back() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("daemon-state.json");
-    let writer =
-        StateWriter::create(&path, 7, &[("tok".to_owned(), "desktop".to_owned())]).expect("create");
+    let writer = StateWriter::create(&path, 7, &[subscription("tok", "desktop")]).expect("create");
 
     writer.set("tok", StreamState::Running).expect("persist");
     let read = StateFile::read(&path).expect("read").expect("present");
