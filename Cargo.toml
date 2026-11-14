@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/echo-core", "crates/echo-daemon"]
+members = ["crates/echo-core", "crates/echo-daemon", "crates/echo-ipc"]
 
 [workspace.package]
 version = "0.1.0"
