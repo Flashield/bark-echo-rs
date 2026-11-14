@@ -53,6 +53,14 @@ pub enum Request {
         /// The Push itself: target, alert fields, Ext Params.
         push: SendPush,
     },
+    // ---- The graceful stop (ticket #12) ----
+    /// Ask the daemon for a graceful shutdown (ticket #12, ADR-0004):
+    /// the Tray Menu's Quit — and any client that can name the wish.
+    /// The daemon answers before it begins stopping, and its graceful
+    /// stop closes every connection; the client reads that close as the
+    /// stop's announcement. The same path a Ctrl-C rides — one
+    /// shutdown vocabulary, not two.
+    Shutdown,
 }
 
 /// One Composer send's content (ticket #16): the fields of the `push`
@@ -133,6 +141,12 @@ pub enum Response {
     },
     /// The live snapshot [`Request::Status`] asked for.
     Status { snapshot: StatusSnapshot },
+    /// The daemon accepted [`Request::Shutdown`] and is beginning its
+    /// graceful stop (ticket #12). The answer leaves first; every
+    /// connection closes as the stop proceeds, and the daemon exits
+    /// with a clean code — one a `Restart=on-failure` /
+    /// `KeepAlive SuccessfulExit=false` supervisor does not resurrect.
+    ShuttingDown,
     /// The request could not be answered as phrased; the message says
     /// what the daemon does know.
     Error { message: String },

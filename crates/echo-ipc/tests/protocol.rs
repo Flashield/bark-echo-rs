@@ -486,3 +486,61 @@ async fn a_send_push_the_daemon_cannot_attempt_is_a_rejected_request() {
 
     shutdown_cleanly(stop_tx, serve_task).await;
 }
+
+#[tokio::test]
+async fn a_shutdown_request_is_answered_and_the_channel_closes_when_the_daemon_stops() {
+    // The Quit contract (ticket #12) at the serve level: the Shutdown
+    // request is answered first — id echoed, `shutting_down` tagged —
+    // and the daemon's stop closes every connection behind it. That
+    // close is the confirmation a Quitting client reads. The fake
+    // handler pulls its own stop behind the answer, the way the real
+    // daemon's run pulls its stop behind the handler's answer; the
+    // beat of delay stands in for the answer reaching the wire first.
+    let (stop_pull_tx, mut stop_pull_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let handler = Box::new(move |request: Request| {
+        let stop_pull_tx = stop_pull_tx.clone();
+        Box::pin(async move {
+            match request {
+                Request::Shutdown => {
+                    tokio::spawn(async move {
+                        let _ = stop_pull_tx.send(());
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    });
+                    Response::ShuttingDown
+                }
+                other => Response::Error {
+                    message: format!("this server does not answer {other:?}"),
+                },
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    });
+    let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
+    let closer = tokio::spawn(async move {
+        let _ = stop_pull_rx.recv().await;
+        let _ = stop_tx.send(());
+    });
+
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    match client.shutdown().await {
+        Ok(()) => {}
+        other => panic!("the daemon accepts the shutdown request: {other:?}"),
+    }
+
+    // The stop closes the channel: the next read is the end of the
+    // stream — an event, a response, anything would mean the daemon is
+    // serving after having accepted a shutdown.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), client.next_event()).await;
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "the channel closes after the shutdown: {outcome:?}"
+    );
+
+    // The serve itself ended cleanly when the fake's stop fired.
+    let _ = closer.await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), serve_task)
+        .await
+        .expect("serve ends after shutdown")
+        .expect("serve task joined");
+    assert!(outcome.is_ok(), "serve must end cleanly: {outcome:?}");
+}

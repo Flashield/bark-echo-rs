@@ -13,6 +13,7 @@ pub mod composer;
 pub mod connection;
 pub mod fonts;
 pub mod model;
+pub mod shutdown;
 pub mod tray;
 pub mod window;
 

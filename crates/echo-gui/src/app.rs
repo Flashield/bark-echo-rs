@@ -16,11 +16,16 @@
 //! `update_logic_only` for a hidden one. So the shell distinguishes the
 //! two asks by its `quitting` flag: a close while not quitting is
 //! cancelled and answered with `Visible(false)`; a close after Quit is
-//! let through.
+//! let through. Quit itself (ticket #12) is an exchange, not a
+//! click-through: the click starts it (`quit_in_progress` — the
+//! reconnect loop stands down, the shutdown request goes out, a
+//! window close still means hide), and the exit close is only sent —
+//! with `quitting` set to let it pass — once the exchange concludes,
+//! whichever way it concluded.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use echo_ipc::Endpoint;
@@ -29,6 +34,7 @@ use crate::composer::ComposerModel;
 use crate::connection::{GuiRequest, UiMsg, spawn_connection_loop};
 use crate::fonts;
 use crate::model::TrayModel;
+use crate::shutdown::{QUIT_BUDGET, QuitOutcome, spawn_quit};
 use crate::tray::TrayMenu;
 use crate::window::{WindowModel, render};
 
@@ -59,7 +65,10 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     // performs them on the one client.
     let (requests, request_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_connection_loop(endpoint, sender, request_receiver, stop.clone());
+    // The endpoint and sender ride on: the Quit exchange (ticket #12)
+    // opens its own one-shot connection and paints through the same
+    // queue the connection loop uses.
+    spawn_connection_loop(endpoint.clone(), sender.clone(), request_receiver, stop.clone());
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
@@ -100,7 +109,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, requests, stop)))
+            Ok(Box::new(TrayApp::new(receiver, requests, sender, endpoint, stop)))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))
@@ -111,7 +120,14 @@ struct TrayApp {
     receiver: Receiver<UiMsg>,
     /// The asks' door to the connection loop — the Composer's send
     /// goes through it (ticket #16); no other component holds a client.
-    requests: std::sync::mpsc::Sender<GuiRequest>,
+    requests: Sender<GuiRequest>,
+    /// The queue Quit's exchange answers into — the same one the
+    /// connection loop paints from.
+    sender: Sender<UiMsg>,
+    /// The channel endpoint, kept for the Quit exchange's one-shot
+    /// connection (the connection loop's connection belongs to its
+    /// watching job, not to Quit's).
+    endpoint: Endpoint,
     stop: Arc<AtomicBool>,
     model: TrayModel,
     /// The Management Window's picture, fed the same connection stream
@@ -126,8 +142,14 @@ struct TrayApp {
     /// the picker's lines from the snapshot, its send's verdicts from
     /// the loop's answers. Its fields persist while the window hides.
     composer: ComposerModel,
-    /// Set by the tray's Quit so the close interception below knows
-    /// this close means exit, not hide.
+    /// Set by the first Quit click (ticket #12): the exchange runs, the
+    /// reconnect loop is told to stand down, further clicks and channel
+    /// news are drained without effect. Not the close-means-exit flag —
+    /// during the exchange a window close still means hide.
+    quit_in_progress: bool,
+    /// Set once the Quit exchange concluded (any outcome — ticket #12):
+    /// the exit close the shell then sends is let through by the close
+    /// interception below, instead of being cancelled and hidden.
     quitting: bool,
     /// Built on the first update, not in the constructor: macOS wants
     /// the tray created while the event loop is already running
@@ -140,16 +162,21 @@ struct TrayApp {
 impl TrayApp {
     fn new(
         receiver: Receiver<UiMsg>,
-        requests: std::sync::mpsc::Sender<GuiRequest>,
+        requests: Sender<GuiRequest>,
+        sender: Sender<UiMsg>,
+        endpoint: Endpoint,
         stop: Arc<AtomicBool>,
     ) -> Self {
         Self {
             receiver,
             requests,
+            sender,
+            endpoint,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
             composer: ComposerModel::new(),
+            quit_in_progress: false,
             quitting: false,
             tray: None,
         }
@@ -187,11 +214,37 @@ impl eframe::App for TrayApp {
 
         // The channel's news, all of it, into the models — the tray's
         // glance, the window's list, and the Composer's picker eat the
-        // same snapshot-then-events stream (they all stay current
-        // while hidden); the Composer's send answers arrive here too.
+        // same snapshot-then-events stream (they all stay current while
+        // hidden); the Composer's send answers arrive here too — or
+        // everything is drained without effect once Quit is underway:
+        // the connection loop is winding down behind the stop flag, and
+        // nothing it says can matter to a shell on its way out.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
+                UiMsg::ShutdownOutcome(outcome) => {
+                    // Quit's last word — honest about what the daemon
+                    // said, and the GUI exits either way (ticket #12:
+                    // a stuck or dead daemon must not hold the tray
+                    // hostage). The conclusion flips the close gate:
+                    // the exit close this sends is the one close the
+                    // interception lets through.
+                    match outcome {
+                        QuitOutcome::Confirmed => {}
+                        QuitOutcome::DaemonAbsent => {
+                            eprintln!("no daemon answered the quit request; the Tray Menu exits")
+                        }
+                        QuitOutcome::Unconfirmed => eprintln!(
+                            "the daemon did not confirm a graceful shutdown within {:?}; \
+                             the Tray Menu exits anyway",
+                            QUIT_BUDGET
+                        ),
+                    }
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                _ if self.quit_in_progress => {}
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
                     self.window.apply_snapshot(&snapshot);
@@ -223,30 +276,62 @@ impl eframe::App for TrayApp {
             eprintln!("the tray menu could not refresh: {err}");
         }
 
-        // The user's clicks, all of them.
-        if let Some(tray) = &self.tray {
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                if tray.is_quit(&event) {
-                    // Ticket #11's Quit: exit the GUI process. Asking
-                    // the daemon for a graceful shutdown is #12. The
-                    // flag tells the close handling below to let this
-                    // one through.
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                } else if tray.is_open_management(&event) {
-                    // The Management Window (ticket #13): reveal the
-                    // one viewport as itself. The title names the
-                    // surface (GLOSSARY) — `run_native`'s app id stays
-                    // "bark-echo", so persistence is untouched. Focus
-                    // raises an existing window; egui 0.37 notes it has
-                    // no effect on Wayland (compositor's call there),
-                    // which is fine — showing still works.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                        "bark-echo — Management Window".to_owned(),
-                    ));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // The user's clicks, all of them. The tray's ids are read
+        // through short per-event borrows — a Quit click needs the tray
+        // mutable right after, for the shutting-down refresh.
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            let is_quit = self
+                .tray
+                .as_ref()
+                .map(|tray| tray.is_quit(&event))
+                .unwrap_or(false);
+            let is_open_management = self
+                .tray
+                .as_ref()
+                .map(|tray| tray.is_open_management(&event))
+                .unwrap_or(false);
+            if is_quit {
+                // Quit (ticket #12): ask the daemon for a graceful
+                // shutdown, wait a bounded while for its confirmation,
+                // then exit. The exchange runs on its own thread with
+                // its own one-shot connection — this thread only paints
+                // the state and refuses re-entry: a second Quit click
+                // is the same instruction, not a new one. The exit
+                // close itself is sent when the exchange concludes
+                // (any outcome); quitting then lets it through.
+                if !self.quit_in_progress {
+                    self.quit_in_progress = true;
+                    // Both surfaces name the stop — one shared
+                    // `LinkState::Quitting` each, the tray's header and
+                    // the window's banner.
+                    self.model.quitting();
+                    self.window.quitting();
+                    if let Some(tray) = &mut self.tray
+                        && let Err(err) = tray.refresh(&self.model)
+                    {
+                        eprintln!("the tray menu could not refresh: {err}");
+                    }
+                    // The reconnect loop stands down before the
+                    // exchange starts: its job is watching a daemon
+                    // that is on its way out, and a retry behind Quit's
+                    // back would re-attach to it and paint noise over
+                    // the shutting-down tray.
+                    self.stop.store(true, Ordering::Relaxed);
+                    spawn_quit(self.endpoint.clone(), self.sender.clone());
                 }
+            } else if is_open_management {
+                // The Management Window (ticket #13): reveal the one
+                // viewport as itself. The title names the surface
+                // (GLOSSARY) — `run_native`'s app id stays "bark-echo",
+                // so persistence is untouched. Focus raises an existing
+                // window; egui 0.37 notes it has no effect on Wayland
+                // (compositor's call there), which is fine — showing
+                // still works.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                    "bark-echo — Management Window".to_owned(),
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
 

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod composer;
 pub mod config;
 pub mod history;
+pub mod lifecycle;
 pub mod lock;
 pub mod notify;
 pub mod paths;

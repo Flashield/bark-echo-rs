@@ -40,6 +40,10 @@ pub enum UiMsg {
     /// The channel broke — the tray names the absence instead of
     /// leaving a stale picture.
     LinkDown,
+    /// The Quit exchange's answer (ticket #12): what the daemon said
+    /// when Quit asked it to stop. The shell exits either way; this
+    /// names how honest the exit is.
+    ShutdownOutcome(crate::shutdown::QuitOutcome),
 }
 
 /// An ask the GUI's surfaces hand to the connection loop: work that

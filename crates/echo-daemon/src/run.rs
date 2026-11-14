@@ -130,6 +130,10 @@ pub async fn run(
     // line each; a client further behind than this is dropped by `serve`
     // and re-snapshots on reconnect — never served stale.
     let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
+    // The channel-side stop trigger (ticket #12): a Shutdown request
+    // pulls the same graceful stop the owner's future pulls — one stop,
+    // one vocabulary of "quit".
+    let shutdown_requested = Arc::new(tokio::sync::Notify::new());
     let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let channel_state = state.clone();
     // The Composer's sends (ticket #16) ride the same channel: the
@@ -138,6 +142,9 @@ pub async fn run(
     // Arcs the handler clones per request.
     let channel_config = Arc::new(spec.config.clone());
     let channel_store = spec.store.clone();
+    // The handler's own clone: the original stays with this function —
+    // the select below waits on the same Notify.
+    let handler_notify = shutdown_requested.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
         server,
         async move {
@@ -148,6 +155,7 @@ pub async fn run(
             let state = channel_state.clone();
             let config = channel_config.clone();
             let store = channel_store.clone();
+            let shutdown_requested = handler_notify.clone();
             async move {
                 match request {
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
@@ -163,6 +171,19 @@ pub async fn run(
                             Ok(outcome) => echo_ipc::Response::PushSent { outcome },
                             Err(message) => echo_ipc::Response::Error { message },
                         }
+                    }
+                    // The Tray Menu's Quit (ticket #12): the answer
+                    // leaves first, then the stop begins — the asking
+                    // client reads the channel closing behind this
+                    // response as the stop's announcement. The trigger
+                    // lands in the same select the owner's future waits
+                    // in: streams fenced, state persisted, the lock
+                    // released, exit 0 — the clean code no
+                    // `Restart=on-failure` / `KeepAlive
+                    // SuccessfulExit=false` supervisor resurrects.
+                    echo_ipc::Request::Shutdown => {
+                        shutdown_requested.notify_one();
+                        echo_ipc::Response::ShuttingDown
                     }
                     // Only post-handshake requests arrive here; an
                     // unknown request is answered, never fatal.
@@ -258,14 +279,24 @@ pub async fn run(
         )));
     }
 
-    // Hold the runtime until the owner lets go (ctrl-C in production, a
-    // fence in tests). The channel ending early does not end the run:
-    // mirroring streams is the daemon's core job, and `status` falls
-    // back to the state file — but the failure is logged loudly, and
-    // the owner still decides when the run is over.
+    // Hold the runtime until the owner lets go — ctrl-C's future (the
+    // headless run) or a Shutdown request over the channel (the Tray
+    // Menu's Quit, ticket #12); both land in the same graceful stop.
+    // The channel ending early does not end the run: mirroring streams
+    // is the daemon's core job, and `status` falls back to the state
+    // file — but the failure is logged loudly, and the owner still
+    // decides when the run is over. Both stop sources are cancel-safe,
+    // so the fallback select after a dead channel can keep waiting on
+    // the same futures.
     tokio::pin!(shutdown);
+    // Created here, after the handler exists: a Shutdown request that
+    // slipped in during setup left a permit on the Notify, and this
+    // future consumes it — no request can be lost to a race with setup.
+    let requested = shutdown_requested.notified();
+    tokio::pin!(requested);
     tokio::select! {
         _ = &mut shutdown => {}
+        _ = &mut requested => {}
         served = &mut channel => {
             match served {
                 Ok(Ok(())) => {}
@@ -276,8 +307,12 @@ pub async fn run(
                     "the IPC channel task failed: {join_error}; `status` falls back to the state file"
                 ),
             }
-            // The owner has not spoken yet; the run holds until it does.
-            (&mut shutdown).await;
+            // Neither stop source has spoken yet; the run holds until
+            // one does — the owner's future or a Shutdown request.
+            tokio::select! {
+                _ = &mut shutdown => {}
+                _ = &mut requested => {}
+            }
         }
     }
 

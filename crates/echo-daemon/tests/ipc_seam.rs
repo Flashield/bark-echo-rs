@@ -268,6 +268,106 @@ async fn the_channel_answers_with_the_live_per_subscription_state() {
 }
 
 #[tokio::test]
+async fn a_shutdown_request_rides_the_same_graceful_stop_as_the_fence() {
+    // Ticket #12: the Tray Menu's Quit asks over the channel, and the
+    // daemon answers with its graceful stop — the same path the owner's
+    // future (ctrl-C in production, a fence in tests) rides: the
+    // channel closes, the streams fence, the run returns Ok, and the
+    // lock dies with the run.
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "quit-by-ipc").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+
+    common::wait_active_streams(&server, 1).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    wait_snapshot(&mut client, "running", |snapshot| {
+        snapshot
+            .subscriptions
+            .get(&token_id)
+            .map(|runtime| runtime.state == StreamState::Running)
+            .unwrap_or(false)
+    })
+    .await;
+
+    // The Quit request: accepted before the stop begins.
+    client
+        .shutdown()
+        .await
+        .expect("the daemon accepts the shutdown");
+
+    // The run ends the graceful way — the fence never had to speak.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    // The streams closed with it…
+    common::wait_active_streams(&server, 0).await;
+    // …and the lock died with the run: nothing stands in the way of the
+    // next launch (spawn-if-absent's takeover, ticket #12).
+    assert!(
+        matches!(
+            echo_daemon::lock::DaemonLock::probe(env.paths.lock_file()),
+            Ok(false)
+        ),
+        "the lock is released with the run"
+    );
+
+    // The fence is still there; closing it is a no-op now.
+    let _ = fence_tx.send(());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_launch_never_attempts_a_second_daemon_while_the_lock_is_held() {
+    // Ticket #12's attach rule: with a daemon running, the launch shape
+    // (spawn-if-absent) probes the lock, answers AlreadyRunning, and
+    // spawns nothing — the running daemon keeps serving, untouched.
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "no-second-attempt").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+
+    common::wait_active_streams(&server, 1).await;
+
+    // The launch shape against a held lock. The program argument is
+    // beside the point here — the probe answers before any spawn could
+    // read it — but it names a real binary so the production shape is
+    // what runs.
+    let program = std::path::Path::new(env!("CARGO_BIN_EXE_bark-echo"));
+    match echo_daemon::lifecycle::spawn_detached_daemon(program, &env.paths, true)
+        .expect("the launch shape probes")
+    {
+        echo_daemon::lifecycle::SpawnOutcome::AlreadyRunning => {}
+        echo_daemon::lifecycle::SpawnOutcome::Spawned { mut child } => {
+            let _ = child.kill();
+            panic!("a held lock must never spawn a second daemon attempt");
+        }
+    }
+
+    // The first daemon is untouched and still mirroring.
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    let snapshot = client.status().await.expect("status");
+    assert_eq!(
+        snapshot.pid,
+        std::process::id(),
+        "the channel still answers for the one and only daemon"
+    );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_second_client_gets_correct_snapshots_concurrently() {
     let server = common::TestServer::spawn().await;
     let (device_key, secret, token_id) = register_and_mint(&server, "two-clients").await;

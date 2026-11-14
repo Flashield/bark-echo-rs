@@ -28,8 +28,21 @@ introduces port squatting where UDS file permissions / named pipe ACLs
 are already the access control.
 
 Lifecycle: the GUI spawns the daemon when the single-instance lock is
-free; the Tray Menu's quit asks the daemon for a graceful shutdown and
-then exits — a clean exit code composes with autostart supervisors
+idle — one probe, then a detached `bark-echo run` beside the same
+binary (its own process group on Unix;
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows) — so the
+child outlives the GUI: a crash or kill leaves the daemon mirroring.
+When the lock is held, the GUI attaches and never attempts a second
+daemon; the probe-then-spawn gap is arbitrated by the child's own lock
+take, and a loser exits with the standard lock refusal. The Tray Menu's
+quit sends the channel's `shutdown` request, which
+the daemon answers (`shutting_down`) before it begins stopping — the
+request rides the same graceful stop as ctrl-C (streams fenced, state
+persisted, lock released, clean exit code), and the daemon closes every
+connection as the stop proceeds: that close is the confirmation the GUI
+waits for, under a bounded budget after which it exits anyway and
+reports the daemon unconfirmed — a stuck daemon must not hold the tray
+hostage. A clean exit code composes with autostart supervisors
 (`Restart=on-failure`, `KeepAlive SuccessfulExit=false` do not resurrect
 a clean stop). Headless autostart keeps running `bark-echo run`
 directly.
