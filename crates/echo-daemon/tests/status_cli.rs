@@ -53,6 +53,14 @@ async fn wait_for_status(harness: &common::Harness, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let output = harness.run(&["--plain-secrets", "status"]).await;
+        eprintln!(
+            "DBG-POLL t={:?} stderr: {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            output.stderr
+        );
         assert!(
             output.success,
             "status must exit 0: {} {}",
@@ -145,6 +153,59 @@ async fn status_follows_a_running_daemons_stream_state_and_shuts_down_clean() {
     assert!(
         stdout.contains("active_streams 0"),
         "the killed daemon's stream is closed: {stdout}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The channel is the proof: delete the runtime state file while the
+/// daemon holds the lock, and `status` still reports the live stream
+/// state — it rode the IPC Channel, not the file. Unix-only because the
+/// harness's paths() face (where the state file lives inside the temp
+/// HOME) is defined where the XDG standard applies; Windows CI runs no
+/// daemon-level tests anyway (see ci.yml).
+#[cfg(unix)]
+#[tokio::test]
+async fn status_takes_the_live_state_over_the_channel_while_the_lock_is_held() {
+    let server = common::TestServer::spawn().await;
+    let harness = common::Harness::new();
+    let _device_key = subscribe_own(&harness, &server.base_url).await;
+
+    let mut daemon = harness
+        .spawn(&["--plain-secrets", "run"])
+        .spawn()
+        .expect("spawn run");
+    let stdout = wait_for_status(&harness, "stream: running").await;
+    assert!(
+        stdout.contains("daemon: running"),
+        "the lock is held by the subprocess: {stdout}"
+    );
+
+    // The proof that `status` rode the channel and not the file: the
+    // runtime state file is gone, and the live answer survives it. (The
+    // daemon only rewrites the file on a state change; none happens in
+    // this window.)
+    let state_file = harness.paths().state_file();
+    std::fs::remove_file(&state_file).expect("remove the state file");
+    let stdout = wait_for_status(&harness, "stream: running").await;
+    assert!(
+        stdout.contains("daemon: running"),
+        "the lock is still held: {stdout}"
+    );
+    assert!(
+        stdout.contains("active_streams 1"),
+        "the channel carried the live state: {stdout}"
+    );
+
+    // Without a daemon, the file's path is the only source again —
+    // unchanged behavior (and the file is gone, so the state reads as
+    // unknown while the server statistics still answer).
+    daemon.kill().await.expect("kill daemon");
+    let _ = daemon.wait().await;
+    let stdout = wait_for_status(&harness, "daemon: not running").await;
+    assert!(
+        stdout.contains("stream: unknown"),
+        "no daemon answers and no state file exists: {stdout}"
     );
 
     server.shutdown().await;

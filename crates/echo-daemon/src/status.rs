@@ -1,10 +1,15 @@
-//! The `status` face (ADR-0002 MVP: the CLI reads the files the runtime
-//! writes — no IPC yet): per-Subscription stream state from the runtime
-//! state file, plus the server's live `/info` statistics (protocol §2.3)
-//! fetched fresh over HTTP. Whether the daemon is alive is answered by
-//! the single-instance lock itself.
+//! The `status` face: per-Subscription stream state from the daemon's
+//! live snapshot over the IPC Channel when the lock is held (ADR-0004),
+//! or from the runtime state file when no daemon answers, plus the
+//! server's live `/info` statistics (protocol §2.3) fetched fresh over
+//! HTTP. Whether the daemon is alive is answered by the single-instance
+//! lock itself.
+
+use std::time::{Duration, Instant};
 
 use echo_core::server::{ServerClient, ServerInfo};
+use echo_ipc::message::StatusSnapshot;
+use echo_ipc::{Client, IpcError};
 
 use crate::auth;
 use crate::config::Config;
@@ -12,6 +17,37 @@ use crate::lock::{DaemonLock, LockError};
 use crate::paths::Paths;
 use crate::secrets::SecretStore;
 use crate::state::{StateError, StateFile, StreamState};
+
+/// How long `status` tries the channel before falling back to the state
+/// file: long enough to absorb a starting daemon (the lock is held a
+/// beat before the endpoint is bound), short enough to stay snappy.
+const CHANNEL_BUDGET: Duration = Duration::from_secs(2);
+/// One connect-handshake-status attempt's cap, so a wedged daemon
+/// cannot wedge `status`.
+const CHANNEL_ATTEMPT: Duration = Duration::from_secs(1);
+const CHANNEL_RETRY: Duration = Duration::from_millis(50);
+
+/// The daemon's live snapshot over the IPC Channel (ADR-0004): the
+/// daemon's in-memory answer, fresher than or equal to the state file's
+/// last write. [`IpcError::Closed`] means the budget was spent without
+/// a live answer — the caller falls back to the state file either way.
+async fn ride_the_channel(paths: &Paths) -> Result<StatusSnapshot, IpcError> {
+    let endpoint = paths.ipc_endpoint();
+    let deadline = Instant::now() + CHANNEL_BUDGET;
+    loop {
+        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
+            let mut client = Client::connect(&endpoint).await?;
+            client.status().await
+        });
+        if let Ok(Ok(snapshot)) = attempt.await {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            return Err(IpcError::Closed);
+        }
+        tokio::time::sleep(CHANNEL_RETRY).await;
+    }
+}
 
 /// Why the status report could not be assembled.
 #[derive(Debug, thiserror::Error)]
@@ -54,17 +90,31 @@ pub struct StatusReport {
     pub subscriptions: Vec<SubscriptionStatus>,
 }
 
-/// Assemble the report: probe the lock, read the state file, fetch each
-/// server's `/info` live. Displayed data is all public; the only secret
-/// read is the operator Basic Auth password out of the store (story 18)
-/// when a protected server's `/info` demands it — never displayed.
+/// Assemble the report: probe the lock, take the per-Subscription
+/// stream state (the daemon's live snapshot over the channel when the
+/// lock is held; the runtime state file otherwise — today's path,
+/// unchanged), fetch each server's `/info` live. Displayed data is all
+/// public; the only secret read is the operator Basic Auth password out
+/// of the store (story 18) when a protected server's `/info` demands it
+/// — never displayed.
 pub async fn report(
     paths: &Paths,
     config: &Config,
     store: &dyn SecretStore,
 ) -> Result<StatusReport, StatusError> {
     let daemon_running = DaemonLock::probe(paths.lock_file())?;
-    let state = StateFile::read(&paths.state_file())?;
+    // The live source when a daemon holds the lock is the channel
+    // (ADR-0004). No daemon, or a channel that does not answer within
+    // the budget (a daemon mid-start, a dying one): the state file —
+    // the same bytes the daemon persists — with today's behavior.
+    let state = if daemon_running {
+        match ride_the_channel(paths).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => StateFile::read(&paths.state_file())?,
+        }
+    } else {
+        StateFile::read(&paths.state_file())?
+    };
 
     let mut subscriptions = Vec::new();
     for subscription in &config.subscriptions {

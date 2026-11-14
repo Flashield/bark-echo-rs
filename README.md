@@ -146,8 +146,13 @@ Inside it:
   (GLOSSARY), appended by both the daemon and `pull`.
 - `daemon.lock` — the single-instance lock (ADR-0002); the OS releases it
   when the holding process dies, so a crash never leaves a stale lock.
-- `daemon-state.json` — the per-Subscription stream state `status` reads
-  while the daemon runs.
+- `daemon.ipc` — the IPC Channel the daemon serves beside its lock
+  (ADR-0004): a Unix domain socket on Linux/macOS (on Windows the pipe
+  name is derived from this directory). `status` takes its live stream
+  state over it while a daemon holds the lock.
+- `daemon-state.json` — the per-Subscription stream state the daemon
+  persists: the crash-recovery record `status` falls back to when no
+  daemon answers.
 
 On a headless Linux box without a secret service, run every command with
 `--plain-secrets` — the keyring error names the fallback when it is needed.
