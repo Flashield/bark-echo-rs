@@ -799,6 +799,7 @@ name = "echo-gui"
 version = "0.1.0"
 dependencies = [
  "echo-ipc",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

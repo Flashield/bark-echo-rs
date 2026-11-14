@@ -5,6 +5,8 @@
 //! renderer over the echo-ipc client's state machine, never a second
 //! runtime.
 
+pub mod connection;
 pub mod model;
 
+pub use connection::UiMsg;
 pub use model::{LinkState, MenuItem, SubscriptionLine, TrayModel};

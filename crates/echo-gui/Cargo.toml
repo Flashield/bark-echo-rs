@@ -10,3 +10,6 @@ edition.workspace = true
 echo-ipc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
