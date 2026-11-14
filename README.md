@@ -167,8 +167,11 @@ cargo clippy --all-targets
 ```
 
 CI runs the same three checks plus a build on Linux, macOS, and Windows on
-every push and PR (the embedded server means no external services); a
-`v*` tag publishes release binaries for all three platforms.
+every push and PR (the embedded server means no external services); on
+Windows the dev-dependency cannot build yet (upstream
+bark-server-rs#13), so Windows runs the build and the echo-ipc channel
+suite only; a `v*` tag publishes release binaries for all three
+platforms.
 
 Contributors: start with [`GLOSSARY.md`](GLOSSARY.md) (the vocabulary
 authority) and the ADRs in [`docs/adr/`](docs/adr/) — they explain the why
