@@ -160,6 +160,81 @@ async fn wait_snapshot(
 }
 
 #[tokio::test]
+async fn the_history_snapshot_answers_with_the_daemons_own_log_tail() {
+    // Ticket #15: the viewer's initial content is the daemon's answer —
+    // the daemon reads its daemon-private History Log (ADR-0004) with
+    // the CLI's `log --tail N` semantics: all complete entries, oldest
+    // last, the last `tail` of them. The test reads the file only as
+    // the referee; the viewer itself never will.
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "history-tail").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+
+    common::wait_active_streams(&server, 1).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+
+    // Three pushes land in the Subscription's History Log; the wait is
+    // on the daemon's own answer, not the state file's cursor — the log
+    // line lands a beat after the cursor, and the channel answer is
+    // what the viewer will see.
+    for body in ["first", "second", "third"] {
+        push_to(&server, &device_key, body).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let full = loop {
+        match client.history_snapshot(&token_id, 100).await {
+            Ok(entries) if entries.len() == 3 => break entries,
+            Ok(_) | Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the daemon's answer never showed three entries"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    assert_eq!(full[0].body, "first", "oldest last");
+    assert_eq!(full[2].body, "third");
+
+    // The bounded tail is the last N entries, oldest last.
+    let tail = client.history_snapshot(&token_id, 2).await.expect("tail");
+    assert_eq!(tail.len(), 2);
+    assert_eq!(tail[0].body, "second");
+    assert_eq!(tail[1].body, "third");
+
+    // The answer is the log file's content verbatim in vocabulary and
+    // order: the complete entries' last N — the slice `log --tail 2`
+    // prints (the test plays referee by reading the daemon-owned file).
+    let log = echo_core::history::HistoryLog::new(env.paths.history_log(&token_id));
+    let entries = log.entries().expect("read the daemon's log");
+    assert_eq!(
+        tail,
+        entries[entries.len() - 2..],
+        "the channel answer is the log file's own tail"
+    );
+
+    // A Subscription the daemon does not hold is refused, not answered
+    // with a silently empty log — and so no path outside the daemon's
+    // own Subscription logs is ever served.
+    let refused = client.history_snapshot("no-such-subscription", 10).await;
+    assert!(
+        matches!(refused, Err(echo_ipc::IpcError::Rejected(_))),
+        "an unknown Subscription is an error answer: {refused:?}"
+    );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_channel_answers_with_the_live_per_subscription_state() {
     let server = common::TestServer::spawn().await;
     let (device_key, secret, token_id) = register_and_mint(&server, "ipc-test").await;

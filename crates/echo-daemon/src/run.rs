@@ -132,6 +132,8 @@ pub async fn run(
     let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
     let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let channel_state = state.clone();
+    let channel_paths = spec.paths.clone();
+    let channel_config = spec.config.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
         server,
         async move {
@@ -140,15 +142,19 @@ pub async fn run(
         event_hub.clone(),
         move |request| {
             let state = channel_state.clone();
+            let paths = channel_paths.clone();
+            let config = channel_config.clone();
             async move {
                 match request {
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
                         snapshot: state.snapshot(),
                     },
-                    // Only post-handshake requests arrive here; the
-                    // vocabulary has no other request yet (the event
-                    // stream is ticket #11), but an unknown request is
-                    // answered, never fatal.
+                    echo_ipc::Request::HistorySnapshot {
+                        subscription_id,
+                        tail,
+                    } => history_snapshot_response(&paths, &config, &subscription_id, tail),
+                    // Only post-handshake requests arrive here; anything
+                    // outside the vocabulary is answered, never fatal.
                     other => echo_ipc::Response::Error {
                         message: format!("this daemon does not answer {other:?}"),
                     },
@@ -280,6 +286,43 @@ pub async fn run(
         let _ = supervisor.await;
     }
     Ok(())
+}
+
+/// Answer a [`echo_ipc::Request::HistorySnapshot`] (ticket #15): the
+/// daemon reads its own daemon-private History Log for the Subscription
+/// (ADR-0004 — the GUI never touches a file) and answers with the
+/// content semantics of the CLI's `log --tail N`: all complete entries,
+/// oldest last, the last `tail` of them. A Subscription the daemon does
+/// not hold is refused, not answered with a silently empty log — so no
+/// path outside its own Subscription logs is ever served, whatever a
+/// client puts in the id.
+fn history_snapshot_response(
+    paths: &Paths,
+    config: &Config,
+    subscription_id: &str,
+    tail: u32,
+) -> echo_ipc::Response {
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|held| held.id == subscription_id)
+    else {
+        return echo_ipc::Response::Error {
+            message: format!("no Subscription with id `{subscription_id}`"),
+        };
+    };
+    let log = HistoryLog::new(paths.history_log(&subscription.id));
+    match log.entries() {
+        Ok(entries) => {
+            let start = entries.len().saturating_sub(tail as usize);
+            echo_ipc::Response::HistorySnapshot {
+                entries: entries[start..].to_vec(),
+            }
+        }
+        Err(err) => echo_ipc::Response::Error {
+            message: format!("cannot read the History Log: {err}"),
+        },
+    }
 }
 
 /// One Subscription's runtime: forward the stream's intents into the
