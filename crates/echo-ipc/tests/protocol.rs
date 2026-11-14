@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use echo_ipc::message::{
-    Request, RequestFrame, Response, ResponseFrame, StatusSnapshot, StreamState,
+    Event, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot, StreamState,
     SubscriptionRuntime,
 };
 use echo_ipc::{Client, Endpoint, IpcError, IpcServer, PROTOCOL_VERSION, connect_raw, serve};
@@ -37,9 +37,24 @@ fn canned_snapshot() -> StatusSnapshot {
 
 /// Bind the channel on a fresh endpoint and serve with `handler` until
 /// the returned trigger fires. The temp dir must be held by the caller —
-/// the endpoint lives inside it.
+/// the endpoint lives inside it. The request/response-only tests get an
+/// event hub nobody broadcasts on; the event suite has its own harness.
 async fn serving(
     handler: BoxedHandler,
+) -> (
+    tempfile::TempDir,
+    Endpoint,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), IpcError>>,
+) {
+    let (hub, _unused) = tokio::sync::broadcast::channel::<Event>(16);
+    let (dir, endpoint, stop_tx, handle) = serving_with_hub(handler, hub).await;
+    (dir, endpoint, stop_tx, handle)
+}
+
+async fn serving_with_hub(
+    handler: BoxedHandler,
+    hub: tokio::sync::broadcast::Sender<Event>,
 ) -> (
     tempfile::TempDir,
     Endpoint,
@@ -55,6 +70,7 @@ async fn serving(
         async move {
             let _ = stop_rx.await;
         },
+        hub,
         handler,
     ));
     (dir, endpoint, stop_tx, handle)

@@ -7,9 +7,20 @@ use std::collections::BTreeMap;
 
 use echo_ipc::PROTOCOL_VERSION;
 use echo_ipc::message::{
-    Request, RequestFrame, Response, ResponseFrame, StatusSnapshot, StreamState,
-    SubscriptionRuntime,
+    Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
+    StreamState, SubscriptionRuntime,
 };
+
+fn plain_intent(id: i64) -> NotificationIntent {
+    NotificationIntent {
+        id,
+        title: "the title".to_owned(),
+        subtitle: String::new(),
+        body: "the body".to_owned(),
+        click_action: None,
+        created_at: 1_700_000_000,
+    }
+}
 
 #[test]
 fn the_protocol_starts_at_version_one() {
@@ -148,4 +159,46 @@ fn the_snapshot_holds_one_line_per_subscription() {
     assert_eq!(snapshot.subscriptions.len(), 2);
     assert_eq!(snapshot.subscriptions["tok-b"].state, StreamState::Running);
     assert_eq!(snapshot.subscriptions["tok-a"].last_message_id, None);
+}
+
+#[test]
+fn a_stream_state_event_round_trips_without_an_id() {
+    // ADR-0004: events carry no id — the client cannot answer them, it
+    // just learns. The frame is the bare event, no envelope.
+    let event = Event::StreamState {
+        subscription_id: "tok".to_owned(),
+        label: "desktop".to_owned(),
+        state: StreamState::Running,
+    };
+    let json = serde_json::to_string(&event).expect("serialize");
+    assert_eq!(
+        json,
+        r#"{"type":"stream_state","subscription_id":"tok","label":"desktop","state":{"kind":"running"}}"#,
+        "the event names itself, its Subscription, and the state in the runtime's vocabulary"
+    );
+    let back: Event = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, event);
+}
+
+#[test]
+fn a_history_appended_event_round_trips_the_log_line_vocabulary() {
+    // The History Log's line (GLOSSARY) and the event's entry are one
+    // vocabulary: the entry's bytes are what the log file holds, so the
+    // GUI renders the event exactly as `log` prints the file.
+    let event = Event::HistoryAppended {
+        subscription_id: "tok".to_owned(),
+        label: "desktop".to_owned(),
+        entry: plain_intent(41),
+    };
+    let json = serde_json::to_string(&event).expect("serialize");
+    assert!(
+        json.starts_with(r#"{"type":"history_appended","subscription_id":"tok","label":"desktop","entry":{"id":41,"#),
+        "the entry rides inside the event: {json}"
+    );
+    assert!(
+        json.contains(r#""title":"the title""#) && json.contains(r#""body":"the body""#),
+        "the log line's fields survive: {json}"
+    );
+    let back: Event = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, event);
 }

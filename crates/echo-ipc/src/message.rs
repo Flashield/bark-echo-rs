@@ -1,5 +1,5 @@
 //! The JSON Lines message vocabulary (ADR-0004): requests and responses
-//! carry an id; daemon-pushed events will carry none (ticket #11). The
+//! carry an id; daemon-pushed events carry none (ticket #11). The
 //! status snapshot's shape is the daemon's live per-Subscription state —
 //! the same vocabulary the runtime state file holds, so the state file
 //! and the channel answer read as one thing (spec story 24: the wire
@@ -8,6 +8,13 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+// The History Log line's vocabulary (GLOSSARY) is echo-core's: the
+// daemon appends `NotificationIntent` lines to the log, and the channel
+// relays appended lines as-is — one type, so the event payload cannot
+// fork the log format (spec story 24). Re-exported here so every
+// consumer of the channel names it from the channel's crate.
+pub use echo_core::intent::NotificationIntent;
 
 /// One client → daemon frame: the request plus the id its response must
 /// carry. The first frame on every connection is [`Request::Hello`].
@@ -18,10 +25,9 @@ pub struct RequestFrame {
     pub request: Request,
 }
 
-/// The requests the channel answers. This slice is request/response
-/// only — openings are snapshot requests (ADR-0004); the daemon-pushed
-/// event stream (a stream state flip, a History Log append) is ticket
-/// #11 and will ride frames without an id.
+/// The requests the channel answers. Openings are snapshot requests
+/// (ADR-0004); the daemon's own pushes — a stream state flip, a History
+/// Log append — arrive unsolicited as [`Event`] frames, without an id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -34,6 +40,37 @@ pub enum Request {
     },
     /// Ask for the daemon's live per-Subscription snapshot.
     Status,
+}
+
+/// The daemon-pushed events (ADR-0004, ticket #11): frames without an
+/// id, interleaved with the request/response traffic on the same
+/// connection. The client cannot answer an event — it just learns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// A Subscription's Realtime Stream flipped state — pushed at the
+    /// same moment the runtime records the flip.
+    StreamState {
+        /// The Subscription the state belongs to (its Stream Token's
+        /// `token_id`).
+        subscription_id: String,
+        /// The Subscription's client label, so a reader can name the
+        /// line even before (or without) taking a snapshot.
+        label: String,
+        /// The state the stream flipped to.
+        state: StreamState,
+    },
+    /// A processed Push landed in the Subscription's History Log —
+    /// announced only after the line is durably on disk, carrying the
+    /// line itself: the exact vocabulary the log file holds.
+    HistoryAppended {
+        /// The Subscription the line was appended to.
+        subscription_id: String,
+        /// The Subscription's client label.
+        label: String,
+        /// The appended History Log line.
+        entry: NotificationIntent,
+    },
 }
 
 /// One daemon → client frame: the response plus the answered request's
