@@ -97,7 +97,9 @@ fn action_label(intent: &NotificationIntent) -> &'static str {
 /// The summary/body split a system notification wants: the title is the
 /// summary when it exists, else the subtitle carries the summary and the
 /// body stands alone; the subtitle is folded into the body otherwise.
-fn render_parts(intent: &NotificationIntent) -> (String, String) {
+/// Shared by every renderer — the notify-rust path and the Windows toast
+/// XML (toast_activation) — so all platforms show the same shape.
+pub(crate) fn render_parts(intent: &NotificationIntent) -> (String, String) {
     if !intent.title.is_empty() {
         let mut body = String::new();
         if !intent.subtitle.is_empty() {

@@ -22,6 +22,26 @@ notify-rust = "4.19"
 tokio = { workspace = true }
 time = { workspace = true }
 
+# Windows toast activation (ticket #17): AUMID registration + COM
+# INotificationActivationCallback — the plumbing notify-rust's Windows
+# backend cannot express. Features stay per API group to keep the
+# compiled surface small; the dependency is only compiled for Windows
+# targets.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_Notifications",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 # The one test seam (spec Testing Decisions): the real server, embedded
 # in-process, mirroring echo-core's own test common module. Dev-only and
