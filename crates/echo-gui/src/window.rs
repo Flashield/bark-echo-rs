@@ -1,20 +1,25 @@
-//! The Management Window (GLOSSARY, ticket #13): the model holds the
-//! echo-ipc client's view of the daemon reduced to what the window
-//! lists — each Subscription's label, server URL, and token hint (the
-//! snapshot's public identity, never the secrets behind it) with its
-//! Realtime Stream's live state — and the render function lays that
-//! picture out. The same thin split as the tray (model owns every word,
-//! paint owns none): the data arrives as the connection loop's
-//! snapshot-then-events stream — the opening snapshot rides every
+//! The Management Window (GLOSSARY, tickets #13 and #15): the model
+//! holds the echo-ipc client's view of the daemon reduced to what the
+//! window lists — each Subscription's label, server URL, and token hint
+//! (the snapshot's public identity, never the secrets behind it) with
+//! its Realtime Stream's live state — and the render function lays that
+//! picture out, with the picked Subscription's History Log view (ticket
+//! #15) beneath the list: its label is the pick, the click becomes one
+//! ask over the channel. The same thin split as the tray (model owns
+//! every word, paint owns none): the data arrives as the connection
+//! loop's snapshot-then-events stream — the opening snapshot rides every
 //! (re)connect and the daemon's events keep the rows current whether
 //! the window is open or not, so showing it reveals the current picture
 //! — and a broken link is named outright instead of left as a stale
 //! picture or a silent blank.
 
 use std::collections::BTreeMap;
+use std::sync::mpsc::Sender;
 
 use echo_ipc::message::{Event, StatusSnapshot, StreamState};
 
+use crate::connection::ClientAsk;
+use crate::history_view::{self, HistoryView};
 use crate::model::LinkState;
 
 /// One Subscription's row: the snapshot's public identity plus the
@@ -182,12 +187,21 @@ impl WindowModel {
     }
 }
 
-/// The Management Window's face: the model's picture laid out. Thin by
-/// contract — the words come from the model; this only arranges them.
-/// Called by the shell's `ui` for the visible window; while the window
-/// is hidden eframe runs no paint pass at all (App::logic only), so
-/// nothing here costs anything until the user opens it.
-pub fn render(ui: &mut egui::Ui, model: &WindowModel) {
+/// The Management Window's face: the model's picture laid out, with the
+/// picked Subscription's History Log view beneath the list (ticket #15).
+/// Thin by contract — the words come from the models; this only
+/// arranges them. A click on a Subscription's label becomes one ask on
+/// `asks` (the connection loop serves it over its own client); the
+/// viewer's content is the answer, never a file read. Called by the
+/// shell's `ui` for the visible window; while the window is hidden
+/// eframe runs no paint pass at all (App::logic only), so nothing here
+/// costs anything until the user opens it.
+pub fn render(
+    ui: &mut egui::Ui,
+    model: &WindowModel,
+    history: &mut HistoryView,
+    asks: &Sender<ClientAsk>,
+) {
     // The daemon banner: the link's truth first, colored when it is not
     // the quiet "connected" — the absence is a state, never a blank.
     let mut header = egui::RichText::new(model.status_line()).strong();
@@ -199,25 +213,45 @@ pub fn render(ui: &mut egui::Ui, model: &WindowModel) {
     ui.label(header);
     ui.separator();
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let rows = model.rows();
-        if rows.is_empty() {
-            // Worth saying only when the daemon had its say; while the
-            // link is down the banner above already names the absence.
-            if model.link() == LinkState::Connected {
-                ui.label("No Subscriptions yet — add one with `subscribe add`.");
+    // The Subscription list: bounded height, so the History Log view
+    // below always keeps its ground even with several Subscriptions.
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .show(ui, |ui| {
+            let rows = model.rows();
+            if rows.is_empty() {
+                // Worth saying only when the daemon had its say; while
+                // the link is down the banner above already names the
+                // absence.
+                if model.link() == LinkState::Connected {
+                    ui.label("No Subscriptions yet — add one with `subscribe add`.");
+                }
+                return;
             }
-            return;
-        }
-        for row in rows {
-            ui.add_space(4.0);
-            ui.strong(&row.label);
-            ui.label(format!("Server: {}", row.server));
-            ui.label(format!("Token hint: {}", row.token_hint));
-            ui.label(format!("Realtime Stream: {}", row.state));
-            ui.separator();
-        }
-    });
+            for row in rows {
+                ui.add_space(4.0);
+                // The label is the pick: clicking it opens that
+                // Subscription's History Log below. Re-picking the one
+                // already followed asks for nothing (the view says so).
+                let picked = history.selected_id() == Some(row.id.as_str());
+                if ui
+                    .selectable_label(picked, egui::RichText::new(&row.label).strong())
+                    .clicked()
+                    && let Some(id) = history.select(&row.id, &row.label)
+                {
+                    let _ = asks.send(ClientAsk::HistorySnapshot {
+                        subscription_id: id,
+                    });
+                }
+                ui.label(format!("Server: {}", row.server));
+                ui.label(format!("Token hint: {}", row.token_hint));
+                ui.label(format!("Realtime Stream: {}", row.state));
+                ui.separator();
+            }
+        });
+    // The picked Subscription's History Log (ticket #15): its own
+    // scroll, newest last, stuck to the bottom.
+    history_view::render(ui, history);
 }
 
 #[cfg(test)]

@@ -327,8 +327,10 @@ pub fn render(ui: &mut egui::Ui, view: &HistoryView) {
     // Newest last, stuck to the bottom: the line that just landed is
     // the one the user is here for (`log --follow`'s scrolling tail).
     // The bound (HISTORY_TAIL) keeps the loop small — no virtualization
-    // needed.
+    // needed — and the area fills the window's remainder below the
+    // Subscription list.
     egui::ScrollArea::vertical()
+        .auto_shrink(false)
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for line in lines {

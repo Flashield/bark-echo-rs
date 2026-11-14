@@ -2,10 +2,11 @@
 //! one window that lives hidden while the Tray Menu is the whole
 //! surface, and shows the Management Window (#13) when the tray item
 //! asks. The shell is thin by contract: it drains the connection loop's
-//! messages into the two models (tray and window — siblings, each its
-//! own state machine), hands tray changes to the tray, dispatches menu
-//! clicks, and draws the window. Every nontrivial decision lives in a
-//! model, every transport rule in the connection loop.
+//! messages into the models (tray and window and the History Log
+//! viewer — siblings, each its own state machine), hands tray changes
+//! to the tray, dispatches menu clicks, and draws the window. Every
+//! nontrivial decision lives in a model, every transport rule in the
+//! connection loop.
 //!
 //! The window's close button hides it, it never ends the app (the tray
 //! persists; reopening works repeatedly) — eframe 0.37's close contract,
@@ -20,13 +21,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use echo_ipc::Endpoint;
 
-use crate::connection::{UiMsg, spawn_connection_loop};
+use crate::connection::{ClientAsk, UiMsg, spawn_connection_loop};
 use crate::fonts;
+use crate::history_view::HistoryView;
 use crate::model::TrayModel;
 use crate::tray::TrayMenu;
 use crate::window::{WindowModel, render};
@@ -53,8 +55,12 @@ pub enum GuiError {
 /// [`spawn_connection_loop`]) and arrives here over the mpsc receiver.
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
+    // The window's asks ride the reverse direction: a History Log pick
+    // (ticket #15) becomes one request the connection loop serves over
+    // its own client — the surfaces never touch the channel themselves.
+    let (ask_sender, ask_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_connection_loop(endpoint, sender, stop.clone());
+    spawn_connection_loop(endpoint, sender, ask_receiver, stop.clone());
 
     let options = eframe::NativeOptions {
         // The one window starts hidden (the Tray Menu is the app's
@@ -94,7 +100,7 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
             creation_context
                 .egui_ctx
                 .set_fonts(fonts::font_definitions());
-            Ok(Box::new(TrayApp::new(receiver, stop)))
+            Ok(Box::new(TrayApp::new(receiver, ask_sender, stop)))
         }),
     )
     .map_err(|err| GuiError::Start(err.to_string()))
@@ -103,6 +109,9 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
 /// The shell: the models' owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
+    /// The window's asks out to the connection loop (a History Log pick,
+    /// ticket #15).
+    asks: Sender<ClientAsk>,
     stop: Arc<AtomicBool>,
     model: TrayModel,
     /// The Management Window's picture, fed the same connection stream
@@ -113,6 +122,9 @@ struct TrayApp {
     /// on-open request is needed (and none exists to send — the
     /// connection loop owns the client).
     window: WindowModel,
+    /// The picked Subscription's History Log viewer (ticket #15): fed
+    /// the same stream, its one request going out over `asks`.
+    history: HistoryView,
     /// Set by the tray's Quit so the close interception below knows
     /// this close means exit, not hide.
     quitting: bool,
@@ -125,12 +137,14 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(receiver: Receiver<UiMsg>, stop: Arc<AtomicBool>) -> Self {
+    fn new(receiver: Receiver<UiMsg>, asks: Sender<ClientAsk>, stop: Arc<AtomicBool>) -> Self {
         Self {
             receiver,
+            asks,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
+            history: HistoryView::default(),
             quitting: false,
             tray: None,
         }
@@ -166,25 +180,49 @@ impl eframe::App for TrayApp {
             }
         }
 
-        // The channel's news, all of it, into both models — the tray's
-        // glance and the window's list eat the same snapshot-then-
-        // events stream (the window's stays current while hidden).
+        // The channel's news, all of it, into the models — the tray's
+        // glance, the window's list, and the History Log viewer eat the
+        // same snapshot-then-events stream (each stays current while
+        // hidden). The viewer re-asks on every fresh authority: its
+        // request goes out over the ask channel and the answer comes
+        // back here as a message.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
                     self.window.apply_snapshot(&snapshot);
+                    if let Some(id) = self.history.daemon_back() {
+                        let _ = self.asks.send(ClientAsk::HistorySnapshot {
+                            subscription_id: id,
+                        });
+                    }
                     dirty = true;
                 }
                 UiMsg::Event(event) => {
                     self.model.apply_event(&event);
                     self.window.apply_event(&event);
+                    self.history.apply_append(&event);
                     dirty = true;
                 }
                 UiMsg::LinkDown => {
                     self.model.connection_lost();
                     self.window.connection_lost();
+                    self.history.connection_lost();
+                    dirty = true;
+                }
+                UiMsg::HistoryLoaded {
+                    subscription_id,
+                    entries,
+                } => {
+                    self.history.snapshot_loaded(&subscription_id, &entries);
+                    dirty = true;
+                }
+                UiMsg::HistoryUnavailable {
+                    subscription_id,
+                    reason,
+                } => {
+                    self.history.snapshot_failed(&subscription_id, &reason);
                     dirty = true;
                 }
             }
@@ -241,8 +279,8 @@ impl eframe::App for TrayApp {
 
     // The Management Window's paint pass, reached only while the
     // viewport is visible (eframe runs no paint at all while hidden).
-    // Thin by contract: the model owns every word; this lays them out.
+    // Thin by contract: the models own every word; this lays them out.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        render(ui, &self.window);
+        render(ui, &self.window, &mut self.history, &self.asks);
     }
 }
