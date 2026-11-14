@@ -43,6 +43,9 @@ jobs:
       # .gitignore prevents the next accidental `git add`; this step makes
       # one that slips past fail the build deterministically.
       - name: No build artifacts tracked
+        # bash: the guard's if/grep syntax is not pwsh, which is the
+        # default shell on Windows runners.
+        shell: bash
         run: |
           if git ls-files | grep -qE '(^|/)target/'; then
             echo "::error::build artifacts are tracked in version control"
