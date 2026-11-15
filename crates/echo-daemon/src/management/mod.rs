@@ -23,10 +23,12 @@
 //!    an HttpOnly + SameSite=Strict session cookie (short TTL, killed by
 //!    rotate); page navigation and the SSE stream ride the cookie
 //!    same-origin, and the page's JS never holds the token again.
-//! 4. **CSRF defense in depth** — SameSite=Strict, the custom-header
-//!    requirement on state changes (a cross-site fetch cannot pass
-//!    preflight with one), and Host/Origin/Referer validation (a foreign
-//!    Host is refused 403, as the prototype validated by curl).
+//! 4. **CSRF defense in depth** — SameSite=Strict; the custom-header
+//!    requirement on state changes, `/v1/session` included (a
+//!    cross-site fetch cannot pass preflight with one); and
+//!    Host/Origin/Referer validation on every `/v1` request, reads
+//!    included (a foreign Host is refused 403, as the prototype
+//!    validated by curl).
 //! 5. **Brute-force guard** — constant-time token compares; after 5
 //!    consecutive failures each failure adds 1 s of delay, in-memory
 //!    only.

@@ -223,11 +223,14 @@ async fn error_of(response: reqwest::Response) -> (reqwest::StatusCode, String, 
     )
 }
 
-/// `POST /v1/session` with `token`; on success the session cookie line
-/// (name=value) is returned, with the full attribute set asserted.
+/// `POST /v1/session` with `token`, riding the page's own custom header
+/// (the session exchange is a state change: the CSRF gate demands one);
+/// on success the session cookie line (name=value) is returned, with
+/// the full attribute set asserted.
 async fn sign_in(base_url: &str, token: &str) -> String {
     let response = reqwest::Client::new()
         .post(format!("{base_url}/v1/session"))
+        .header("X-Requested-With", "bark-echo-face")
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await
@@ -449,8 +452,11 @@ async fn the_brute_force_guard_engages_after_five_consecutive_failures() {
         let base_url = running.base_url.clone();
         async move {
             let started = Instant::now();
+            // The custom header clears the CSRF gate so the wrong-token
+            // attempts reach the guard — what the page's sign-in does.
             let response = client
                 .post(format!("{base_url}/v1/session"))
+                .header("X-Requested-With", "bark-echo-face")
                 .json(&serde_json::json!({ "token": token }))
                 .send()
                 .await
@@ -587,6 +593,139 @@ async fn the_csrf_gates_refuse_cross_site_state_changes() {
         body_text.contains("csrf_rejected"),
         "the refusal names the gate: {body_text}"
     );
+
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn the_session_exchange_runs_the_csrf_gates() {
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+    let addr = running
+        .base_url
+        .strip_prefix("http://")
+        .expect("an http url")
+        .to_owned();
+    let body = serde_json::json!({ "token": &running.token }).to_string();
+
+    // The exchange mints a session — a state change: without the custom
+    // header it is refused before the body is even parsed (a wrong
+    // token would earn 401; this shape earns 403 first).
+    let (status, body_text) = raw_request(
+        addr.parse().expect("addr"),
+        "POST",
+        "/v1/session",
+        &addr,
+        &[("Content-Type", "application/json")],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, 403, "{body_text}");
+    assert!(
+        body_text.contains("csrf_rejected"),
+        "the refusal names the gate: {body_text}"
+    );
+
+    // The API-client path (the token header doubles as the custom
+    // header) with a cross-site Origin: refused.
+    let (status, body_text) = raw_request(
+        addr.parse().expect("addr"),
+        "POST",
+        "/v1/session",
+        &addr,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Management-Token", &running.token),
+            ("Origin", "http://evil.example"),
+        ],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, 403, "{body_text}");
+    assert!(body_text.contains("origin_rejected"), "{body_text}");
+
+    // A foreign Host on the exchange: refused like any state change.
+    let (status, body_text) = raw_request(
+        addr.parse().expect("addr"),
+        "POST",
+        "/v1/session",
+        "evil.example:8081",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Management-Token", &running.token),
+        ],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, 403, "{body_text}");
+    assert!(body_text.contains("host_rejected"), "{body_text}");
+
+    // Sanity: the page's own shape (X-Requested-With, same origin)
+    // exchanges for a session.
+    let (status, body_text) = raw_request(
+        addr.parse().expect("addr"),
+        "POST",
+        "/v1/session",
+        &addr,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Requested-With", "bark-echo-face"),
+        ],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, 204, "{body_text}");
+
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn cross_site_reads_are_refused_and_same_origin_reads_pass() {
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+    let addr = running
+        .base_url
+        .strip_prefix("http://")
+        .expect("an http url")
+        .to_owned();
+
+    // A cross-site Origin on a plain read (a DNS-rebinding shape): the
+    // Host/Origin/Referer layer runs on every /v1 request, reads
+    // included — the token in the header cannot make it legitimate.
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/status", running.base_url))
+        .header("X-Management-Token", &running.token)
+        .header("Origin", "http://evil.example")
+        .send()
+        .await
+        .expect("GET /v1/status with a foreign Origin");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = response.json().await.expect("the refusal");
+    assert_eq!(body["error"]["code"], "origin_rejected", "{body}");
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/log/absent", running.base_url))
+        .header("X-Management-Token", &running.token)
+        .header("Origin", "http://evil.example")
+        .send()
+        .await
+        .expect("GET /v1/log with a foreign Origin");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Same-origin reads pass: the browser names the face's own address.
+    let (status, body_text) = raw_request(
+        addr.parse().expect("addr"),
+        "GET",
+        "/v1/status",
+        &addr,
+        &[
+            ("X-Management-Token", &running.token),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body_text}");
 
     running.stop().await;
 }

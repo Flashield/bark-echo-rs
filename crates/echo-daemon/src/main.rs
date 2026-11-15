@@ -341,7 +341,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let added: echo_ipc::message::AddedSubscription = fork_on_lock(
                     &paths,
                     async || {
-                        Ok(subscribe::add_via_channel(&paths, &server, source.clone(), &label, auth.clone()).await?)
+                        Ok(subscribe::add_via_channel(
+                            &paths,
+                            &server,
+                            source.clone(),
+                            &label,
+                            auth.clone(),
+                        )
+                        .await?)
                     },
                     async || {
                         let client = ServerClient::new(&server);

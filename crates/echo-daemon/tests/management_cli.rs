@@ -51,11 +51,13 @@ async fn wait_token(harness: &common::Harness) -> String {
     }
 }
 
-/// `POST /v1/session` with `token`; returns the cookie name=value on
-/// success.
+/// `POST /v1/session` with `token`, riding the page's own custom header
+/// (the session exchange is a state change: the CSRF gate demands one);
+/// returns the cookie name=value on success.
 async fn sign_in(base_url: &str, token: &str) -> String {
     let response = reqwest::Client::new()
         .post(format!("{base_url}/v1/session"))
+        .header("X-Requested-With", "bark-echo-face")
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await

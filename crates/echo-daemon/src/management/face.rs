@@ -173,7 +173,7 @@ fn cross_site(security: &FaceState, headers: &HeaderMap) -> Option<&'static str>
 }
 
 /// The 403 a cross-site verdict earns, phrased for what was refused (a
-/// "state change" or the "event stream").
+/// "state change", a read "request", or the "event stream").
 fn cross_site_rejection(verdict: &str, what: &str) -> Response {
     match verdict {
         "host" => err(
@@ -226,15 +226,24 @@ async fn authorize(face: &Face, headers: &HeaderMap) -> Result<(), Box<Response>
     )))
 }
 
-/// Authenticate a state change: reads-auth plus the CSRF layers —
-/// Host/Origin/Referer validation and the custom-header requirement (a
-/// cross-site fetch with a custom header cannot pass preflight, and
-/// SameSite=Strict already keeps the cookie home; the page sends
-/// `X-Requested-With`, API clients' `X-Management-Token` doubles as the
-/// custom header).
+/// Authenticate a state change: reads-auth plus the CSRF layers
+/// ([`require_csrf`]).
 async fn authorize_change(face: &Face, headers: &HeaderMap) -> Result<(), Box<Response>> {
     authorize(face, headers).await?;
-    if let Some(verdict) = cross_site(&face.security, headers) {
+    require_csrf(&face.security, headers)
+}
+
+/// The CSRF layers a state-changing request runs after its auth (issue
+/// #24 point 3): the Host/Origin/Referer validation, then the custom-
+/// header requirement (a cross-site fetch with a custom header cannot
+/// pass preflight, and SameSite=Strict already keeps the cookie home;
+/// the page sends `X-Requested-With`, API clients' `X-Management-Token`
+/// doubles as the custom header). `/v1/session` is a state change too —
+/// it mints a session — and runs these layers ahead of its body parse;
+/// its token rides the body, so the custom header is the page's
+/// `X-Requested-With` or the API client's `X-Management-Token`.
+fn require_csrf(security: &FaceState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if let Some(verdict) = cross_site(security, headers) {
         return Err(Box::new(cross_site_rejection(verdict, "state change")));
     }
     let has_custom_header =
@@ -245,6 +254,23 @@ async fn authorize_change(face: &Face, headers: &HeaderMap) -> Result<(), Box<Re
             "csrf_rejected",
             "state changes require a custom header (X-Requested-With for the page, X-Management-Token for API clients)",
         )));
+    }
+    Ok(())
+}
+
+/// Authenticate a read (the token or the session cookie) and run the
+/// Host/Origin/Referer layer every `/v1` request runs (issue #24 point
+/// 3 — the Transmission/qBittorrent precedent checks every request,
+/// reads included): a cross-site request is refused whatever it asked
+/// for. `what` phrases the refusal (a "request", the "event stream").
+async fn authorize_read(
+    face: &Face,
+    headers: &HeaderMap,
+    what: &'static str,
+) -> Result<(), Box<Response>> {
+    authorize(face, headers).await?;
+    if let Some(verdict) = cross_site(&face.security, headers) {
+        return Err(Box::new(cross_site_rejection(verdict, what)));
     }
     Ok(())
 }
@@ -303,10 +329,15 @@ pub struct SessionRequest {
 }
 
 /// `POST /v1/session`: exchange the token for an HttpOnly +
-/// SameSite=Strict session cookie. A wrong token rides the brute-force
-/// guard's delay before the refusal; a right one mints a session of the
-/// current token generation — rotate invalidates it without a sweep.
-async fn session(State(face): State<Face>, bytes: Bytes) -> Response {
+/// SameSite=Strict session cookie. A state change (it mints a session):
+/// the CSRF layers run before the body is even parsed; a wrong token
+/// then rides the brute-force guard's delay before the refusal, a right
+/// one mints a session of the current token generation — rotate
+/// invalidates it without a sweep.
+async fn session(State(face): State<Face>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if let Err(response) = require_csrf(&face.security, &headers) {
+        return *response;
+    }
     let request: SessionRequest = match parse_body(&bytes) {
         Ok(request) => request,
         Err(response) => return *response,
@@ -340,7 +371,7 @@ async fn session(State(face): State<Face>, bytes: Bytes) -> Response {
 /// identity (server URL, token hint) rides the line; the secrets behind
 /// the hints never leave the daemon (spec story 13).
 async fn status(State(face): State<Face>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorize(&face, &headers).await {
+    if let Err(response) = authorize_read(&face, &headers, "request").await {
         return *response;
     }
     Json(face.manager.snapshot()).into_response()
@@ -451,7 +482,7 @@ async fn log_tail(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = authorize(&face, &headers).await {
+    if let Err(response) = authorize_read(&face, &headers, "request").await {
         return *response;
     }
     let tail: u32 = query
@@ -537,11 +568,8 @@ impl Stream for HubStream {
 /// A client lagged behind the hub's capacity gets a `resync` notice —
 /// refetch `/v1/status` — instead of a replay.
 async fn events(State(face): State<Face>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorize(&face, &headers).await {
+    if let Err(response) = authorize_read(&face, &headers, "event stream").await {
         return *response;
-    }
-    if let Some(verdict) = cross_site(&face.security, &headers) {
-        return cross_site_rejection(verdict, "event stream");
     }
     let mut hub = face.manager.events().subscribe();
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
