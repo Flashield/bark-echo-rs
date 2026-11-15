@@ -33,14 +33,16 @@ required label, the optional operator Basic Auth credentials) and
 `subscribe_remove` (the Subscription id) are requests with typed
 outcomes; a refusal is an error response whose message is the reason —
 the server's own words, shown in the window and printed by the CLI. The
-add answers once that stream's supervisor is up; the remove answers
-once the stream is stopped, its secrets erased, and the config
-persisted. A removal is also announced unsolicited as a
-`subscription_removed` event so watching clients drop the line at once;
-the add needs no event of its own — the new stream's `starting` flip is
-that announcement, and it grows the line in place. Every apply
-serializes in the daemon: file before memory, so a failed save refuses
-the apply whole and the daemon's memory never disagrees with the file.
+add answers once the stream's supervisor is spawned — the new line
+starts at `starting` and its flip to running arrives as an event
+announcement; the remove answers once the stream is stopped, its
+secrets erased, and the config persisted. A removal is also announced
+unsolicited as a `subscription_removed` event so watching clients drop
+the line at once; the add needs no event of its own — the new stream's
+`starting` flip is that announcement, and it grows the line in place.
+Every apply serializes in the daemon: file before memory, so a failed
+save refuses the apply whole and the daemon's memory never disagrees
+with the file.
 
 Hot-apply also reshapes the daemon's own floor: zero Subscriptions is a
 healthy, actionable state — the daemon runs, serves the empty snapshot,
