@@ -469,6 +469,25 @@ pub async fn run(
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
                         snapshot: manager.state.snapshot(),
                     },
+                    // The Push Composer's send (ticket #16): performed
+                    // here, with the daemon's own secrets — the wire
+                    // carries none. The server's verdict goes back
+                    // verbatim; a send that could not be attempted is
+                    // the error answer.
+                    echo_ipc::Request::SendPush { push } => {
+                        // The send's context resolves from the config
+                        // the single writer holds NOW — hot CRUD may
+                        // have changed it since startup. The snapshot
+                        // clones out under a short lock; the HTTP send
+                        // runs without holding the writer.
+                        let config = manager.core.lock().await.config.clone();
+                        match crate::composer::handle_send(&config, manager.store.as_ref(), push)
+                            .await
+                        {
+                            Ok(outcome) => echo_ipc::Response::PushSent { outcome },
+                            Err(message) => echo_ipc::Response::Error { message },
+                        }
+                    }
                     // The Tray Menu's Quit (ticket #12): the answer
                     // leaves first, then the stop begins — the asking
                     // client reads the channel closing behind this

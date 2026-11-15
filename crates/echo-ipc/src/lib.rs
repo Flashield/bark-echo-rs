@@ -21,8 +21,8 @@ pub use error::IpcError;
 pub use handshake::{client_handshake, server_handshake};
 pub use message::{
     AddSource, AddedSubscription, BasicAuthCredentials, ClickAction, Event, NotificationIntent,
-    RemovedSubscription, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
-    StreamState, SubscriptionRuntime,
+    RemovedSubscription, Request, RequestFrame, Response, ResponseFrame, SendPush, SendPushOutcome,
+    StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 pub use server::serve;
 pub use transport::{Endpoint, IpcServer, connect_raw};

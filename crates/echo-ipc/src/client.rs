@@ -12,7 +12,8 @@ use crate::error::IpcError;
 use crate::handshake;
 use crate::message::{
     AddSource, AddedSubscription, BasicAuthCredentials, Event, NotificationIntent,
-    RemovedSubscription, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
+    RemovedSubscription, Request, RequestFrame, Response, ResponseFrame, SendPush, SendPushOutcome,
+    StatusSnapshot,
 };
 use crate::transport::{self, ClientStream, Endpoint};
 
@@ -153,6 +154,21 @@ impl Client {
             Response::SubscriptionRemoved { id, label } => Ok(RemovedSubscription { id, label }),
             other => Err(IpcError::Protocol(format!(
                 "unexpected response to a subscribe-remove request: {other:?}"
+            ))),
+        }
+    }
+
+    /// Send one Push on the Composer's behalf (ticket #16): the daemon
+    /// performs the send with its own stored secrets and answers with
+    /// the bark server's verdict. A send the daemon could not attempt
+    /// (unknown Subscription, unreachable server) is
+    /// [`IpcError::Rejected`] carrying its explanation; the server's
+    /// acceptance or refusal is the [`SendPushOutcome`].
+    pub async fn send_push(&mut self, push: SendPush) -> Result<SendPushOutcome, IpcError> {
+        match self.call(Request::SendPush { push }).await? {
+            Response::PushSent { outcome } => Ok(outcome),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a send-push request: {other:?}"
             ))),
         }
     }

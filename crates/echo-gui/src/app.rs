@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use echo_ipc::Endpoint;
 
+use crate::composer::ComposerModel;
 use crate::connection::{ClientAsk, CrudCommand, UiMsg, spawn_connection_loop};
 use crate::crud::{self, CrudModel};
 use crate::fonts;
@@ -62,13 +63,17 @@ pub enum GuiError {
 /// [`spawn_connection_loop`]) and arrives here over the mpsc receiver.
 pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    // The window's asks ride the reverse direction: a History Log pick
-    // (ticket #15) and the CRUD submits (ticket #14) become requests
-    // the connection loop serves over its own client — the surfaces
-    // never touch the channel themselves. Plain channels, one thread.
-    let (ask_sender, ask_receiver) = std::sync::mpsc::channel();
+    // The surfaces' asks ride the reverse direction: a History Log pick
+    // (ticket #15), the Composer's send (ticket #16), and the CRUD
+    // submits (ticket #14) become requests the connection loop serves
+    // over its own client — no surface ever touches the channel
+    // itself. Plain channels, one thread.
+    let (asks, ask_receiver) = std::sync::mpsc::channel();
     let (crud_sender, crud_receiver) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
+    // The endpoint and sender ride on: the Quit exchange (ticket #12)
+    // opens its own one-shot connection and paints through the same
+    // queue the connection loop uses.
     spawn_connection_loop(
         endpoint.clone(),
         sender.clone(),
@@ -82,11 +87,12 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
         // always-available face) and becomes the Management Window when
         // the tray item asks; `run_native`'s app id stays "bark-echo"
         // (the persistence key), while the runtime title is set on every
-        // show. The size is the Management Window's opening shape — the
-        // hidden shell never paints at it.
+        // show. The size is the Management Window's opening shape —
+        // the Push Composer's form above the Subscription list (ticket
+        // #16); the hidden shell never paints at it.
         viewport: egui::ViewportBuilder::default()
             .with_title("bark-echo")
-            .with_inner_size([560.0, 420.0])
+            .with_inner_size([640.0, 700.0])
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
         event_loop_builder: Some(Box::new(|builder| {
@@ -117,9 +123,9 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
                 .set_fonts(fonts::font_definitions());
             Ok(Box::new(TrayApp::new(
                 receiver,
+                asks,
                 sender,
                 endpoint,
-                ask_sender,
                 stop,
                 crud_sender,
             )))
@@ -131,8 +137,9 @@ pub fn run(endpoint: Endpoint) -> Result<(), GuiError> {
 /// The shell: the models' owner on the UI thread.
 struct TrayApp {
     receiver: Receiver<UiMsg>,
-    /// The window's asks out to the connection loop (a History Log pick,
-    /// ticket #15).
+    /// The surfaces' door to the connection loop — the Composer's send
+    /// (ticket #16) and the History Log view's pick (ticket #15) go
+    /// through it; no surface ever holds a client.
     asks: Sender<ClientAsk>,
     /// The queue Quit's exchange answers into — the same one the
     /// connection loop paints from.
@@ -151,6 +158,10 @@ struct TrayApp {
     /// on-open request is needed (and none exists to send — the
     /// connection loop owns the client).
     window: WindowModel,
+    /// The Push Composer's form (ticket #16), fed the same stream:
+    /// the picker's lines from the snapshot, its send's verdicts from
+    /// the loop's answers. Its fields persist while the window hides.
+    composer: ComposerModel,
     /// The picked Subscription's History Log viewer (ticket #15): fed
     /// the same stream, its one request going out over `asks`.
     history: HistoryView,
@@ -180,20 +191,21 @@ struct TrayApp {
 impl TrayApp {
     fn new(
         receiver: Receiver<UiMsg>,
+        asks: Sender<ClientAsk>,
         sender: Sender<UiMsg>,
         endpoint: Endpoint,
-        asks: Sender<ClientAsk>,
         stop: Arc<AtomicBool>,
         crud_commands: Sender<CrudCommand>,
     ) -> Self {
         Self {
             receiver,
+            asks,
             sender,
             endpoint,
-            asks,
             stop,
             model: TrayModel::connecting(),
             window: WindowModel::connecting(),
+            composer: ComposerModel::new(),
             history: HistoryView::default(),
             crud: CrudModel::new(),
             crud_commands,
@@ -234,14 +246,14 @@ impl eframe::App for TrayApp {
         }
 
         // The channel's news, all of it, into the models — the tray's
-        // glance, the window's list, and the History Log viewer eat the
-        // same snapshot-then-events stream (each stays current while
-        // hidden); the viewer re-asks on every fresh authority, its
-        // request going out over the ask channel and the answer coming
-        // back here as a message. Or everything is drained without
-        // effect once Quit is underway: the connection loop is winding
-        // down behind the stop flag, and nothing it says can matter to
-        // a shell on its way out.
+        // glance, the window's list, the Composer's picker, and the
+        // History Log viewer eat the same snapshot-then-events stream
+        // (each stays current while hidden); the viewer re-asks on every
+        // fresh authority, and the Composer's send verdicts arrive here
+        // as messages too. Or everything is drained without effect once
+        // Quit is underway: the connection loop is winding down behind
+        // the stop flag, and nothing it says can matter to a shell on
+        // its way out.
         let mut dirty = false;
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
@@ -271,6 +283,7 @@ impl eframe::App for TrayApp {
                 UiMsg::Snapshot(snapshot) => {
                     self.model.apply_snapshot(&snapshot);
                     self.window.apply_snapshot(&snapshot);
+                    self.composer.apply_snapshot(&snapshot);
                     if let Some(id) = self.history.daemon_back() {
                         let _ = self.asks.send(ClientAsk::HistorySnapshot {
                             subscription_id: id,
@@ -281,12 +294,18 @@ impl eframe::App for TrayApp {
                 UiMsg::Event(event) => {
                     self.model.apply_event(&event);
                     self.window.apply_event(&event);
+                    self.composer.apply_event(&event);
                     self.history.apply_append(&event);
+                    dirty = true;
+                }
+                UiMsg::SendFinished(result) => {
+                    self.composer.apply_send_result(&result);
                     dirty = true;
                 }
                 UiMsg::LinkDown => {
                     self.model.connection_lost();
                     self.window.connection_lost();
+                    self.composer.connection_lost();
                     self.history.connection_lost();
                     dirty = true;
                 }
@@ -398,11 +417,20 @@ impl eframe::App for TrayApp {
 
     // The Management Window's paint pass, reached only while the
     // viewport is visible (eframe runs no paint at all while hidden).
-    // Thin by contract: the models own every word; this lays them out
-    // and forwards the two asks — a row's Remove click to the CRUD
-    // model, and the CRUD model's composed commands to the connection
-    // loop (ticket #14).
+    // Thin by contract: the models own every word; this lays them out —
+    // the Push Composer's form on top (ticket #16), the Subscription
+    // list with its History Log viewer and the CRUD face beneath — and
+    // forwards the two asks: a row's Remove click to the CRUD model,
+    // and the CRUD model's composed commands to the connection loop
+    // (ticket #14).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(send) = crate::composer::render(ui, &mut self.composer) {
+            // The send rides the connection loop's client; the shell
+            // only forwards it (the model's busy state keeps the clicks
+            // one at a time).
+            let _ = self.asks.send(ClientAsk::SendPush(send));
+        }
+        ui.separator();
         let remove_clicked = render(ui, &self.window, &mut self.history, &self.asks);
         for id in remove_clicked {
             let label = self

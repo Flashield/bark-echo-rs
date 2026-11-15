@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use echo_ipc::message::{
     AddSource, BasicAuthCredentials, Event, Request, RequestFrame, Response, ResponseFrame,
-    StatusSnapshot, StreamState, SubscriptionRuntime,
+    SendPush, SendPushOutcome, StatusSnapshot, StreamState, SubscriptionRuntime,
 };
 use echo_ipc::{Client, Endpoint, IpcError, IpcServer, PROTOCOL_VERSION, connect_raw, serve};
 
@@ -459,6 +459,101 @@ async fn the_daemons_error_response_surfaces_to_the_client() {
     shutdown_cleanly(stop_tx, serve_task).await;
 }
 
+// ---- The Push Composer's send (ticket #16) ----
+
+#[tokio::test]
+async fn a_send_push_exchange_returns_the_servers_verdict() {
+    // The daemon answers the Composer's send with what the bark server
+    // said — here a rejection, carried verbatim to the window.
+    let handler = Box::new(|request: Request| {
+        Box::pin(async move {
+            match request {
+                Request::SendPush { push } => {
+                    assert_eq!(push.subscription_id, "tok");
+                    assert_eq!(push.device_key, "device-key-1");
+                    assert_eq!(push.title.as_deref(), Some("from the Composer"));
+                    assert_eq!(
+                        push.ext_params.get("url").map(String::as_str),
+                        Some("https://example.com"),
+                        "the Ext Params rode the request"
+                    );
+                    Response::PushSent {
+                        outcome: SendPushOutcome::Rejected {
+                            code: Some(400),
+                            message: "failed to get [key] device token from database".to_owned(),
+                        },
+                    }
+                }
+                other => panic!("the handler saw an unexpected request: {other:?}"),
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    });
+    let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    let outcome = client
+        .send_push(SendPush {
+            subscription_id: "tok".to_owned(),
+            device_key: "device-key-1".to_owned(),
+            title: Some("from the Composer".to_owned()),
+            subtitle: None,
+            body: None,
+            ext_params: BTreeMap::from([("url".to_owned(), "https://example.com".to_owned())]),
+        })
+        .await
+        .expect("the verdict answers");
+    assert_eq!(
+        outcome,
+        SendPushOutcome::Rejected {
+            code: Some(400),
+            message: "failed to get [key] device token from database".to_owned(),
+        }
+    );
+
+    shutdown_cleanly(stop_tx, serve_task).await;
+}
+
+#[tokio::test]
+async fn a_send_push_the_daemon_cannot_attempt_is_a_rejected_request() {
+    // A refusal to attempt (here: the daemon does not know the
+    // Subscription) is the channel's first-class error answer — the
+    // connection survives it and the message is actionable.
+    let handler = Box::new(|request: Request| {
+        Box::pin(async move {
+            match request {
+                Request::SendPush { .. } => Response::Error {
+                    message: "no Subscription with id `tok` is configured".to_owned(),
+                },
+                other => panic!("the handler saw an unexpected request: {other:?}"),
+            }
+        }) as Pin<Box<dyn Future<Output = Response> + Send>>
+    });
+    let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
+    let mut client = Client::connect(&endpoint).await.expect("connect");
+    let outcome = client
+        .send_push(SendPush {
+            subscription_id: "tok".to_owned(),
+            device_key: "device-key-1".to_owned(),
+            title: None,
+            subtitle: None,
+            body: None,
+            ext_params: BTreeMap::new(),
+        })
+        .await;
+    match outcome {
+        Err(IpcError::Rejected(message)) => {
+            assert!(
+                message.contains("no Subscription with id `tok`"),
+                "the refusal names the problem: {message}"
+            );
+        }
+        other => panic!("a refusal-to-attempt is Rejected, got {other:?}"),
+    }
+
+    shutdown_cleanly(stop_tx, serve_task).await;
+}
+
 #[tokio::test]
 async fn a_crud_request_travels_the_stack_and_its_typed_answer_comes_back() {
     // Ticket #14: add/remove ride the same connection as the snapshot —
@@ -563,6 +658,7 @@ async fn a_shutdown_request_is_answered_and_the_channel_closes_when_the_daemon_s
         }) as Pin<Box<dyn Future<Output = Response> + Send>>
     });
     let (_dir, endpoint, stop_tx, serve_task) = serving(handler).await;
+
     let closer = tokio::spawn(async move {
         let _ = stop_pull_rx.recv().await;
         let _ = stop_tx.send(());

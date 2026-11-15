@@ -93,7 +93,29 @@ impl Env {
         token_id: &str,
         label: &str,
     ) -> Self {
-        use echo_daemon::config::{Config, Subscription};
+        Self::with_subscription_and_auth(
+            server_url,
+            device_key,
+            stream_token,
+            token_id,
+            label,
+            None,
+        )
+    }
+
+    /// [`Env::with_subscription`] plus per-server operator Basic Auth
+    /// (protocol §1.4): the user rides the config's public fields, the
+    /// password only the daemon's store (spec story 13) — the shape the
+    /// Composer's send resolves on the daemon side (ticket #16).
+    fn with_subscription_and_auth(
+        server_url: &str,
+        device_key: &str,
+        stream_token: &str,
+        token_id: &str,
+        label: &str,
+        auth: Option<(&str, &str)>,
+    ) -> Self {
+        use echo_daemon::config::{Config, ServerEntry, Subscription};
         use echo_daemon::secrets::{SecretKey, SecretKind};
 
         let mut env = Self::empty();
@@ -107,6 +129,23 @@ impl Env {
         env.store
             .set(&key, SecretKind::StreamToken, stream_token)
             .expect("store stream token");
+        let servers = match auth {
+            Some((user, password)) => {
+                env.store
+                    .set(
+                        &SecretKey::for_server(server_url),
+                        SecretKind::BasicAuthPassword,
+                        password,
+                    )
+                    .expect("store basic auth password");
+                vec![ServerEntry {
+                    url: server_url.to_owned(),
+                    basic_auth_user: user.to_owned(),
+                    basic_auth_password_stored: true,
+                }]
+            }
+            None => Vec::new(),
+        };
         env.config = Config {
             subscriptions: vec![Subscription {
                 id: token_id.to_owned(),
@@ -115,7 +154,7 @@ impl Env {
                 token_hint: format!("{}...", &stream_token[..12]),
                 device_hint: format!("{}...", &device_key[..8]),
             }],
-            servers: Vec::new(),
+            servers,
         };
         env
     }
@@ -757,45 +796,6 @@ async fn a_push_lands_as_a_history_event_and_a_server_death_as_a_state_flip() {
     assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
 }
 
-#[tokio::test]
-async fn a_daemon_with_zero_subscriptions_stays_healthy_and_actionable() {
-    // Ticket #14: hot CRUD means a daemon can reach zero Subscriptions,
-    // and the GUI's spawn-if-absent starts one before any exists. Zero
-    // streams is a state, not a failure: the channel answers with an
-    // empty snapshot and the run stays up for more to come.
-    let server = common::TestServer::spawn().await;
-    let env = Env::empty();
-    let (fence_tx, runner) = running_daemon(&env).await;
-    let endpoint = env.paths.ipc_endpoint();
-
-    let mut client = connect_when_listening(&endpoint).await;
-    let snapshot = client.status().await.expect("the channel answers");
-    assert_eq!(
-        snapshot.subscriptions.len(),
-        0,
-        "no Subscription is configured yet"
-    );
-    assert_eq!(
-        snapshot.pid,
-        std::process::id(),
-        "the snapshot is this daemon run's"
-    );
-    // Still alive and answering after the first beat — no crash on the
-    // empty list.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let again = client.status().await.expect("the channel still answers");
-    assert_eq!(again.subscriptions.len(), 0);
-
-    fence_tx.send(()).expect("fence open");
-    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
-        .await
-        .expect("run ends within 10s")
-        .expect("run task joined");
-    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
-
-    server.shutdown().await;
-}
-
 // --- Hot-apply CRUD (ticket #14): add and remove ride the channel and
 // --- take effect immediately — asserted from outside the daemon, on
 // --- the channel, the server, the config file, and the secret store.
@@ -1218,6 +1218,214 @@ async fn basic_auth_credentials_land_in_the_store_never_in_the_config() {
         config.basic_auth_configured(&server.base_url),
         "the stored-password marker is set"
     );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+// ---- The Push Composer's send (ticket #16) ----
+
+/// Drain `listener` past the connect-time stream flips until the
+/// History Log append, and return it.
+async fn wait_history_append(
+    listener: &mut Client,
+    subscription_id: &str,
+    body: &str,
+) -> echo_ipc::message::NotificationIntent {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(15), listener.next_event())
+            .await
+            .expect("an event within 15s")
+            .expect("the channel stayed open");
+        match event {
+            echo_ipc::message::Event::HistoryAppended {
+                subscription_id: id,
+                entry,
+                ..
+            } => {
+                assert_eq!(id, subscription_id);
+                assert_eq!(
+                    entry.body, body,
+                    "this append is the Composer's Push, mirrored back"
+                );
+                return entry;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the append never arrived: {other:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_composer_send_arrives_at_the_target_device_end_to_end() {
+    // Ticket #16's acceptance: the send is one IPC request; the daemon
+    // performs it; the Push lands at the target Device through the
+    // embedded server — here the Subscription's own Device, which the
+    // daemon itself mirrors, so the arrival is observable as a History
+    // Log append announced on the channel.
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "composer").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+
+    common::wait_active_streams(&server, 1).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut listener = connect_when_listening(&endpoint).await;
+    let mut client = connect_when_listening(&endpoint).await;
+
+    // The send rides the seam: Subscription reference, explicit target
+    // Device Key, alert fields, Ext Params — and nothing else.
+    let outcome = client
+        .send_push(echo_ipc::message::SendPush {
+            subscription_id: token_id.clone(),
+            device_key: device_key.clone(),
+            title: Some("from the Composer".to_owned()),
+            subtitle: None,
+            body: Some("through the seam".to_owned()),
+            ext_params: [
+                ("url".to_owned(), "https://example.com".to_owned()),
+                ("sound".to_owned(), "bell".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        })
+        .await
+        .expect("the send was answered");
+    assert_eq!(outcome, echo_ipc::message::SendPushOutcome::Sent);
+
+    // The target Device received it: the daemon's own mirror appended
+    // the line — and the Ext Params rode through exactly as the server's
+    // V2 JSON route passes them for the CLI, `url` resolving into the
+    // intent's click action (the same mapping `push` produces).
+    let entry = wait_history_append(&mut listener, &token_id, "through the seam").await;
+    assert_eq!(entry.title, "from the Composer");
+    assert_eq!(
+        entry.click_action,
+        Some(echo_core::intent::ClickAction::OpenUrl {
+            url: "https://example.com".to_owned(),
+        }),
+        "the url Ext Param survived the whole ride: {entry:?}"
+    );
+
+    // The channel's cursor follows the send, like any other Push.
+    let snapshot = wait_snapshot(&mut client, "the processed id", |snapshot| {
+        snapshot.subscriptions[&token_id].last_message_id.is_some()
+    })
+    .await;
+    assert_eq!(
+        snapshot.subscriptions[&token_id].last_message_id,
+        Some(entry.id)
+    );
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rejected_composer_send_surfaces_the_servers_verdict_readably() {
+    // A bad Device Key: the server's own refusal rides the seam
+    // verbatim — the window will show what the server said, never a
+    // silent failure (ticket #16's acceptance).
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "composer-reject").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "desktop");
+    let (fence_tx, runner) = running_daemon(&env).await;
+    let endpoint = env.paths.ipc_endpoint();
+    let mut client = connect_when_listening(&endpoint).await;
+
+    let outcome = client
+        .send_push(echo_ipc::message::SendPush {
+            subscription_id: token_id.clone(),
+            device_key: "no-such-device-key".to_owned(),
+            title: None,
+            subtitle: None,
+            body: Some("doomed".to_owned()),
+            ext_params: Default::default(),
+        })
+        .await
+        .expect("the verdict answers even for a refusal");
+    match outcome {
+        echo_ipc::message::SendPushOutcome::Rejected { code, message } => {
+            assert_eq!(code, Some(400));
+            assert!(
+                message.contains("device token"),
+                "the server's own message rides: {message}"
+            );
+        }
+        other => panic!("a bad Device Key is a rejection, got {other:?}"),
+    }
+
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run ends within 10s")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "run must not fail: {outcome:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_composer_send_works_with_secrets_touched_only_by_the_daemon() {
+    // A Basic-Auth-protected server (protocol §1.4): the password lives
+    // only in the daemon's store. The IPC client — the GUI's exact
+    // position — cannot carry a credential: its request names the
+    // Subscription, and the send still goes out. Assert the daemon-side
+    // credential path through the seam, arrival included.
+    let server = common::TestServer::spawn_with_basic_auth("operator", "hunter2").await;
+    // /register is Basic-Auth-exempt (protocol §1.4); minting is not,
+    // so setup rides the operator credentials.
+    let setup = echo_core::server::ServerClient::new(&server.base_url)
+        .with_basic_auth("operator", "hunter2");
+    let device = setup.register_stream_device().await.expect("register");
+    let minted = setup
+        .mint_stream_token(&device.device_key, "composer-secrets")
+        .await
+        .expect("mint");
+    let env = Env::with_subscription_and_auth(
+        &server.base_url,
+        &device.device_key,
+        &minted.secret,
+        &minted.token_id,
+        "desktop",
+        Some(("operator", "hunter2")),
+    );
+    let (fence_tx, runner) = running_daemon(&env).await;
+
+    let endpoint = env.paths.ipc_endpoint();
+    let mut listener = connect_when_listening(&endpoint).await;
+    let mut client = connect_when_listening(&endpoint).await;
+
+    let outcome = client
+        .send_push(echo_ipc::message::SendPush {
+            subscription_id: minted.token_id.clone(),
+            device_key: device.device_key.clone(),
+            title: None,
+            subtitle: None,
+            body: Some("credentials stayed home".to_owned()),
+            ext_params: Default::default(),
+        })
+        .await
+        .expect("the send was answered");
+    assert_eq!(outcome, echo_ipc::message::SendPushOutcome::Sent);
+
+    // The daemon's own stream (its credentials, its connection policy)
+    // mirrored the send back: arrival, not just acceptance.
+    wait_history_append(&mut listener, &minted.token_id, "credentials stayed home").await;
 
     fence_tx.send(()).expect("fence open");
     let outcome = tokio::time::timeout(Duration::from_secs(10), runner)

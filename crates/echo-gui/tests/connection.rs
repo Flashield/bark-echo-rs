@@ -13,7 +13,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use echo_gui::connection::{ClientAsk, CrudCommand, UiMsg, run_connection_loop};
-use echo_ipc::message::{AddSource, Event, Request, Response, StatusSnapshot, StreamState};
+use echo_ipc::message::{
+    AddSource, Event, Request, Response, SendPush, StatusSnapshot, StreamState,
+};
 use echo_ipc::{Endpoint, IpcServer, serve};
 
 type BoxedHandler =
@@ -442,6 +444,139 @@ async fn an_ask_made_while_the_daemon_is_away_is_served_when_it_returns() {
         panic!("unreachable")
     };
     assert_eq!(subscription_id, "tok");
+
+    stop.store(true, Ordering::Relaxed);
+    loop_task.abort();
+}
+
+// ---- The Push Composer's send rides the loop (ticket #16) ----
+
+fn a_send() -> SendPush {
+    SendPush {
+        subscription_id: "tok".to_owned(),
+        device_key: "device-key-1".to_owned(),
+        title: Some("from the Composer".to_owned()),
+        subtitle: None,
+        body: Some("through the loop".to_owned()),
+        ext_params: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_composer_send_rides_the_loop_and_the_verdict_comes_back() {
+    // The Composer's send is performed on the connection the loop owns
+    // — the GUI's surfaces never hold a client — and the bark server's
+    // verdict comes back as its own message.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Endpoint::in_config_dir(dir.path());
+    let handler: BoxedHandler = Box::new(|request| {
+        Box::pin(async move {
+            match request {
+                Request::SendPush { push } => {
+                    assert_eq!(push.device_key, "device-key-1");
+                    Response::PushSent {
+                        outcome: echo_ipc::message::SendPushOutcome::Sent,
+                    }
+                }
+                Request::Status => Response::Status {
+                    snapshot: snapshot_with(StreamState::Running),
+                },
+                other => panic!("the handler saw an unexpected request: {other:?}"),
+            }
+        })
+    });
+    let _serve = serve_on(&endpoint, handler).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
+    let (_commands_tx, commands_rx) = mpsc::channel();
+    let loop_stop = stop.clone();
+    let loop_endpoint = endpoint.clone();
+    let loop_task = tokio::spawn(async move {
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            ask_rx,
+            loop_stop,
+            Duration::from_millis(50),
+            commands_rx,
+        )
+        .await
+    });
+
+    // Connected before asking: the ask queues once the loop is
+    // listening, the way the shell forwards a Send click.
+    wait_for(&rx, "the opening snapshot", |msg| {
+        matches!(msg, UiMsg::Snapshot(_))
+    })
+    .await;
+    ask_tx
+        .send(ClientAsk::SendPush(a_send()))
+        .expect("queue the send");
+    let msg = wait_for(&rx, "the send's verdict", |msg| {
+        matches!(msg, UiMsg::SendFinished(_))
+    })
+    .await;
+    match msg {
+        UiMsg::SendFinished(Ok(outcome)) => {
+            assert_eq!(
+                outcome,
+                echo_ipc::message::SendPushOutcome::Sent,
+                "the server's verdict surfaced"
+            );
+        }
+        other => panic!("the send's verdict, not: {other:?}"),
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn a_send_queued_while_the_daemon_is_away_is_failed_not_lost() {
+    // No daemon anywhere: the queued send is answered with why it did
+    // not go out — the Composer's state machine never hangs on
+    // Sending, and the absence is named (the tray's "never stale
+    // silence" rule, applied to the form). Unlike a History Log pick —
+    // a read that may wait out an outage — a Push is a side effect: it
+    // must never leave after the user was told it failed.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Endpoint::in_config_dir(dir.path());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (ask_tx, ask_rx) = mpsc::channel::<ClientAsk>();
+    let (_commands_tx, commands_rx) = mpsc::channel();
+    let loop_stop = stop.clone();
+    let loop_endpoint = endpoint.clone();
+    let loop_task = tokio::spawn(async move {
+        run_connection_loop(
+            loop_endpoint,
+            tx,
+            ask_rx,
+            loop_stop,
+            Duration::from_millis(50),
+            commands_rx,
+        )
+        .await
+    });
+
+    ask_tx
+        .send(ClientAsk::SendPush(a_send()))
+        .expect("queue the send");
+    let msg = wait_for(&rx, "the failed send", |msg| {
+        matches!(msg, UiMsg::SendFinished(_))
+    })
+    .await;
+    match msg {
+        UiMsg::SendFinished(Err(message)) => {
+            assert!(
+                message.contains("away"),
+                "the failure names the daemon's absence: {message}"
+            );
+        }
+        other => panic!("a queued send with no daemon fails, not: {other:?}"),
+    }
 
     stop.store(true, Ordering::Relaxed);
     loop_task.abort();
