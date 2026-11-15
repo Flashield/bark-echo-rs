@@ -646,8 +646,17 @@ async fn a_shutdown_request_is_answered_and_the_channel_closes_when_the_daemon_s
             match request {
                 Request::Shutdown => {
                     tokio::spawn(async move {
-                        let _ = stop_pull_tx.send(());
+                        // The beat is real: the stop fires only after the
+                        // answer had 50 ms to reach the wire. A named-pipe
+                        // write completes at the kernel asynchronously —
+                        // the writer is told the frame is out when it is
+                        // merely enqueued — so an instant stop races the
+                        // answer and cuts the frame mid-delivery on
+                        // Windows (a Unix socket's write is kernel-buffered
+                        // the moment the call returns, which is why the
+                        // race never showed there).
                         tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = stop_pull_tx.send(());
                     });
                     Response::ShuttingDown
                 }
