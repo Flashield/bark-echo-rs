@@ -53,14 +53,6 @@ async fn wait_for_status(harness: &common::Harness, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let output = harness.run(&["--plain-secrets", "status"]).await;
-        eprintln!(
-            "DBG-POLL t={:?} stderr: {}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            output.stderr
-        );
         assert!(
             output.success,
             "status must exit 0: {} {}",
