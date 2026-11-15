@@ -144,7 +144,7 @@ impl IpcServer {
             // a caller bug (the lock forbids it) — fail loudly here too.
             let pending = ServerOptions::new()
                 .first_pipe_instance(true)
-                .open(&endpoint.address)?;
+                .create(&endpoint.address)?;
             Ok(IpcServer {
                 endpoint: endpoint.clone(),
                 pipe_name: endpoint.address().to_owned(),
@@ -169,15 +169,22 @@ impl IpcServer {
         #[cfg(windows)]
         {
             use tokio::net::windows::named_pipe::ServerOptions;
+            // Platform fact: a client that opens the pipe and vanishes
+            // before the connect completes surfaces ERROR_BROKEN_PIPE
+            // (109) or ERROR_NO_DATA (232) — the connection is closed and
+            // one instance serves one connection, so the only fix is
+            // recreating the instance, which is what a fresh accept
+            // attempt does.
+            const ERROR_BROKEN_PIPE: i32 = 109;
+            const ERROR_NO_DATA: i32 = 232;
             match self.pending.connect().await {
                 Ok(()) => {}
-                // Platform fact (tokio's named pipe contract): a connect
-                // future that is dropped mid-wait leaves the instance in
-                // the connecting state — the only fix is recreating the
-                // instance, which is what a fresh accept attempt does.
-                Err(err) if err.kind() == io::ErrorKind::Cancelled => {
-                    self.pending = ServerOptions::new().open(&self.pipe_name)?;
-                    return self.accept().await;
+                Err(err)
+                    if err.raw_os_error() == Some(ERROR_BROKEN_PIPE)
+                        || err.raw_os_error() == Some(ERROR_NO_DATA) =>
+                {
+                    self.pending = ServerOptions::new().create(&self.pipe_name)?;
+                    return Box::pin(self.accept()).await;
                 }
                 Err(source) => return Err(source),
             }
@@ -186,7 +193,7 @@ impl IpcServer {
             // second client is never refused for a scheduling hiccup.
             let connected = std::mem::replace(
                 &mut self.pending,
-                ServerOptions::new().open(&self.pipe_name)?,
+                ServerOptions::new().create(&self.pipe_name)?,
             );
             Ok(Connection::new(connected))
         }
