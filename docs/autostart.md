@@ -21,8 +21,11 @@ All three samples rely on the same facts about the daemon:
   backoff and `Last-Event-ID` resume), so the service supervisor only
   needs to cover process crashes; a bark-server-rs maintenance window is
   invisible.
-- Configuration changes (ADR-0001's Subscription list) are read at
-  startup: restart the service after `subscribe add` / `subscribe rm`.
+- Configuration changes (ADR-0001's Subscription list) apply hot while
+  a daemon runs: `subscribe add` / `subscribe rm` ride the IPC Channel
+  and take effect immediately (ADR-0004) — no service restart. Only the
+  headless direct write (no daemon up, the CLI writing the files
+  directly) takes effect at the daemon's next start.
 
 With the GUI installed, these facts do more work, not less. Starting
 the Tray Menu (`bark-echo gui`) brings the daemon up when the
