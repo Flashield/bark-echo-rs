@@ -3,10 +3,17 @@
 //! config (ADR-0001), the secret store, and the server's Device/Token
 //! plane. Files and process output stay with the caller (the CLI); this
 //! module owns the *what*, not the *where*.
+//!
+//! When a daemon holds the single-instance lock, add and remove ride
+//! the IPC Channel instead (ticket #14, ADR-0004): the daemon is the
+//! single writer and applies the change hot. Without a daemon, the
+//! caller keeps today's direct-write path.
 
 use echo_core::server::{ServerClient, ServerError};
 
+use crate::channel;
 use crate::config::{Config, Subscription};
+use crate::paths::Paths;
 use crate::secrets::{SecretError, SecretKey, SecretKind, SecretStore};
 
 /// Where a new Subscription's Device comes from (GLOSSARY.md: one
@@ -125,4 +132,89 @@ pub fn remove(
 /// First 8 characters + `...` — matches the config's `device_hint` shape.
 fn device_hint(device_key: &str) -> String {
     format!("{}...", &device_key[..device_key.len().min(8)])
+}
+
+/// Why a channel ride failed (ticket #14). The daemon's own refusals
+/// come through as [`IpcError::Rejected`] carrying its message — the
+/// actionable part, printed as-is.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    /// A daemon holds the lock, but the channel did not answer within
+    /// the budget. Falling through to the direct write would race the
+    /// single writer, so the command fails instead — stop that daemon
+    /// or retry.
+    #[error(
+        "a daemon holds the lock but its IPC channel did not answer — \
+         stop that instance or retry"
+    )]
+    Unreachable,
+    /// The exchange itself failed (a refusal, a protocol break, a
+    /// transport error).
+    #[error(transparent)]
+    Ipc(#[from] echo_ipc::IpcError),
+}
+
+/// `subscribe add` when a daemon holds the lock (ticket #14): the
+/// request rides the IPC Channel and the daemon — the single writer —
+/// applies it hot, answering once the stream's supervisor is spawned —
+/// the new line starts at `starting` and its flip to running arrives
+/// as an event announcement (ADR-0004). The wire shape is the CLI
+/// flags' exact face (`--own` / `--device-key`, the label, the
+/// optional Basic Auth credentials).
+pub async fn add_via_channel(
+    paths: &Paths,
+    server: &str,
+    source: AddSource,
+    label: &str,
+    auth: Option<echo_core::stream::BasicAuth>,
+) -> Result<echo_ipc::message::AddedSubscription, ChannelError> {
+    let wire_source = match source {
+        AddSource::Own => echo_ipc::message::AddSource::Own,
+        AddSource::DeviceKey(device_key) => echo_ipc::message::AddSource::DeviceKey { device_key },
+    };
+    let wire_auth = auth.map(|credentials| echo_ipc::message::BasicAuthCredentials {
+        user: credentials.user,
+        password: credentials.password,
+    });
+    // The ride's budget, attempt cap, and retry shape are the shared
+    // loop's (crate::channel::ride); what is left here is the request's
+    // wire shape and the answer's fate.
+    let answer = channel::ride(paths, |mut client| {
+        let source = wire_source.clone();
+        let credentials = wire_auth.clone();
+        async move {
+            client
+                .subscribe_add(server, source, label, credentials)
+                .await
+        }
+    })
+    .await;
+    match answer {
+        Ok(added) => Ok(added),
+        // The daemon refused and said why (a bad Device Key, a refused
+        // label, ...): retrying cannot change the answer.
+        Err(err @ echo_ipc::IpcError::Rejected(_)) => Err(err.into()),
+        // The budget was spent without an answer: never fall through
+        // to the direct write (it would race the single writer) —
+        // Unreachable, the caller's actionable failure.
+        Err(_) => Err(ChannelError::Unreachable),
+    }
+}
+
+/// `subscribe rm` when a daemon holds the lock (ticket #14): the
+/// request rides the IPC Channel; the daemon stops that stream, erases
+/// the secrets, and updates the config before answering.
+pub async fn remove_via_channel(
+    paths: &Paths,
+    id: &str,
+) -> Result<echo_ipc::message::RemovedSubscription, ChannelError> {
+    let answer = channel::ride(paths, |mut client| async move {
+        client.subscribe_remove(id).await
+    })
+    .await;
+    match answer {
+        Ok(removed) => Ok(removed),
+        Err(err @ echo_ipc::IpcError::Rejected(_)) => Err(err.into()),
+        Err(_) => Err(ChannelError::Unreachable),
+    }
 }

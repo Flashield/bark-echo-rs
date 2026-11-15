@@ -101,6 +101,14 @@ impl Paths {
         self.config_dir.join("history")
     }
 
+    /// The IPC Channel's endpoint (ADR-0004): derived from this
+    /// install's config dir, so it lives beside the lock — a Unix domain
+    /// socket file on Linux/macOS, a named pipe on Windows
+    /// (echo-ipc handles the per-platform shape).
+    pub fn ipc_endpoint(&self) -> echo_ipc::Endpoint {
+        echo_ipc::Endpoint::in_config_dir(&self.config_dir)
+    }
+
     /// One Subscription's History Log path inside [`Paths::history_dir`].
     pub fn history_log(&self, subscription_id: &str) -> PathBuf {
         self.history_dir().join(format!("{subscription_id}.jsonl"))

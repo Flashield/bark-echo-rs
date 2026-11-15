@@ -15,6 +15,7 @@ use echo_core::server::ServerClient;
 use echo_daemon::auth;
 use echo_daemon::config::Config;
 use echo_daemon::history;
+use echo_daemon::lock::DaemonLock;
 use echo_daemon::notify::DesktopRenderer;
 use echo_daemon::paths::Paths;
 use echo_daemon::run::{self, DaemonSpec};
@@ -105,6 +106,15 @@ enum Command {
     /// Per-Subscription stream state plus the server's live statistics
     /// (/info): delivery health at a glance.
     Status,
+    /// The Tray Menu (GLOSSARY): the GUI's always-present tray presence,
+    /// each Subscription's label with its live stream state, updating
+    /// from the daemon's pushed events (issue #11). Launches the daemon
+    /// when the single-instance lock is idle (spawn-if-absent, ticket
+    /// #12); Quit asks the daemon for a graceful shutdown before
+    /// exiting. Shows the daemon's absence as the reconnecting state
+    /// instead of silence. The Management Window (#13) comes with its
+    /// ticket.
+    Gui,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +226,14 @@ impl BasicAuthArgs {
 
 #[tokio::main]
 async fn main() {
+    // The Windows toast-activation local server (ticket #17): the shell
+    // runs `<exe> --toast-activation` when a toast is clicked while no
+    // daemon is running to receive the click. Serve that one activation
+    // and exit — before the CLI sees arguments it does not know.
+    #[cfg(windows)]
+    if echo_daemon::toast_activation::is_activation_process() {
+        std::process::exit(echo_daemon::toast_activation::serve_activation_process());
+    }
     let cli = Cli::parse();
     if let Err(err) = run(cli).await {
         eprintln!("{err}");
@@ -277,29 +295,45 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Operator Basic Auth (§1.4, story 18): the client presents
                 // the credentials for minting; `add` then stores the
                 // password and lays the user + marker into the config.
-                let client = ServerClient::new(&server);
-                let client = match (&auth_user, &auth_password) {
-                    (None, None) => client,
-                    (user, password) => client.with_basic_auth(
-                        user.clone().unwrap_or_default(),
-                        password.clone().unwrap_or_default(),
-                    ),
-                };
                 let auth = (auth_user.is_some() || auth_password.is_some()).then(|| {
                     echo_core::stream::BasicAuth {
-                        user: auth_user.unwrap_or_default(),
-                        password: auth_password.unwrap_or_default(),
+                        user: auth_user.clone().unwrap_or_default(),
+                        password: auth_password.clone().unwrap_or_default(),
                     }
                 });
-                let added =
-                    subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
-                        .await?;
-                config.save(&paths.config_file())?;
-                println!("device key: {}", added.device_key);
-                println!(
-                    "subscription {} added (label: {}, token hint: {})",
-                    added.subscription.id, added.subscription.label, added.subscription.token_hint
-                );
+                // A daemon holding the lock is the single writer
+                // (ADR-0004): the change rides the channel and takes
+                // effect without a restart. Without a daemon, today's
+                // direct-write path stands (spec story 21).
+                if DaemonLock::probe(paths.lock_file())? {
+                    let added =
+                        subscribe::add_via_channel(&paths, &server, source, &label, auth).await?;
+                    println!("device key: {}", added.device_key);
+                    println!(
+                        "subscription {} added (label: {}, token hint: {})",
+                        added.id, added.label, added.token_hint
+                    );
+                } else {
+                    let client = ServerClient::new(&server);
+                    let client = match (&auth_user, &auth_password) {
+                        (None, None) => client,
+                        (user, password) => client.with_basic_auth(
+                            user.clone().unwrap_or_default(),
+                            password.clone().unwrap_or_default(),
+                        ),
+                    };
+                    let added =
+                        subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
+                            .await?;
+                    config.save(&paths.config_file())?;
+                    println!("device key: {}", added.device_key);
+                    println!(
+                        "subscription {} added (label: {}, token hint: {})",
+                        added.subscription.id,
+                        added.subscription.label,
+                        added.subscription.token_hint
+                    );
+                }
             }
             SubscribeCommand::List => {
                 let subscriptions = subscribe::list(&config);
@@ -317,12 +351,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             SubscribeCommand::Rm { id } => {
-                let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
-                config.save(&paths.config_file())?;
-                println!(
-                    "subscription {} removed (label: {})",
-                    removed.id, removed.label
-                );
+                // The same lock-held fork as `add` (ADR-0004): the
+                // daemon applies the removal hot when it holds the
+                // lock; the direct write otherwise.
+                if DaemonLock::probe(paths.lock_file())? {
+                    let removed = subscribe::remove_via_channel(&paths, &id).await?;
+                    println!(
+                        "subscription {} removed (label: {})",
+                        removed.id, removed.label
+                    );
+                } else {
+                    let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
+                    config.save(&paths.config_file())?;
+                    println!(
+                        "subscription {} removed (label: {})",
+                        removed.id, removed.label
+                    );
+                }
             }
         },
         Command::Token { command } => match command {
@@ -363,7 +408,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 paths: paths.clone(),
                 config,
                 store,
-                renderer: Arc::new(DesktopRenderer),
+                // `new` registers the Windows toast activation (ticket
+                // #17); elsewhere it is plain construction.
+                renderer: Arc::new(DesktopRenderer::new()),
             };
             run::run(spec, async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -373,6 +420,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status => {
             let report = status::report(&paths, &config, store.as_ref()).await?;
             print!("{}", report.render());
+        }
+        Command::Gui => {
+            // Lifecycle (ticket #12, ADR-0004): spawn-if-absent — an
+            // idle lock spawns a detached `bark-echo run` beside this
+            // executable; a held lock means a daemon is running (or
+            // starting) and the Tray Menu attaches to it. Never a
+            // second daemon attempt. A spawn failure is fatal and names
+            // itself: the launch owed the user a daemon, and silence
+            // would leave the tray guessing.
+            match echo_daemon::lifecycle::spawn_if_absent(&paths, cli.plain_secrets)? {
+                echo_daemon::lifecycle::SpawnOutcome::AlreadyRunning => {
+                    println!("daemon already running; the Tray Menu attaches to it");
+                }
+                echo_daemon::lifecycle::SpawnOutcome::Spawned { mut child } => {
+                    println!(
+                        "daemon spawned (pid {}); the Tray Menu attaches as it comes up",
+                        child.id()
+                    );
+                    // Reap the child whenever it ends, so an early
+                    // daemon death leaves no zombie behind the GUI
+                    // (dropping the handle would not reap). The daemon
+                    // is detached; its death is not the GUI's business
+                    // beyond this tidy-up.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+            }
+            // The event loop owns this thread, and the thread is the
+            // main one (eframe/winit and macOS's tray requirement). The
+            // channel work runs on the GUI crate's own thread, so no
+            // async runtime is needed here.
+            echo_gui::run(paths.ipc_endpoint())?;
         }
     }
     Ok(())

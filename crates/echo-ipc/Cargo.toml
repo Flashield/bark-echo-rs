@@ -1,0 +1,17 @@
+[package]
+name = "echo-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The History Log line's vocabulary (NotificationIntent) is echo-core's:
+# the channel relays appended lines as-is, one type, so the wire cannot
+# fork the log format (spec story 24).
+echo-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

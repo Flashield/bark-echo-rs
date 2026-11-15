@@ -1,17 +1,31 @@
-//! The `status` face (ADR-0002 MVP: the CLI reads the files the runtime
-//! writes — no IPC yet): per-Subscription stream state from the runtime
-//! state file, plus the server's live `/info` statistics (protocol §2.3)
-//! fetched fresh over HTTP. Whether the daemon is alive is answered by
-//! the single-instance lock itself.
+//! The `status` face: per-Subscription stream state from the daemon's
+//! live snapshot over the IPC Channel when the lock is held (ADR-0004),
+//! or from the runtime state file when no daemon answers, plus the
+//! server's live `/info` statistics (protocol §2.3) fetched fresh over
+//! HTTP. Whether the daemon is alive is answered by the single-instance
+//! lock itself.
 
 use echo_core::server::{ServerClient, ServerInfo};
+use echo_ipc::IpcError;
+use echo_ipc::message::StatusSnapshot;
 
 use crate::auth;
+use crate::channel;
 use crate::config::Config;
 use crate::lock::{DaemonLock, LockError};
 use crate::paths::Paths;
 use crate::secrets::SecretStore;
 use crate::state::{StateError, StateFile, StreamState};
+
+/// The daemon's live snapshot over the IPC Channel (ADR-0004): the
+/// daemon's in-memory answer, fresher than or equal to the state file's
+/// last write, riding the shared deadline-retry loop
+/// ([`crate::channel::ride`]). [`IpcError::Closed`] means the budget was
+/// spent without a live answer — the caller falls back to the state file
+/// either way.
+async fn ride_the_channel(paths: &Paths) -> Result<StatusSnapshot, IpcError> {
+    channel::ride(paths, |mut client| async move { client.status().await }).await
+}
 
 /// Why the status report could not be assembled.
 #[derive(Debug, thiserror::Error)]
@@ -54,17 +68,31 @@ pub struct StatusReport {
     pub subscriptions: Vec<SubscriptionStatus>,
 }
 
-/// Assemble the report: probe the lock, read the state file, fetch each
-/// server's `/info` live. Displayed data is all public; the only secret
-/// read is the operator Basic Auth password out of the store (story 18)
-/// when a protected server's `/info` demands it — never displayed.
+/// Assemble the report: probe the lock, take the per-Subscription
+/// stream state (the daemon's live snapshot over the channel when the
+/// lock is held; the runtime state file otherwise — today's path,
+/// unchanged), fetch each server's `/info` live. Displayed data is all
+/// public; the only secret read is the operator Basic Auth password out
+/// of the store (story 18) when a protected server's `/info` demands it
+/// — never displayed.
 pub async fn report(
     paths: &Paths,
     config: &Config,
     store: &dyn SecretStore,
 ) -> Result<StatusReport, StatusError> {
     let daemon_running = DaemonLock::probe(paths.lock_file())?;
-    let state = StateFile::read(&paths.state_file())?;
+    // The live source when a daemon holds the lock is the channel
+    // (ADR-0004). No daemon, or a channel that does not answer within
+    // the budget (a daemon mid-start, a dying one): the state file —
+    // the same bytes the daemon persists — with today's behavior.
+    let state = if daemon_running {
+        match ride_the_channel(paths).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => StateFile::read(&paths.state_file())?,
+        }
+    } else {
+        StateFile::read(&paths.state_file())?
+    };
 
     let mut subscriptions = Vec::new();
     for subscription in &config.subscriptions {

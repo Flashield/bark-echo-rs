@@ -21,10 +21,11 @@ is [`GLOSSARY.md`](GLOSSARY.md).
   disconnect — a flaky network or a server restart never loses a Push.
 - **Desktop notifications from notification intents**: title / subtitle /
   body rendered natively; a `url` Ext Param opens the default browser on
-  click and a `copy` Ext Param writes the clipboard — click actions are
-  supported on macOS and Linux; on Windows the toast fires but the action
-  is dropped until the tray stage (ADR-0002); an end-to-end-encrypted
-  Push renders a readable placeholder instead of ciphertext noise.
+  click and a `copy` Ext Param writes the clipboard — on all three
+  platforms (Windows toasts activate through the runtime-registered
+  AppUserModelID + COM callback, no installer needed); an
+  end-to-end-encrypted Push renders a readable placeholder instead of
+  ciphertext noise.
 - **Pull** (GLOSSARY): `pull` replays and lands everything the server
   still retains — for a laptop that slept through a day — into the
   History Log, silently, with replay-overlap duplicates suppressed by
@@ -146,8 +147,13 @@ Inside it:
   (GLOSSARY), appended by both the daemon and `pull`.
 - `daemon.lock` — the single-instance lock (ADR-0002); the OS releases it
   when the holding process dies, so a crash never leaves a stale lock.
-- `daemon-state.json` — the per-Subscription stream state `status` reads
-  while the daemon runs.
+- `daemon.ipc` — the IPC Channel the daemon serves beside its lock
+  (ADR-0004): a Unix domain socket on Linux/macOS (on Windows the pipe
+  name is derived from this directory). `status` takes its live stream
+  state over it while a daemon holds the lock.
+- `daemon-state.json` — the per-Subscription stream state the daemon
+  persists: the crash-recovery record `status` falls back to when no
+  daemon answers.
 
 On a headless Linux box without a secret service, run every command with
 `--plain-secrets` — the keyring error names the fallback when it is needed.
@@ -162,8 +168,11 @@ cargo clippy --all-targets
 ```
 
 CI runs the same three checks plus a build on Linux, macOS, and Windows on
-every push and PR (the embedded server means no external services); a
-`v*` tag publishes release binaries for all three platforms.
+every push and PR (the embedded server means no external services); on
+Windows the dev-dependency cannot build yet (upstream
+bark-server-rs#13), so Windows runs the build and the echo-ipc channel
+suite only; a `v*` tag publishes release binaries for all three
+platforms.
 
 Contributors: start with [`GLOSSARY.md`](GLOSSARY.md) (the vocabulary
 authority) and the ADRs in [`docs/adr/`](docs/adr/) — they explain the why

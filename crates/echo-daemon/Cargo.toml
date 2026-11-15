@@ -12,6 +12,11 @@ path = "src/main.rs"
 [dependencies]
 # The push subcommand is the send module's first consumer (issue #6).
 echo-core = { workspace = true }
+# The `gui` subcommand is the Tray Menu's entry (ticket #11); the crate
+# is the GUI stage's home (ADR-0003).
+echo-gui = { workspace = true }
+# The IPC Channel the daemon serves beside its lock (ADR-0004).
+echo-ipc = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +26,30 @@ keyring = { workspace = true }
 notify-rust = "4.19"
 tokio = { workspace = true }
 time = { workspace = true }
+
+# Windows toast activation (ticket #17): AUMID registration + COM
+# INotificationActivationCallback — the plumbing notify-rust's Windows
+# backend cannot express. Features stay per API group to keep the
+# compiled surface small; the dependency is only compiled for Windows
+# targets.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Win32_Security",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "UI_Notifications",
+    "Win32_UI_Notifications",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The #[implement] COM macro expands to windows_core paths.
+windows-core = "0.62"
 
 [dev-dependencies]
 # The one test seam (spec Testing Decisions): the real server, embedded

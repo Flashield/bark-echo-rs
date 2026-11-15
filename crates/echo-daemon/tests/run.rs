@@ -502,9 +502,15 @@ async fn run_refuses_when_another_instance_holds_the_lock() {
 }
 
 #[tokio::test]
-async fn run_without_subscriptions_is_an_actionable_error() {
+async fn a_run_with_zero_subscriptions_holds_and_ends_cleanly() {
+    // Ticket #14: hot CRUD means a daemon can start at — or reach —
+    // zero Subscriptions: a healthy, actionable state, not an error.
+    // The channel serves the empty snapshot and CRUD can add to it
+    // (the IPC seam asserts that); here the run's own contract — it
+    // holds until fenced and ends Ok.
     let dir = tempfile::tempdir().expect("temp dir");
-    let outcome = echo_daemon::run::run(
+    let (fence_tx, fence_rx) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(echo_daemon::run::run(
         echo_daemon::run::DaemonSpec {
             paths: echo_daemon::paths::Paths::from_dir(dir.path()),
             config: echo_daemon::config::Config::default(),
@@ -513,16 +519,22 @@ async fn run_without_subscriptions_is_an_actionable_error() {
             )),
             renderer: Arc::new(RecordingRenderer::default()),
         },
-        std::future::pending::<()>(),
-    )
-    .await;
-    match outcome {
-        Err(err) => assert!(
-            err.to_string().contains("subscribe add"),
-            "the error points at the fix: {err}"
-        ),
-        Ok(()) => panic!("a daemon with nothing to mirror must not start"),
-    }
+        async move {
+            let _ = fence_rx.await;
+        },
+    ));
+    // A beat of holding: zero Subscriptions is not an instant exit.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !runner.is_finished(),
+        "a zero-Subscription run holds, it does not end"
+    );
+    fence_tx.send(()).expect("fence open");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("run ends after the fence")
+        .expect("run task joined");
+    assert!(outcome.is_ok(), "the run ends cleanly: {outcome:?}");
 }
 
 #[tokio::test]

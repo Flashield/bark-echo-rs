@@ -4,8 +4,11 @@
 
 pub(crate) mod atomic;
 pub mod auth;
+pub(crate) mod channel;
+pub mod composer;
 pub mod config;
 pub mod history;
+pub mod lifecycle;
 pub mod lock;
 pub mod notify;
 pub mod paths;
@@ -14,3 +17,4 @@ pub mod secrets;
 pub mod state;
 pub mod status;
 pub mod subscribe;
+pub mod toast_activation;

@@ -6,13 +6,16 @@
 # fallback there.
 #
 # Windows runs build + fmt + clippy on the first-party targets only, and
-# skips `clippy --all-targets` and `cargo test`: both compile the
-# dev-dependency bark-server-rs (the embedded in-process test server),
-# whose lib target does not build on Windows — it binds a UnixListener
-# unconditionally (upstream Flashield/bark-server-rs#13). Plain
-# `cargo build` compiles no dev-dependencies, so the released Windows
-# binary is unaffected (release.yml builds exactly that). Until the
-# upstream cfg(unix) fix lands, that gate stands.
+# skips `clippy --all-targets` and the workspace `cargo test`: both
+# compile the dev-dependency bark-server-rs (the embedded in-process
+# test server), whose lib target does not build on Windows — it binds a
+# UnixListener unconditionally (upstream Flashield/bark-server-rs#13).
+# Plain `cargo build` compiles no dev-dependencies, so the released
+# Windows binary is unaffected (release.yml builds exactly that). The
+# echo-ipc crate carries no bark-server dev-dependency, so its own test
+# suite — the channel protocol over the real UDS/named-pipe transport —
+# runs on Windows too (`cargo test -p echo-ipc`); the daemon-level seam
+# tests stay on Linux/macOS until the upstream cfg(unix) fix lands.
 
 name: CI
 
@@ -81,6 +84,12 @@ jobs:
       - name: Build
         if: runner.os != 'Windows'
         run: cargo build --workspace --all-targets
+
+      # Windows: the channel's own suite — real UDS/named-pipe transport,
+      # no embedded server (see the file header).
+      - name: Test (echo-ipc)
+        if: runner.os == 'Windows'
+        run: cargo test -p echo-ipc
 
       - name: Test
         if: runner.os != 'Windows'

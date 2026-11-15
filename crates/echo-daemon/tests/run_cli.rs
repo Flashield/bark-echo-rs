@@ -32,18 +32,36 @@ async fn wait_active_streams(server: &common::TestServer, n: u64) {
 }
 
 #[tokio::test]
-async fn run_without_subscriptions_fails_with_the_actionable_fix() {
+async fn a_zero_subscription_run_stays_up_and_status_reports_it() {
+    // Ticket #14: hot CRUD means a daemon can start at — or reach —
+    // zero Subscriptions. The subprocess holds, and `status` rides the
+    // channel (the lock is held) to report the truth: running, nothing
+    // subscribed, the actionable empty state.
     let harness = common::Harness::new();
-    let output = harness.run(&["--plain-secrets", "run"]).await;
-    assert!(
-        !output.success,
-        "a daemon with nothing to mirror must not start"
-    );
-    assert!(
-        output.stderr.contains("subscribe add"),
-        "the error points at the fix: {}",
-        output.stderr
-    );
+    let mut daemon = harness
+        .spawn(&["--plain-secrets", "run"])
+        .spawn()
+        .expect("spawn run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let output = harness.run(&["--plain-secrets", "status"]).await;
+        assert!(
+            output.success,
+            "status must exit 0: {} {}",
+            output.stderr, output.stdout
+        );
+        if output.stdout.contains("daemon: running") && output.stdout.contains("no subscriptions") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the zero-Subscription daemon never came up; last:\n{}",
+            output.stdout
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    daemon.kill().await.expect("kill daemon");
+    let _ = daemon.wait().await;
 }
 
 #[tokio::test]

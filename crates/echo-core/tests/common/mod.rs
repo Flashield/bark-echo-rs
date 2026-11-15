@@ -8,6 +8,9 @@ pub mod apns;
 pub mod sse;
 
 use bark_server_rs::config::Config;
+// The receive loop's own credentials shape — the type the client
+// carries, not a bare tuple.
+use echo_core::stream::BasicAuth;
 
 /// An embedded bark server bound to an ephemeral port with its own
 /// temporary data directory. Hold the value until the test is done;
@@ -188,11 +191,11 @@ pub async fn wait_active_streams(server: &TestServer, n: u64) {
 // common/ is compiled into every test target; helpers are shared per
 // target, not all used everywhere.
 #[allow(dead_code)]
-pub async fn wait_active_streams_with(server: &TestServer, n: u64, auth: Option<(&str, &str)>) {
+pub async fn wait_active_streams_with(server: &TestServer, n: u64, auth: Option<BasicAuth>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let mut request = reqwest::Client::new().get(format!("{}/info", server.base_url));
-        if let Some((user, password)) = auth {
+        if let Some(BasicAuth { user, password }) = &auth {
             request = request.basic_auth(user, Some(password));
         }
         let info: serde_json::Value = request
