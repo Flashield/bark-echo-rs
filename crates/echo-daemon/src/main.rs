@@ -103,6 +103,13 @@ enum Command {
     /// Push as a desktop notification — the daemon runtime (ADR-0002).
     /// Stops on ctrl-C; a second run refuses on the single-instance lock.
     Run,
+    /// Run the Tray Menu host (issue #30, ADR-0005): a bare event loop
+    /// with no windows — the native tray shows each Subscription's
+    /// stream state at a glance, Manage opens the daemon's web
+    /// management face in the default browser, and Quit asks the daemon
+    /// for a graceful shutdown (ADR-0004's exchange). Brings the daemon
+    /// up when it is not running (spawn-if-absent).
+    Tray,
     /// Per-Subscription stream state plus the server's live statistics
     /// (/info): delivery health at a glance.
     Status,
@@ -407,6 +414,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await?;
+        }
+        Command::Tray => {
+            // The tray host owns the process from here: it runs the
+            // event loop until Quit and returns only when the host is
+            // done (the clean exit code rides on this returning Ok).
+            // The daemon's config and secret store stay out of the
+            // host — the spawned `bark-echo run` reads them itself
+            // (ADR-0004: the GUI never touched secrets either).
+            echo_daemon::tray_host::run(&paths, cli.plain_secrets)?;
         }
         Command::Status => {
             let report = status::report(&paths, &config, store.as_ref()).await?;
