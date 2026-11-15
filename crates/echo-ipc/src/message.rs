@@ -452,3 +452,32 @@ impl StreamState {
         }
     }
 }
+
+/// The CRUD answers' one-step rise from the typed outcome to the
+/// response frame: [`AddedSubscription`] is documented as
+/// [`Response::SubscriptionAdded`]'s fields as one value, and the
+/// daemon's two faces (the channel handler, the web face) both answer
+/// from it — the conversion lives here so the field mapping cannot
+/// fork between them.
+impl From<AddedSubscription> for Response {
+    fn from(added: AddedSubscription) -> Self {
+        Self::SubscriptionAdded {
+            id: added.id,
+            label: added.label,
+            server: added.server,
+            token_hint: added.token_hint,
+            device_key: added.device_key,
+        }
+    }
+}
+
+/// [`Response::SubscriptionRemoved`] from the typed outcome — the
+/// counterpart of the add conversion above.
+impl From<RemovedSubscription> for Response {
+    fn from(removed: RemovedSubscription) -> Self {
+        Self::SubscriptionRemoved {
+            id: removed.id,
+            label: removed.label,
+        }
+    }
+}

@@ -408,14 +408,10 @@ async fn subscribe_add(State(face): State<Face>, headers: HeaderMap, bytes: Byte
         )
         .await
     {
-        Ok(added) => Json(echo_ipc::message::AddedSubscription {
-            id: added.subscription.id,
-            label: added.subscription.label,
-            server: added.subscription.server,
-            token_hint: added.subscription.token_hint,
-            device_key: added.device_key,
-        })
-        .into_response(),
+        Ok(added) => {
+            let added: echo_ipc::message::AddedSubscription = added.into();
+            Json(added).into_response()
+        }
         Err(error) => refused(&error),
     }
 }
@@ -433,11 +429,10 @@ async fn subscribe_remove(
         return *response;
     }
     match face.manager.remove(&id).await {
-        Ok(removed) => Json(echo_ipc::message::RemovedSubscription {
-            id: removed.id,
-            label: removed.label,
-        })
-        .into_response(),
+        Ok(removed) => {
+            let removed: echo_ipc::message::RemovedSubscription = removed.into();
+            Json(removed).into_response()
+        }
         Err(error) => refused(&error),
     }
 }

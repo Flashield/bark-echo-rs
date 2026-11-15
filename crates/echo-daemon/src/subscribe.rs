@@ -39,6 +39,33 @@ pub struct Added {
     pub device_key: String,
 }
 
+/// The channel's wire outcome of a successful add: the persisted
+/// Subscription's public identity plus the Device Key, 1:1 — the one
+/// value both faces of the single writer answer with (the channel's
+/// `Response::SubscriptionAdded`, the web face's JSON body).
+impl From<Added> for echo_ipc::message::AddedSubscription {
+    fn from(added: Added) -> Self {
+        Self {
+            id: added.subscription.id,
+            label: added.subscription.label,
+            server: added.subscription.server,
+            token_hint: added.subscription.token_hint,
+            device_key: added.device_key,
+        }
+    }
+}
+
+/// The channel's wire outcome of a successful removal: the id and the
+/// label it carried — the removed Subscription's only public remains.
+impl From<Subscription> for echo_ipc::message::RemovedSubscription {
+    fn from(subscription: Subscription) -> Self {
+        Self {
+            id: subscription.id,
+            label: subscription.label,
+        }
+    }
+}
+
 /// Failures of the subscribe operations. Every message is for the user:
 /// the server face's typed errors and the store's actionable errors pass
 /// through unchanged.

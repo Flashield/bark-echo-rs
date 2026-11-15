@@ -683,22 +683,19 @@ pub async fn run(
                         label,
                         basic_auth,
                     } => match manager.add(&server, source, &label, basic_auth).await {
-                        Ok(added) => echo_ipc::Response::SubscriptionAdded {
-                            id: added.subscription.id,
-                            label: added.subscription.label,
-                            server: added.subscription.server,
-                            token_hint: added.subscription.token_hint,
-                            device_key: added.device_key,
-                        },
+                        Ok(added) => {
+                            let added: echo_ipc::message::AddedSubscription = added.into();
+                            echo_ipc::Response::from(added)
+                        }
                         Err(err) => echo_ipc::Response::Error {
                             message: err.to_string(),
                         },
                     },
                     echo_ipc::Request::SubscribeRemove { id } => match manager.remove(&id).await {
-                        Ok(removed) => echo_ipc::Response::SubscriptionRemoved {
-                            id: removed.id,
-                            label: removed.label,
-                        },
+                        Ok(removed) => {
+                            let removed: echo_ipc::message::RemovedSubscription = removed.into();
+                            echo_ipc::Response::from(removed)
+                        }
                         Err(err) => echo_ipc::Response::Error {
                             message: err.to_string(),
                         },
