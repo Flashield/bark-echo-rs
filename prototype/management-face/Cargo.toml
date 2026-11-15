@@ -1,0 +1,23 @@
+# Ticket #23 prototype: one web management page to react to.
+# Throwaway fidelity — mock data, no daemon integration, never merged.
+[package]
+name = "management-face-prototype"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone crate on purpose: the empty [workspace] table detaches this
+# directory from the repo workspace above it, so building the repo never
+# touches this crate and building this crate never touches the repo.
+[workspace]
+
+[dependencies]
+# Same major pin as bark-server-rs (resolves to 0.8.x; the repo's lock
+# file shows 0.8.9). The real daemon face builds on exactly this serving
+# pattern, so the prototype doubles as its validation.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only for the `Stream` trait the SSE body implements (zero deps of its own).
+futures-core = { version = "0.3", default-features = false }

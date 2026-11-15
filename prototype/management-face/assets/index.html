@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>bark-echo — management face (prototype)</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <h1>bark-echo</h1>
+    <span class="tag">management face — prototype</span>
+  </div>
+  <span id="conn" class="conn">connecting</span>
+</header>
+
+<main>
+
+  <section id="subs" class="card">
+    <div class="sec-head">
+      <h2>Subscriptions</h2>
+      <button id="add-open" class="btn small" type="button">+ Add</button>
+    </div>
+    <ul id="sub-list" class="sub-list">
+      <li class="empty">Loading subscriptions…</li>
+    </ul>
+    <form id="add-form" class="form" hidden>
+      <h3>New subscription</h3>
+      <label>Label
+        <input name="label" required placeholder="Home Server" autocomplete="off">
+      </label>
+      <label>Server URL
+        <input name="server" type="url" required placeholder="https://push.example.net" autocomplete="off">
+      </label>
+      <label>Device key
+        <input name="device_key" placeholder="the push target (mock)" autocomplete="off">
+      </label>
+      <label>Stream Token
+        <input name="stream_token" placeholder="the stream credential (mock)" autocomplete="off">
+      </label>
+      <div class="btn-row">
+        <button class="btn primary" type="submit">Add — hot apply</button>
+        <button class="btn" type="button" id="add-cancel">Cancel</button>
+      </div>
+      <p class="hint">Mock: the new line starts at <code>starting</code>; the flip to
+        <code>running</code> arrives over the event stream, like the real hot-apply.</p>
+    </form>
+  </section>
+
+  <section id="log" class="card">
+    <div class="sec-head">
+      <h2>History Log</h2>
+      <span id="log-sub" class="muted">select a subscription</span>
+    </div>
+    <ul id="log-list" class="log-list">
+      <li class="empty">No subscription selected.</li>
+    </ul>
+  </section>
+
+  <section id="composer" class="card">
+    <div class="sec-head">
+      <h2>Push Composer</h2>
+    </div>
+    <form id="push-form" class="form">
+      <label>Subscription
+        <select name="subscription_id" id="push-sub"></select>
+      </label>
+      <label>Device key
+        <input name="device_key" placeholder="target Device Key" autocomplete="off">
+      </label>
+      <label>Title
+        <input name="title" placeholder="notification title" autocomplete="off">
+      </label>
+      <label>Subtitle
+        <input name="subtitle" placeholder="notification subtitle" autocomplete="off">
+      </label>
+      <label>Body
+        <textarea name="body" rows="3" placeholder="the content — try typing CJK here"></textarea>
+      </label>
+      <fieldset class="ext-box">
+        <legend>Ext Params</legend>
+        <div id="ext-rows">
+          <div class="ext">
+            <input name="ext_name" placeholder="name — url, group, sound…" autocomplete="off">
+            <input name="ext_value" placeholder="value" autocomplete="off">
+          </div>
+          <div class="ext">
+            <input name="ext_name" placeholder="name" autocomplete="off">
+            <input name="ext_value" placeholder="value" autocomplete="off">
+          </div>
+        </div>
+        <button class="btn small" type="button" id="ext-add">+ field</button>
+      </fieldset>
+      <button class="btn primary" type="submit">Send push</button>
+      <p class="hint">Mock: a sent push lands in the History Log over the event stream.</p>
+    </form>
+  </section>
+
+</main>
+
+<div id="gate" class="gate" hidden>
+  <form id="gate-form" class="card gate-card">
+    <h2>Management token</h2>
+    <p class="hint">Every request to the face needs the daemon's management token.
+      It is exchanged for an HttpOnly session cookie; the page never holds it again.
+      Demo token: <code>demo</code></p>
+    <label>Token
+      <input id="gate-token" type="password" required autocomplete="off" inputmode="text">
+    </label>
+    <button class="btn primary" type="submit">Unlock</button>
+    <p id="gate-error" class="error" hidden></p>
+  </form>
+</div>
+
+<div id="toast" class="toast" role="status"></div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>
