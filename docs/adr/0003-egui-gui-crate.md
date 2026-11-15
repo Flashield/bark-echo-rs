@@ -1,5 +1,10 @@
 # The GUI is an egui/eframe crate (glow renderer), not Tauri or Slint
 
+> **Superseded (2026-11-15):** [ADR-0005](0005-web-management-face.md) chose a
+> daemon-served B/S web management face over this ADR's egui GUI. This
+> branch is dormant (tag `egui-face-dormant`); the ADR remains as the
+> record of the egui decision.
+
 The GUI stage (Tray Menu, Management Window, Push Composer — GLOSSARY) is
 one Rust crate built on egui/eframe with the glow renderer. ADR-0002's
 placeholder named Tauri; the deciding constraints rank differently: the

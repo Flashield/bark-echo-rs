@@ -1,5 +1,10 @@
 # The IPC Channel is JSON Lines over a UDS/named pipe; the daemon is the single writer
 
+> **Amended (2026-11-15):** [ADR-0005](0005-web-management-face.md) changed the
+> presentation layer this ADR assumed — the web face reads daemon state
+> in-process and the tray host takes over spawn-if-absent — while this
+> ADR's IPC Channel stands unchanged as the CLI's face.
+
 The GUI stage's local channel (ADR-0002) carries one JSON Lines
 connection per client — the GUI, and the CLI's live queries. Requests
 and responses carry an id; daemon-pushed events carry none. Openings are
