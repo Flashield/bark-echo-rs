@@ -20,6 +20,15 @@ use echo_ipc::message::{SendPush, SendPushOutcome};
 use crate::config::Config;
 use crate::secrets::SecretStore;
 
+/// The refusal for a send naming no held Subscription — one message for
+/// every face (the channel's error answer and the HTTP face's 404,
+/// issue #31), so neither can paraphrase it into its own words.
+pub(crate) fn unknown_subscription_message(subscription_id: &str) -> String {
+    format!(
+        "no Subscription with id `{subscription_id}` is configured — the Composer's send rides one of the daemon's Subscriptions"
+    )
+}
+
 /// Perform one Composer send. `Ok` is the bark server's verdict —
 /// [`SendPushOutcome::Sent`] or the refusal verbatim; `Err` is the
 /// explanation for a send that was never attempted, as the channel's
@@ -35,12 +44,7 @@ pub async fn handle_send(
         .subscriptions
         .iter()
         .find(|subscription| subscription.id == push.subscription_id)
-        .ok_or_else(|| {
-            format!(
-                "no Subscription with id `{}` is configured — the Composer's send rides one of the daemon's Subscriptions",
-                push.subscription_id
-            )
-        })?;
+        .ok_or_else(|| unknown_subscription_message(&push.subscription_id))?;
     // The operator Basic Auth credentials (§1.4) out of the store — the
     // daemon's own (spec story 13). A credential-required seam: unlike
     // the CLI `push` (whose flags or absence speak for themselves), the

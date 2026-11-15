@@ -776,12 +776,15 @@ name = "echo-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bark-server-rs",
  "clap",
  "echo-core",
  "echo-ipc",
+ "futures-core",
  "keyring",
  "notify-rust",
+ "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",

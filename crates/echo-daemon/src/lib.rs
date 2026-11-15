@@ -10,6 +10,11 @@ pub mod config;
 pub mod history;
 pub mod lifecycle;
 pub mod lock;
+/// The management face (issue #31): the daemon's in-process HTTP
+/// surface — the `/v1` API, the SSE stream, and the security posture
+/// (issue #24). Public for the CLI's `management` commands; the face
+/// itself serves only from a live `run`.
+pub mod management;
 pub mod notify;
 pub mod paths;
 pub mod run;

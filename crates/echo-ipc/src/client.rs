@@ -215,6 +215,20 @@ impl Client {
         }
     }
 
+    /// Ask the daemon to rotate its management token (ticket #31, the
+    /// CLI's `management rotate` when a daemon holds the lock): the
+    /// fresh secret is stored and every session the face issued under
+    /// the old one dies at once. [`IpcError::Rejected`] carries the
+    /// daemon's reason when the rotation could not be applied.
+    pub async fn management_rotate(&mut self) -> Result<(), IpcError> {
+        match self.call(Request::ManagementRotate).await? {
+            Response::ManagementRotated => Ok(()),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a management-rotate request: {other:?}"
+            ))),
+        }
+    }
+
     /// The next daemon-pushed event, oldest first. Events heard during
     /// an exchange surface here before anything new arrives; while
     /// waiting on the wire, a response frame is a protocol error —

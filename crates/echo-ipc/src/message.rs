@@ -109,6 +109,18 @@ pub enum Request {
         /// large History Log from weighing on the viewer.
         tail: u32,
     },
+
+    // --- Management face (ticket #31): the web face's root credential
+    // --- is the daemon's to rotate — the single writer owns the secret
+    // --- store (ADR-0004) — and the rotation must drop every browser
+    // --- session the face holds (issue #24's kill switch), so it rides
+    // --- the channel like every other live state change. The token
+    // --- itself never rides the wire: `management token` reads the
+    // --- store directly, on the same machine.
+    /// Ask the daemon to replace its management token (issue #24): the
+    /// fresh secret is stored, and every session the face issued under
+    /// the old one is invalidated at once.
+    ManagementRotate,
 }
 
 /// Where a new Subscription's Device comes from (GLOSSARY.md: one
@@ -292,6 +304,15 @@ pub enum Response {
         /// The entries, oldest last.
         entries: Vec<NotificationIntent>,
     },
+
+    // --- Management face (ticket #31), matching the request plane's
+    // section above.
+    /// A [`Request::ManagementRotate`] was applied: the fresh token is
+    /// in the secret store and every face session issued under the old
+    /// one is gone. The token's value is read with `management token`,
+    /// never carried here — the channel keeps no copy of the face's
+    /// credential.
+    ManagementRotated,
 }
 
 /// What a successful [`Request::SubscribeAdd`] produced — the

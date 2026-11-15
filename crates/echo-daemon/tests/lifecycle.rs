@@ -134,6 +134,7 @@ async fn a_launch_spawns_attaches_quits_and_takes_over() {
                 device_hint: format!("{}...", &device_key[..8]),
             }],
             servers: Vec::new(),
+            management: Default::default(),
         };
         config.save(&paths.config_file()).expect("config saved");
     }

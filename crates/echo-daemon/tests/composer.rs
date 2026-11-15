@@ -71,6 +71,7 @@ fn an_env(
             device_hint: format!("{}...", &device_key[..8.min(device_key.len())]),
         }],
         servers,
+        management: Default::default(),
     };
     (dir, config, store)
 }

@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- The management page's HTML shell. Ticket #32 fills this in with the
+     real page (server-rendered shell + vanilla-JS consumer of the /v1
+     API); this placeholder keeps the serving shape, the gate, and the
+     route live for ticket #31's seam tests. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bark-echo management</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main>
+    <h1>bark-echo management face</h1>
+    <p>The web page arrives with ticket #32. Until then, the daemon is
+       fully manageable with curl over the <code>/v1</code> API:</p>
+    <pre><code>curl -H "X-Management-Token: $TOKEN" http://127.0.0.1:8081/v1/status</code></pre>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

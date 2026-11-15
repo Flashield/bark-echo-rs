@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// The whole persisted configuration: the Subscription list plus
-/// per-server entries (Basic Auth, protocol §1.4).
+/// per-server entries (Basic Auth, protocol §1.4) and the management
+/// face's serving settings (issue #31).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -20,6 +21,51 @@ pub struct Config {
     /// Per-server operator-level settings, keyed by URL.
     #[serde(default)]
     pub servers: Vec<ServerEntry>,
+    /// The management face's serving settings (issue #31).
+    /// `#[serde(default)]` because config files written before the face
+    /// existed must still parse; the next save lays the section in.
+    #[serde(default)]
+    pub management: ManagementConfig,
+}
+
+/// The management face's serving configuration (issue #31): where the
+/// daemon serves the web face, and the LAN opt-in. The face's
+/// credential is not here — secrets stay out of config.toml (ADR-0001's
+/// shape); the management token lives in the secret store under the
+/// `management` key (issue #24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementConfig {
+    /// The socket address the face binds, e.g. `127.0.0.1:8081` — the
+    /// default: bark-server owns 8080, and localhost-only is the safe
+    /// posture (issue #24). Port `0` binds an ephemeral port (tests).
+    /// An SSH tunnel or tailnet reaches this default without any LAN
+    /// exposure (spec story 16).
+    #[serde(default = "ManagementConfig::default_bind")]
+    pub bind: String,
+    /// The LAN opt-in (issue #24, spec story 15): bind on all interfaces
+    /// and require the management token for every request — the HTML
+    /// page included, no anonymous view. The config half of the opt-in;
+    /// `run --bind-lan` says the same thing for one run.
+    #[serde(default)]
+    pub bind_lan: bool,
+}
+
+impl ManagementConfig {
+    /// The default bind: localhost at 8081 (issue #24 — bark-server
+    /// owns 8080).
+    fn default_bind() -> String {
+        "127.0.0.1:8081".to_owned()
+    }
+}
+
+impl Default for ManagementConfig {
+    fn default() -> Self {
+        Self {
+            bind: Self::default_bind(),
+            bind_lan: false,
+        }
+    }
 }
 
 /// One Subscription (GLOSSARY.md): one server URL, one Device, one Stream

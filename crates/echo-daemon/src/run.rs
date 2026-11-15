@@ -22,6 +22,7 @@ use std::sync::Arc;
 use echo_core::history::HistoryLog;
 use echo_core::intent::NotificationIntent;
 use echo_core::stream::{RealtimeStream, StreamConfig, StreamEnd, StreamEvent};
+use echo_ipc::message::{SendPush, SendPushOutcome, StatusSnapshot};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
@@ -33,7 +34,8 @@ use crate::state::{StateWriter, StreamState};
 
 /// Everything a daemon run needs, handed in by the CLI (or a test):
 /// where the files live, the loaded Subscription list, the secret store,
-/// and the renderer the intents flow into.
+/// the renderer the intents flow into — and, when the management face is
+/// being served, its pre-bound listener.
 pub struct DaemonSpec {
     /// The daemon's file locations.
     pub paths: Paths,
@@ -43,6 +45,30 @@ pub struct DaemonSpec {
     pub store: Arc<dyn SecretStore>,
     /// The notification renderer — real in production, a fake in tests.
     pub renderer: Arc<dyn NotificationRenderer>,
+    /// The management face's inputs (issue #31): `bark-echo run` binds
+    /// per `[management]` config and hands the listener in; `None`
+    /// skips the face (the channel tests drive `run` without HTTP).
+    pub management: Option<ManagementFace>,
+}
+
+/// The management face's serving inputs (issue #31): an already-bound
+/// listener and the LAN posture. The bind happens at the caller — a
+/// squatted port fails loud there, naming the config key, before the
+/// daemon claims its lock.
+pub struct ManagementFace {
+    /// The listener the face serves on (`bark-echo run`: per
+    /// `[management] bind`, rewritten to all interfaces by the LAN
+    /// opt-in; tests: an ephemeral `127.0.0.1:0` bind).
+    pub listener: std::net::TcpListener,
+    /// The LAN posture (#24 point 2): when bound to all interfaces,
+    /// every request requires the management token — the HTML page
+    /// included, no anonymous view.
+    pub gate_page: bool,
+    /// Whether the face is localhost-bound and may enforce the loopback
+    /// Host allowlist (the DNS-rebinding defense, #24 point 3). A LAN
+    /// bind disables it — callers may use any name — and the token
+    /// gates everything there anyway.
+    pub local_only: bool,
 }
 
 /// Why a run could not start. In-run problems (a render hiccup, a
@@ -68,6 +94,17 @@ pub enum RunError {
         #[source]
         source: std::io::Error,
     },
+    /// The management face's token could not be ensured in the secret
+    /// store (issue #31): the run refuses to start rather than serve a
+    /// face with no credential — the token is the whole gate (issue
+    /// #24). A headless machine without a secret service is pointed at
+    /// `--plain-secrets` by the store's own error.
+    #[error("cannot ensure the management token: {0}")]
+    ManagementToken(#[from] crate::secrets::SecretError),
+    /// The pre-bound management listener could not be adopted by the
+    /// async runtime — the bind itself already succeeded at the caller.
+    #[error("cannot serve the management face on its bound listener: {0}")]
+    FaceListener(#[source] std::io::Error),
 }
 
 /// One live Subscription's handles: how shutdown and hot removal stop
@@ -86,7 +123,10 @@ struct LiveStream {
 /// Subscription list and the live supervisor set live here; every
 /// mutation — the startup spawn and the hot CRUD handlers — serializes
 /// on the mutex, so two requests can never interleave a half-apply.
-struct Manager {
+/// `pub(crate)`: the management face's endpoints call the same
+/// operations the channel's handlers do — one single writer, two faces
+/// (issue #31, spec story 30).
+pub(crate) struct Manager {
     /// The daemon's file locations — the config file the single writer
     /// keeps current (ADR-0004).
     paths: Paths,
@@ -113,6 +153,75 @@ struct Core {
 }
 
 impl Manager {
+    /// The live snapshot (the channel's `Status` answer and the face's
+    /// `/v1/status`): the state writer's own view, no file read.
+    pub(crate) fn snapshot(&self) -> StatusSnapshot {
+        self.state.snapshot()
+    }
+
+    /// The event hub — the face's `/v1/events` subscribes to the same
+    /// broadcast the channel relays (one hub, every face hears every
+    /// flip and append).
+    pub(crate) fn events(&self) -> tokio::sync::broadcast::Sender<echo_ipc::Event> {
+        self.event_hub.clone()
+    }
+
+    /// The History Log tail (ticket #15's semantics) for the channel's
+    /// `HistorySnapshot` and the face's `/v1/log/{id}`: the daemon reads
+    /// its own daemon-private log — for the config as the single writer
+    /// holds it NOW (hot CRUD may have changed it since startup) — all
+    /// complete entries, oldest last, the last `tail` of them. A
+    /// Subscription the daemon does not hold is refused, not answered
+    /// with a silently empty log — so no path outside its own
+    /// Subscription logs is ever served, whatever a client puts in the
+    /// id.
+    pub(crate) async fn history_tail(
+        &self,
+        subscription_id: &str,
+        tail: u32,
+    ) -> Result<Vec<NotificationIntent>, TailError> {
+        let core = self.core.lock().await;
+        let Some(subscription) = core
+            .config
+            .subscriptions
+            .iter()
+            .find(|held| held.id == subscription_id)
+        else {
+            return Err(TailError::Unknown(subscription_id.to_owned()));
+        };
+        let log = HistoryLog::new(self.paths.history_log(&subscription.id));
+        match log.entries() {
+            Ok(entries) => {
+                let start = entries.len().saturating_sub(tail as usize);
+                Ok(entries[start..].to_vec())
+            }
+            Err(err) => Err(TailError::Read(err.to_string())),
+        }
+    }
+
+    /// One Composer send (ticket #16): performed here, with the daemon's
+    /// own stored secrets and connection policy (ADR-0004) — the channel
+    /// carries no credentials, and neither does the face. The send's
+    /// context resolves from the config the single writer holds NOW —
+    /// hot CRUD may have changed it since startup. The snapshot clones
+    /// out under a short lock; the HTTP send runs without holding the
+    /// writer.
+    pub(crate) async fn push(&self, push: SendPush) -> Result<SendPushOutcome, SendAttemptError> {
+        let config = self.core.lock().await.config.clone();
+        if !config
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.id == push.subscription_id)
+        {
+            return Err(SendAttemptError::Unknown(
+                crate::composer::unknown_subscription_message(&push.subscription_id),
+            ));
+        }
+        crate::composer::handle_send(&config, self.store.as_ref(), push)
+            .await
+            .map_err(SendAttemptError::Unreachable)
+    }
+
     /// Start one Subscription's Realtime Stream (ADR-0002): the Stream
     /// Token and the operator Basic Auth credentials out of the store,
     /// the core receive loop spawned, a supervisor watching it. The
@@ -222,7 +331,7 @@ impl Manager {
     /// announces the new line, and starts that stream's supervisor —
     /// all before the answer goes out, so "runs immediately" is
     /// literal.
-    async fn add(
+    pub(crate) async fn add(
         &self,
         server: &str,
         source: echo_ipc::message::AddSource,
@@ -309,7 +418,7 @@ impl Manager {
     /// config persisted ([`crate::subscribe::remove`]'s contract), and
     /// the snapshot line leaves with an announcement for the watching
     /// clients. The whole apply serializes on the single writer.
-    async fn remove(&self, id: &str) -> Result<crate::config::Subscription, ApplyError> {
+    pub(crate) async fn remove(&self, id: &str) -> Result<crate::config::Subscription, ApplyError> {
         let mut core = self.core.lock().await;
         let known = core
             .config
@@ -364,6 +473,39 @@ pub enum ApplyError {
     /// touched.
     #[error("a Subscription needs a label — the Stream Token is minted with it")]
     EmptyLabel,
+}
+
+/// Why a Composer send was never attempted: the Subscription named does
+/// not exist ([`SendAttemptError::Unknown`] — the client picked a stale
+/// id), or the attempt could not start ([`SendAttemptError::
+/// Unreachable`] — an unreachable store or server). The message is the
+/// daemon's own words either way: the channel carries it as-is, and the
+/// HTTP face maps the kinds to 404 and 502 (issue #31).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SendAttemptError {
+    /// No Subscription carries this id — the send was refused before
+    /// any HTTP.
+    #[error("{0}")]
+    Unknown(String),
+    /// The send could not be attempted (a store failure, an
+    /// unreachable server).
+    #[error("{0}")]
+    Unreachable(String),
+}
+
+/// Why a History Log tail was refused: the id names no Subscription
+/// ([`TailError::Unknown`] — the client picked a stale id), or the
+/// daemon could not read its own log ([`TailError::Read`]). The words
+/// are the daemon's either way: the channel carries them as-is, and the
+/// HTTP face maps the kinds to 404 and 500 (issue #31).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TailError {
+    /// No Subscription carries this id.
+    #[error("no Subscription with id `{0}`")]
+    Unknown(String),
+    /// The daemon's own History Log read failed.
+    #[error("cannot read the History Log: {0}")]
+    Read(String),
 }
 
 /// Run the daemon until `shutdown` resolves: one supervised Realtime
@@ -443,6 +585,43 @@ pub async fn run(
         }),
     });
 
+    // The management face (issue #31): its token is ensured in the store
+    // (auto-generated at the first start with the face — issue #24), its
+    // security state is created, and the axum server is spawned off the
+    // same single writer the channel serves. The listener arrives
+    // pre-bound: a squatted port already failed loud at the caller,
+    // naming the config key. `None` (the channel tests drive `run`
+    // without HTTP) means no token is minted and nothing is served.
+    let mut face_server = None;
+    let channel_face: Option<Arc<crate::management::FaceState>> = match spec.management {
+        Some(management) => {
+            let token = crate::management::ensure_token(spec.store.as_ref())?;
+            let face_state = Arc::new(crate::management::FaceState::new(
+                token,
+                management.gate_page,
+                management.local_only,
+            ));
+            // The listener arrives from std (the caller bound it to
+            // fail loud); the async runtime needs it non-blocking —
+            // tokio refuses a blocking socket outright.
+            management
+                .listener
+                .set_nonblocking(true)
+                .map_err(RunError::FaceListener)?;
+            let listener = tokio::net::TcpListener::from_std(management.listener)
+                .map_err(RunError::FaceListener)?;
+            face_server = Some(tokio::spawn(crate::management::serve(
+                listener,
+                crate::management::Face {
+                    security: face_state.clone(),
+                    manager: manager.clone(),
+                },
+            )));
+            Some(face_state)
+        }
+        None => None,
+    };
+
     // The opening supervisor set: one stream per configured Subscription
     // (ADR-0002) — through the same door a hot add uses later, so both
     // start streams exactly alike.
@@ -463,6 +642,7 @@ pub async fn run(
         event_hub.clone(),
         move |request| {
             let manager = channel_manager.clone();
+            let face = channel_face.clone();
             let shutdown_requested = handler_notify.clone();
             async move {
                 match request {
@@ -474,20 +654,12 @@ pub async fn run(
                     // carries none. The server's verdict goes back
                     // verbatim; a send that could not be attempted is
                     // the error answer.
-                    echo_ipc::Request::SendPush { push } => {
-                        // The send's context resolves from the config
-                        // the single writer holds NOW — hot CRUD may
-                        // have changed it since startup. The snapshot
-                        // clones out under a short lock; the HTTP send
-                        // runs without holding the writer.
-                        let config = manager.core.lock().await.config.clone();
-                        match crate::composer::handle_send(&config, manager.store.as_ref(), push)
-                            .await
-                        {
-                            Ok(outcome) => echo_ipc::Response::PushSent { outcome },
-                            Err(message) => echo_ipc::Response::Error { message },
-                        }
-                    }
+                    echo_ipc::Request::SendPush { push } => match manager.push(push).await {
+                        Ok(outcome) => echo_ipc::Response::PushSent { outcome },
+                        Err(err) => echo_ipc::Response::Error {
+                            message: err.to_string(),
+                        },
+                    },
                     // The Tray Menu's Quit (ticket #12): the answer
                     // leaves first, then the stop begins — the asking
                     // client reads the channel closing behind this
@@ -538,14 +710,27 @@ pub async fn run(
                     echo_ipc::Request::HistorySnapshot {
                         subscription_id,
                         tail,
-                    } => {
-                        let core = manager.core.lock().await;
-                        history_snapshot_response(
-                            &manager.paths,
-                            &core.config,
-                            &subscription_id,
-                            tail,
-                        )
+                    } => match manager.history_tail(&subscription_id, tail).await {
+                        Ok(entries) => echo_ipc::Response::HistorySnapshot { entries },
+                        Err(err) => echo_ipc::Response::Error {
+                            message: err.to_string(),
+                        },
+                    },
+                    // The management face's rotation (issue #31, #24's
+                    // kill switch): the single writer stores the fresh
+                    // token and the face — when this run serves one —
+                    // drops every session issued under the old one at
+                    // once. The token's value never rides the wire.
+                    echo_ipc::Request::ManagementRotate => {
+                        match crate::management::apply_rotation(
+                            manager.store.as_ref(),
+                            face.as_deref(),
+                        ) {
+                            Ok(()) => echo_ipc::Response::ManagementRotated,
+                            Err(err) => echo_ipc::Response::Error {
+                                message: err.to_string(),
+                            },
+                        }
                     }
                     // Only post-handshake requests arrive here; an
                     // unknown request is answered, never fatal.
@@ -595,15 +780,31 @@ pub async fn run(
     }
 
     // Graceful stop: the channel closes first (its connections die with
-    // the aborted tasks), then every supervisor still in the set closes
-    // its stream — the set is whatever hot CRUD left running (ticket
-    // #14), read from the map, not remembered from startup — all before
-    // the lock is released with this function's scope.
+    // the aborted tasks), then the management face — its task is
+    // aborted rather than drained, because a graceful drain would hang
+    // on the never-ending SSE responses (the channel's connections die
+    // the same way, with its tasks) — then every supervisor still in
+    // the set closes its stream — the set is whatever hot CRUD left
+    // running (ticket #14), read from the map, not remembered from
+    // startup — all before the lock is released with this function's
+    // scope.
     let _ = channel_stop_tx.send(());
     match channel.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("the IPC channel ended with an error: {err}"),
         Err(join_error) => eprintln!("the IPC channel task failed: {join_error}"),
+    }
+    if let Some(face) = face_server {
+        face.abort();
+        match face.await {
+            Ok(result) => {
+                if let Err(err) = result {
+                    eprintln!("the management face ended with an error: {err}");
+                }
+            }
+            Err(join_error) if join_error.is_cancelled() => {}
+            Err(join_error) => eprintln!("the management face task failed: {join_error}"),
+        }
     }
     let streams = {
         let mut core = manager.core.lock().await;
@@ -613,43 +814,6 @@ pub async fn run(
         Manager::stop_stream(stream).await;
     }
     Ok(())
-}
-
-/// Answer a [`echo_ipc::Request::HistorySnapshot`] (ticket #15): the
-/// daemon reads its own daemon-private History Log for the Subscription
-/// (ADR-0004 — the GUI never touches a file) and answers with the
-/// content semantics of the CLI's `log --tail N`: all complete entries,
-/// oldest last, the last `tail` of them. A Subscription the daemon does
-/// not hold is refused, not answered with a silently empty log — so no
-/// path outside its own Subscription logs is ever served, whatever a
-/// client puts in the id.
-fn history_snapshot_response(
-    paths: &Paths,
-    config: &Config,
-    subscription_id: &str,
-    tail: u32,
-) -> echo_ipc::Response {
-    let Some(subscription) = config
-        .subscriptions
-        .iter()
-        .find(|held| held.id == subscription_id)
-    else {
-        return echo_ipc::Response::Error {
-            message: format!("no Subscription with id `{subscription_id}`"),
-        };
-    };
-    let log = HistoryLog::new(paths.history_log(&subscription.id));
-    match log.entries() {
-        Ok(entries) => {
-            let start = entries.len().saturating_sub(tail as usize);
-            echo_ipc::Response::HistorySnapshot {
-                entries: entries[start..].to_vec(),
-            }
-        }
-        Err(err) => echo_ipc::Response::Error {
-            message: format!("cannot read the History Log: {err}"),
-        },
-    }
 }
 
 /// One Subscription's runtime: forward the stream's intents into the

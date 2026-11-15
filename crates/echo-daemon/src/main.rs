@@ -5,6 +5,7 @@
 //! echo-core's send module; the daemon runtime (streams, notifications)
 //! arrives with later tickets (ADR-0002).
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
@@ -99,10 +100,25 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// The management face's credential (issue #31): print it, or rotate
+    /// it — the rotation invalidates every browser session the daemon's
+    /// web face issued under the old token (issue #24's kill switch).
+    Management {
+        #[command(subcommand)]
+        command: ManagementCommand,
+    },
     /// Hold every Subscription's Realtime Stream open and render each
     /// Push as a desktop notification — the daemon runtime (ADR-0002).
-    /// Stops on ctrl-C; a second run refuses on the single-instance lock.
-    Run,
+    /// Also serves the management face over HTTP (issue #31). Stops on
+    /// ctrl-C; a second run refuses on the single-instance lock.
+    Run {
+        /// Serve the management face on all interfaces (the LAN opt-in,
+        /// issue #24): every request — the HTML page included — then
+        /// requires the management token. The same opt-in as
+        /// `[management] bind_lan = true` in config.toml.
+        #[arg(long)]
+        bind_lan: bool,
+    },
     /// Per-Subscription stream state plus the server's live statistics
     /// (/info): delivery health at a glance.
     Status,
@@ -192,6 +208,23 @@ enum TokenCommand {
         #[command(flatten)]
         auth: BasicAuthArgs,
     },
+}
+
+/// The `management` subcommands (issue #31): the web face's credential,
+/// managed like every other secret.
+#[derive(Subcommand)]
+enum ManagementCommand {
+    /// Print the management token — the one the web face's sign-in
+    /// (`POST /v1/session`) and every `X-Management-Token` request
+    /// answer to. Reads the store directly: no daemon is needed.
+    Token,
+    /// Replace the management token and invalidate every session the
+    /// daemon issued under the old one (issue #24's one-command kill
+    /// switch). When a daemon holds the lock, the rotation rides the
+    /// channel so the running face drops its sessions at once; without
+    /// a daemon, the store is written directly and the next start picks
+    /// the new token up.
+    Rotate,
 }
 
 /// The operator Basic Auth credentials (protocol §1.4) a server may
@@ -394,7 +427,63 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
-        Command::Run => {
+        Command::Management { command } => match command {
+            ManagementCommand::Token => {
+                let token = echo_daemon::management::stored_token(store.as_ref())?;
+                println!("{token}");
+            }
+            ManagementCommand::Rotate => {
+                // The same lock-held fork as `subscribe add` (ADR-0004):
+                // with a daemon holding the lock the rotation rides the
+                // channel — the single writer stores the fresh token and
+                // the running face drops its sessions at once (#24's
+                // kill switch); without one, the store is written
+                // directly and no sessions exist to invalidate.
+                if DaemonLock::probe(paths.lock_file())? {
+                    echo_daemon::management::rotate_via_channel(&paths).await?;
+                    println!(
+                        "management token rotated; every session under the old one is invalidated"
+                    );
+                } else {
+                    echo_daemon::management::rotate(store.as_ref())?;
+                    println!(
+                        "management token rotated (no daemon is running; the face picks the new token up at its next start)"
+                    );
+                }
+            }
+        },
+        Command::Run { bind_lan } => {
+            // The management face binds here, before the daemon claims
+            // its lock (issue #31): a squatted port fails loud naming
+            // the config key, instead of leaving a daemon nobody can
+            // reach. The LAN opt-in (#24) — the flag or `[management]
+            // bind_lan` — widens the bind to all interfaces (the
+            // configured port kept) and gates every request, the HTML
+            // page included, behind the token.
+            let lan = bind_lan || config.management.bind_lan;
+            let configured = config.management.bind.parse::<SocketAddr>().map_err(|_| {
+                format!(
+                    "management.bind `{}` in config.toml is not a socket address like 127.0.0.1:8081",
+                    config.management.bind
+                )
+            })?;
+            let bind = if lan {
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), configured.port())
+            } else {
+                configured
+            };
+            // The LAN posture (#24): all-interfaces binds gate every
+            // request behind the token — and so does a direct
+            // non-loopback bind, whatever key expressed it. The Host
+            // allowlist (the DNS-rebinding defense) is a localhost-only
+            // tool: on any broader bind the callers may use any name,
+            // and the token gate is what stands.
+            let loopback = configured.ip().is_loopback();
+            let gate_page = lan || !loopback;
+            let local_only = loopback && !lan;
+            let listener = std::net::TcpListener::bind(bind).map_err(|err| {
+                format!("cannot bind the management face at {bind}: {err} — change [management] bind in config.toml")
+            })?;
             let spec = DaemonSpec {
                 paths: paths.clone(),
                 config,
@@ -402,6 +491,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // `new` registers the Windows toast activation (ticket
                 // #17); elsewhere it is plain construction.
                 renderer: Arc::new(DesktopRenderer::new()),
+                management: Some(run::ManagementFace {
+                    listener,
+                    gate_page,
+                    local_only,
+                }),
             };
             run::run(spec, async {
                 let _ = tokio::signal::ctrl_c().await;

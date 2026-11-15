@@ -155,6 +155,7 @@ impl Env {
                 device_hint: format!("{}...", &device_key[..8]),
             }],
             servers,
+            management: Default::default(),
         };
         env
     }
@@ -173,6 +174,7 @@ async fn running_daemon(
         config: env.config.clone(),
         store: env.store.clone(),
         renderer: Arc::new(SilentRenderer),
+        management: None,
     };
     let runner = tokio::spawn(async move {
         echo_daemon::run::run(spec, async move {
@@ -330,6 +332,7 @@ async fn the_viewers_initial_content_is_what_log_tail_prints() {
             device_hint: format!("{}...", &device_key[..8]),
         }],
         servers: Vec::new(),
+        management: Default::default(),
     };
     // The CLI child reads the Subscription list from the files (its
     // headless path); the daemon gets the same list injected.
@@ -348,6 +351,7 @@ async fn the_viewers_initial_content_is_what_log_tail_prints() {
                     daemon_paths.secrets_file(),
                 )),
                 renderer: Arc::new(SilentRenderer),
+                management: None,
             },
             async move {
                 let _ = fence_rx.await;

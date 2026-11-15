@@ -17,7 +17,12 @@ use echo_core::stream::BasicAuth;
 pub struct TestServer {
     /// `http://127.0.0.1:<port>` — no trailing slash, no url prefix.
     pub base_url: String,
+    // common/ is compiled into every test target; some targets (the
+    // management CLI suite) never touch the embedded server, so every
+    // TestServer member carries the allow.
+    #[allow(dead_code)]
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    #[allow(dead_code)]
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     _dir: tempfile::TempDir,
 }
@@ -48,6 +53,7 @@ impl TestServer {
 
     /// [`TestServer::spawn`] with per-test `Config` overrides applied on
     /// top of the ephemeral-port, temp-data-dir defaults.
+    #[allow(dead_code)]
     async fn spawn_configuring(configure: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().expect("temp data dir");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -77,6 +83,7 @@ impl TestServer {
     }
 
     /// Signal shutdown and await the server task's clean exit.
+    #[allow(dead_code)]
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -123,6 +130,7 @@ impl TestServer {
 
 /// Poll until the server answers 2xx (50 ms apart, 15 s budget) — the
 /// listener is bound before spawn, so failure means the server task died.
+#[allow(dead_code)]
 async fn wait_ready(url: &str) {
     let client = reqwest::Client::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -213,8 +221,47 @@ pub struct Harness {
 #[allow(dead_code)]
 impl Harness {
     pub fn new() -> Self {
-        Harness {
+        let harness = Harness {
             home: short_temp_home(),
+        };
+        // The management face binds per config (issue #31): the suite's
+        // daemons serve it at an ephemeral `127.0.0.1:0`, so parallel
+        // daemons never fight over the production default 8081 (which
+        // fails loud on a squatted port, by design). The seed
+        // round-trips later CLI config writes — `Config::save`
+        // serializes the whole struct, `[management]` section included.
+        let mut config = echo_daemon::config::Config::load(&harness.config_path())
+            .expect("a fresh (or absent) harness config loads");
+        config.management.bind = "127.0.0.1:0".to_owned();
+        config
+            .save(&harness.config_path())
+            .expect("seed the harness config with an ephemeral management bind");
+        harness
+    }
+
+    /// The config.toml location inside this harness — the daemon's own
+    /// resolution, computed with the same pure functions the binary
+    /// uses (unix: the XDG standard root; macOS: Application Support;
+    /// windows: %APPDATA%).
+    fn config_path(&self) -> std::path::PathBuf {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let xdg = self.home.path().join(".config");
+            echo_daemon::paths::config_dir_from(Some(self.home.path()), Some(&xdg))
+                .expect("temp home resolves")
+                .join("config.toml")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            echo_daemon::paths::config_dir_from(Some(self.home.path()), None)
+                .expect("temp home resolves")
+                .join("config.toml")
+        }
+        #[cfg(windows)]
+        {
+            echo_daemon::paths::config_dir_from(&self.home.path().join("AppData/Roaming"))
+                .expect("temp home resolves")
+                .join("config.toml")
         }
     }
 

@@ -1,0 +1,4 @@
+/* The management page's stylesheet. Ticket #32 fills this in; this
+   placeholder keeps the embedded-asset route live for ticket #31's seam
+   tests (issue #31). */
+body { font-family: sans-serif; margin: 2rem; }

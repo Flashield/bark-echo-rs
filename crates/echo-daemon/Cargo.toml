@@ -14,6 +14,11 @@ path = "src/main.rs"
 echo-core = { workspace = true }
 # The IPC Channel the daemon serves beside its lock (ADR-0004).
 echo-ipc = { workspace = true }
+# The management face's HTTP serving (issue #31): the daemon itself is
+# the face's server — no separate process (ADR-0005).
+axum = { workspace = true }
+# Only for the `Stream` trait the SSE body implements (issue #31).
+futures-core = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +28,9 @@ keyring = { workspace = true }
 notify-rust = "4.19"
 tokio = { workspace = true }
 time = { workspace = true }
+# The management token's fresh mint (issue #31) — the same crate the
+# receive loop's backoff jitter uses.
+rand = { workspace = true }
 
 # Windows toast activation (ticket #17): AUMID registration + COM
 # INotificationActivationCallback — the plumbing notify-rust's Windows

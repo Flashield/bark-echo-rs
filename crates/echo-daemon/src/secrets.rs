@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Which secret is being addressed: a Subscription's two (Device Key,
-/// Stream Token) or the operator's per-server Basic Auth password.
+/// Stream Token), the operator's per-server Basic Auth password, or the
+/// management face's root credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The Device Key — authorizes pushing and token minting (§3.2).
@@ -18,6 +19,11 @@ pub enum SecretKind {
     /// The operator Basic Auth password for one server (§1.4, story 18)
     /// — keyed by server alone, shared by every Subscription on it.
     BasicAuthPassword,
+    /// The management face's root credential (issue #31, #24): one per
+    /// install, keyed like a per-server secret under the `management`
+    /// address. Auto-generated at the daemon's first start with the
+    /// face; `management token` / `management rotate` manage it.
+    ManagementToken,
 }
 
 impl SecretKind {
@@ -27,6 +33,7 @@ impl SecretKind {
             SecretKind::DeviceKey => "device-key",
             SecretKind::StreamToken => "stream-token",
             SecretKind::BasicAuthPassword => "basic-auth-password",
+            SecretKind::ManagementToken => "management-token",
         }
     }
 }

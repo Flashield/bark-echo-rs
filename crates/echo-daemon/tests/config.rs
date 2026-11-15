@@ -37,6 +37,7 @@ fn saving_and_loading_round_trips_subscriptions_and_server_entries() {
             basic_auth_user: "operator".to_owned(),
             basic_auth_password_stored: true,
         }],
+        management: Default::default(),
     };
 
     config.save(&path).expect("save config");

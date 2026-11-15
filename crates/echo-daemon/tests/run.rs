@@ -151,6 +151,7 @@ impl Env {
                 device_hint: format!("{}...", &device_key[..8]),
             }],
             servers: Vec::new(),
+            management: Default::default(),
         };
         Self {
             paths,
@@ -212,6 +213,7 @@ async fn pushed_messages_render_through_the_injected_renderer_and_reach_the_hist
         config: env.config.clone(),
         store: env.store.clone(),
         renderer: Arc::new(fake.clone()),
+        management: None,
     };
     let runner = tokio::spawn(async move {
         echo_daemon::run::run(spec, async move {
@@ -297,6 +299,7 @@ async fn the_daemon_rides_out_a_server_restart() {
         config: env.config.clone(),
         store: env.store.clone(),
         renderer: Arc::new(fake.clone()),
+        management: None,
     };
     let runner = tokio::spawn(async move {
         echo_daemon::run::run(spec, async move {
@@ -420,6 +423,7 @@ async fn a_revoked_token_flags_only_its_subscription() {
         config: env.config.clone(),
         store: env.store.clone(),
         renderer: Arc::new(fake.clone()),
+        management: None,
     };
     let runner = tokio::spawn(async move {
         echo_daemon::run::run(spec, async move {
@@ -489,6 +493,7 @@ async fn run_refuses_when_another_instance_holds_the_lock() {
             config: env.config.clone(),
             store: env.store.clone(),
             renderer: Arc::new(fake.clone()),
+            management: None,
         },
         std::future::pending::<()>(),
     )
@@ -518,6 +523,7 @@ async fn a_run_with_zero_subscriptions_holds_and_ends_cleanly() {
                 dir.path().join("secrets.toml"),
             )),
             renderer: Arc::new(RecordingRenderer::default()),
+            management: None,
         },
         async move {
             let _ = fence_rx.await;
@@ -573,6 +579,7 @@ async fn an_unreachable_store_keeps_the_daemons_basic_auth_error_actionable() {
             basic_auth_user: "operator".to_owned(),
             basic_auth_password_stored: true,
         }],
+        management: Default::default(),
     };
     let store: Arc<dyn SecretStore> = Arc::new(TokenOnlyStore {
         token: secret.clone(),
@@ -584,6 +591,7 @@ async fn an_unreachable_store_keeps_the_daemons_basic_auth_error_actionable() {
         config,
         store,
         renderer: Arc::new(RecordingRenderer::default()),
+        management: None,
     };
     let runner = tokio::spawn(async move {
         echo_daemon::run::run(spec, async move {
