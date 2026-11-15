@@ -4,6 +4,7 @@
 
 pub(crate) mod atomic;
 pub mod auth;
+pub(crate) mod browser;
 pub(crate) mod channel;
 pub mod composer;
 pub mod config;

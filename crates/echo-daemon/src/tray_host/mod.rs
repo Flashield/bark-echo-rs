@@ -42,10 +42,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 
 use echo_ipc::Endpoint;
 
+use crate::browser::open_in_default_browser;
 use crate::lifecycle::{SpawnOutcome, spawn_if_absent};
 use crate::paths::Paths;
 use crate::tray_host::connection::{UiMsg, spawn_connection_loop};
-use crate::tray_host::face::{management_face_url, open_in_default_browser};
+use crate::tray_host::face::management_face_url;
 use crate::tray_host::model::TrayModel;
 use crate::tray_host::shutdown::{QUIT_BUDGET, QuitOutcome, spawn_quit};
 use crate::tray_host::tray::TrayMenu;

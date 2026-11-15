@@ -165,7 +165,7 @@ pub(crate) fn render_parts(intent: &NotificationIntent) -> (String, String) {
 pub(crate) fn perform_click(action: &ClickAction) {
     match action {
         ClickAction::OpenUrl { url } => {
-            if let Err(err) = open_url(url) {
+            if let Err(err) = crate::browser::open_in_default_browser(url) {
                 eprintln!("click action: opening {url} failed: {err}");
             }
         }
@@ -175,32 +175,6 @@ pub(crate) fn perform_click(action: &ClickAction) {
             }
         }
     }
-}
-
-/// Open a URL in the default browser.
-fn open_url(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    // Platform fact: `start` treats the first quoted argument as a
-    // window title, so the URL must ride second behind an empty title —
-    // without it a URL with special characters is swallowed as a title.
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]).arg(url);
-        command
-    };
-    command.spawn().map(|_| ()).map_err(|err| err.to_string())
 }
 
 /// Place text on the system clipboard, by the platform's clipboard
