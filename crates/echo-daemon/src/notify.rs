@@ -71,11 +71,11 @@ impl NotificationRenderer for DesktopRenderer {
         // toast on a machine where registration failed, keeps
         // notify-rust and the long-standing behavior.
         #[cfg(windows)]
-        if intent.click_action.is_some() {
-            if let crate::toast_activation::Activation::Ready(ready) = &self.activation {
-                return crate::toast_activation::show_click_toast(ready, intent)
-                    .map_err(RenderError::Show);
-            }
+        if intent.click_action.is_some()
+            && let crate::toast_activation::Activation::Ready(ready) = &self.activation
+        {
+            return crate::toast_activation::show_click_toast(ready, intent)
+                .map_err(RenderError::Show);
         }
         let (summary, body) = render_parts(intent);
         let mut notification = notify_rust::Notification::new();
