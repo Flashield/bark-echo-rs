@@ -73,7 +73,7 @@ impl TrayMenu {
                 }
                 // The two actions. Quit asks the daemon for a graceful
                 // shutdown and then leaves (ticket #12); the Management
-                // Window row is #13's placeholder.
+                // Window row opens the window (ticket #13).
                 MenuItem::OpenManagementWindow => {
                     let item = tray_icon::menu::MenuItem::new("Open Management Window", true, None);
                     self.open_management_id = item.id().clone();
