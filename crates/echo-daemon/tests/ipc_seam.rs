@@ -1192,7 +1192,15 @@ async fn basic_auth_credentials_land_in_the_store_never_in_the_config() {
     // (spec story 13: the secrets stay inside the daemon). The /info
     // poll rides the same credentials: the protected server refuses
     // the anonymous observation (§1.4).
-    common::wait_active_streams_with(&server, 1, Some(("operator", "op-secret"))).await;
+    common::wait_active_streams_with(
+        &server,
+        1,
+        Some(echo_core::stream::BasicAuth {
+            user: "operator".to_owned(),
+            password: "op-secret".to_owned(),
+        }),
+    )
+    .await;
 
     // The password is in the store under the server's key…
     let stored = env
