@@ -270,8 +270,13 @@ impl Harness {
 /// under it. The desktop production path is far shorter and never
 /// approaches the limit. Windows needs none of this: its channel
 /// endpoint is a named pipe named by a hash of the config path
-/// (echo-ipc's `Endpoint`), not a filesystem path.
-fn short_temp_home() -> tempfile::TempDir {
+/// (echo-ipc's `Endpoint`), not a filesystem path. Also serves
+/// lifecycle.rs's process-env config root, whose children bind the
+/// same socket under the same limit.
+// common/ is compiled into every test target; helpers are shared per
+// target, not all used everywhere.
+#[allow(dead_code)]
+pub fn short_temp_home() -> tempfile::TempDir {
     #[cfg(unix)]
     {
         tempfile::Builder::new()

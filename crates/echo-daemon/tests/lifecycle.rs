@@ -74,7 +74,12 @@ async fn a_launch_spawns_attaches_quits_and_takes_over() {
     // environment. (Rust 2024 fences env mutation; the alternative is
     // an environment seam through the spawn function that production
     // would never use.)
-    let root = tempfile::tempdir().expect("temp root");
+    //
+    // The root is deliberately short (common::short_temp_home): the
+    // children bind the channel at `Library/Application Support/bark-echo/
+    // daemon.ipc` under it, and macOS's 104-byte sun_len cannot fit the
+    // per-user temp root's prefix in front of that (ticket #27).
+    let root = common::short_temp_home();
     #[cfg(all(unix, not(target_os = "macos")))]
     unsafe {
         std::env::set_var("HOME", root.path());
