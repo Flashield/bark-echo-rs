@@ -177,6 +177,11 @@ pub struct SendPush {
     pub body: Option<String>,
     /// The Ext Params (GLOSSARY) — `url`, `group`, `sound`, and any
     /// other key-value pair, passed through verbatim (protocol §2.2).
+    /// `#[serde(default)]` so the HTTP face's JSON may omit the empty
+    /// map (a send with no Ext Params is the common case there); the
+    /// channel frames always serialize it in full, so nothing else
+    /// changes on the wire.
+    #[serde(default)]
     pub ext_params: BTreeMap<String, String>,
 }
 

@@ -678,3 +678,508 @@ async fn the_lan_opt_in_rewrites_the_bind_and_gates_the_page() {
 
     daemon.kill().await.expect("kill the daemon");
 }
+
+// --- the /v1 API face (ticket checklist items 4-6): the CRUD, push,
+// --- History Log, and SSE seams against the real daemon and the real
+// --- embedded bark server ---
+
+/// One subscriber's read of the face's event stream: raw chunks parsed
+/// into the `data:` payloads (axum's SSE frames carry no `event:` line;
+/// the `:`-prefixed keep-alives are not events). No total timeout — the
+/// stream is long-lived; each read is deadline-bounded instead.
+struct FaceEvents {
+    res: reqwest::Response,
+    buf: Vec<u8>,
+}
+
+impl FaceEvents {
+    async fn open(base_url: &str, token: &str) -> Self {
+        let res = reqwest::Client::new()
+            .get(format!("{base_url}/v1/events"))
+            .header("X-Management-Token", token)
+            .send()
+            .await
+            .expect("open the event stream");
+        assert_eq!(res.status(), reqwest::StatusCode::OK, "the stream opens");
+        Self {
+            res,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next event's JSON, or a panic naming `what` past the
+    /// deadline — tests must not hang.
+    async fn next_event(&mut self, what: &str) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for {what}");
+            let chunk = tokio::time::timeout(remaining, self.res.chunk())
+                .await
+                .expect("read deadline hit")
+                .expect("stream read error")
+                .expect("the stream ended before {what}");
+            self.buf.extend_from_slice(&chunk);
+            while let Some(pos) = find_frame_end(&self.buf) {
+                let frame: Vec<u8> = self.buf.drain(..pos + 2).collect();
+                let data: String = String::from_utf8_lossy(&frame)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !data.is_empty() {
+                    return serde_json::from_str(&data).expect("event data is JSON");
+                }
+            }
+        }
+    }
+}
+
+/// The index just past the next `\n\n` frame terminator, if any.
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|pair| pair == b"\n\n")
+}
+
+/// Wait until the event stream yields a `stream_state` for `id` whose
+/// state's `kind` is `want`, consuming whatever comes first.
+async fn wait_stream_state(events: &mut FaceEvents, id: &str, want: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let event = events.next_event(what).await;
+        if event["type"] == "stream_state"
+            && event["subscription_id"] == *id
+            && event["state"]["kind"] == want
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stream never flipped {id} to {want}: last {event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscribe_add_hot_applies_and_the_flips_arrive_over_sse() {
+    let server = common::TestServer::spawn().await;
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+
+    // The stream is open before the add: every announcement lands.
+    let mut events = FaceEvents::open(&running.base_url, &running.token).await;
+
+    // The add is the wire's SubscribeAdd vocabulary 1:1: server, source
+    // (`kind`-tagged, like the channel frames), label.
+    let response = post_json(
+        &running.base_url,
+        "/v1/subscriptions",
+        Some(&running.token),
+        serde_json::json!({
+            "server": server.base_url,
+            "source": { "kind": "own" },
+            "label": "phone",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let added: serde_json::Value = response.json().await.expect("the added outcome");
+    let id = added["id"].as_str().expect("the id").to_owned();
+    assert_eq!(added["label"], "phone");
+    assert_eq!(added["server"], server.base_url.as_str());
+    assert!(
+        added["token_hint"].as_str().expect("hint").ends_with("..."),
+        "the hint names the token without exposing it: {added}"
+    );
+    assert!(
+        added["device_key"].as_str().expect("key").len() >= 8,
+        "the Device Key — the push target — rides the answer: {added}"
+    );
+
+    // "Runs immediately" is literal: the Starting flip, then the
+    // Running one, arrive over /v1/events.
+    wait_stream_state(&mut events, &id, "starting", "the starting flip").await;
+    wait_stream_state(&mut events, &id, "running", "the running flip").await;
+
+    // The status snapshot carries the line with its public identity —
+    // the same vocabulary the channel answers with.
+    let response = get(&running.base_url, "/v1/status", Some(&running.token), None).await;
+    let snapshot: serde_json::Value = response.json().await.expect("snapshot");
+    let line = &snapshot["subscriptions"][&id];
+    assert_eq!(line["label"], "phone");
+    assert_eq!(line["server"], server.base_url.as_str());
+    assert_eq!(line["state"]["kind"], "running");
+    assert_eq!(line["token_hint"], added["token_hint"]);
+
+    // The single writer kept the files agreeing: the config holds the
+    // Subscription, the store holds its two secrets.
+    let config = Config::load(&env.paths.config_file()).expect("config parses");
+    assert_eq!(config.subscriptions.len(), 1);
+    assert_eq!(config.subscriptions[0].id, id);
+    let key = SecretKey::for_subscription(&server.base_url, &id);
+    assert!(
+        env.store.get(&key, SecretKind::DeviceKey).is_ok(),
+        "the Device Key is in the store"
+    );
+    assert!(
+        env.store.get(&key, SecretKind::StreamToken).is_ok(),
+        "the Stream Token is in the store"
+    );
+
+    running.stop().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn subscribe_remove_hot_applies_and_the_removal_is_announced() {
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "remove-me").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "gone");
+    let running = running_daemon_with_face(&env, false).await;
+    common::wait_active_streams(&server, 1).await;
+
+    let mut events = FaceEvents::open(&running.base_url, &running.token).await;
+
+    let response = reqwest::Client::new()
+        .delete(format!("{}/v1/subscriptions/{token_id}", running.base_url))
+        .header("X-Management-Token", &running.token)
+        .send()
+        .await
+        .expect("DELETE the subscription");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let removed: serde_json::Value = response.json().await.expect("the removed outcome");
+    assert_eq!(removed["id"], token_id.as_str());
+    assert_eq!(removed["label"], "gone");
+
+    // The removal is announced unsolicited: watching clients drop the
+    // line at once.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let event = events.next_event("the removal announcement").await;
+        if event["type"] == "subscription_removed" && event["subscription_id"] == *token_id {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the removal was never announced: last {event}"
+        );
+    }
+
+    // The stream stopped (the server saw it close), the secrets are
+    // erased, the config updated.
+    common::wait_active_streams(&server, 0).await;
+    let config = Config::load(&env.paths.config_file()).expect("config parses");
+    assert!(config.subscriptions.is_empty(), "the config has no line");
+    let key = SecretKey::for_subscription(&server.base_url, &token_id);
+    assert!(
+        env.store.get(&key, SecretKind::DeviceKey).is_err(),
+        "the Device Key is erased"
+    );
+    assert!(
+        env.store.get(&key, SecretKind::StreamToken).is_err(),
+        "the Stream Token is erased"
+    );
+
+    running.stop().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn refusals_carry_the_daemons_own_words_in_the_stable_shape() {
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+
+    // An empty label: refused before the server is touched.
+    let (status, code, message) = error_of(
+        post_json(
+            &running.base_url,
+            "/v1/subscriptions",
+            Some(&running.token),
+            serde_json::json!({
+                "server": "http://127.0.0.1:9",
+                "source": { "kind": "own" },
+                "label": "   ",
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(code, "refused");
+    assert!(
+        message.contains("label"),
+        "the daemon's own words: {message}"
+    );
+
+    // An add against a dead server: the server plane's typed error
+    // rides verbatim.
+    let (status, code, message) = error_of(
+        post_json(
+            &running.base_url,
+            "/v1/subscriptions",
+            Some(&running.token),
+            serde_json::json!({
+                "server": "http://127.0.0.1:9",
+                "source": { "kind": "own" },
+                "label": "dead",
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(code, "refused");
+    assert!(!message.is_empty(), "the refusal says what happened");
+
+    // A removal naming no held Subscription: 404, the daemon's words.
+    let (status, code, message) = error_of(
+        reqwest::Client::new()
+            .delete(format!("{}/v1/subscriptions/absent", running.base_url))
+            .header("X-Management-Token", &running.token)
+            .send()
+            .await
+            .expect("DELETE an unknown id"),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(code, "refused");
+    assert!(
+        message.contains("no Subscription with id `absent`"),
+        "the daemon's own words: {message}"
+    );
+
+    // A History Log tail naming no held Subscription: refused too —
+    // no path outside the daemon's own logs is ever served.
+    let (status, _, message) = error_of(
+        get(
+            &running.base_url,
+            "/v1/log/absent",
+            Some(&running.token),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert!(
+        message.contains("no Subscription with id `absent`"),
+        "the daemon's own words: {message}"
+    );
+
+    // A send naming no held Subscription: refused before any HTTP —
+    // the Composer's own words.
+    let (status, _, message) = error_of(
+        post_json(
+            &running.base_url,
+            "/v1/push",
+            Some(&running.token),
+            serde_json::json!({
+                "subscription_id": "absent",
+                "device_key": "any",
+                "body": "hello",
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert!(
+        message.contains("no Subscription with id `absent`") && message.contains("Composer"),
+        "the daemon's own words: {message}"
+    );
+
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn the_history_log_tail_serves_the_log_files_own_lines_live() {
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "logger").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "logger");
+    let running = running_daemon_with_face(&env, false).await;
+    common::wait_active_streams(&server, 1).await;
+
+    // The stream is open before the Push lands: the hub does not replay
+    // events a subscriber joined too late for.
+    let mut events = FaceEvents::open(&running.base_url, &running.token).await;
+
+    // A Push lands through the server plane; the daemon's stream
+    // processes it into the History Log, and the append is announced.
+    let response = reqwest::Client::new()
+        .post(format!("{}/push", server.base_url))
+        .json(&serde_json::json!({ "device_key": device_key, "body": "logged-body" }))
+        .send()
+        .await
+        .expect("push to the server");
+    let envelope: serde_json::Value = response.json().await.expect("envelope");
+    assert_eq!(envelope["code"], 200, "{envelope}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let appended = loop {
+        let event = events.next_event("the history append").await;
+        if event["type"] == "history_appended" && event["subscription_id"] == *token_id {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the append was never announced: last {event}"
+        );
+    };
+    assert_eq!(appended["entry"]["body"], "logged-body");
+    assert_eq!(appended["label"], "logger");
+
+    // The tail endpoint answers with the same lines, oldest last —
+    // snapshot and live appends are one vocabulary.
+    let response = get(
+        &running.base_url,
+        &format!("/v1/log/{token_id}?tail=10"),
+        Some(&running.token),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let tail: serde_json::Value = response.json().await.expect("the tail");
+    assert_eq!(tail["subscription_id"], token_id.as_str());
+    let entries = tail["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["body"], "logged-body");
+    assert_eq!(entries[0]["title"], appended["entry"]["title"]);
+
+    running.stop().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_goes_through_the_subscriptions_stored_credentials_end_to_end() {
+    let server = common::TestServer::spawn().await;
+    let (device_key, secret, token_id) = register_and_mint(&server, "sender").await;
+    let env = Env::with_subscription(&server.base_url, &device_key, &secret, &token_id, "sender");
+    let running = running_daemon_with_face(&env, false).await;
+    common::wait_active_streams(&server, 1).await;
+
+    let mut events = FaceEvents::open(&running.base_url, &running.token).await;
+
+    // The send rides the Subscription's stored context (ADR-0004): the
+    // Subscription names the server, the Device Key is explicit, no
+    // credential rides the request.
+    let response = post_json(
+        &running.base_url,
+        "/v1/push",
+        Some(&running.token),
+        serde_json::json!({
+            "subscription_id": token_id,
+            "device_key": device_key,
+            "title": "From the face",
+            "body": "sent-body",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let outcome: serde_json::Value = response.json().await.expect("the verdict");
+    assert_eq!(outcome["kind"], "sent", "{outcome}");
+
+    // The daemon's own stream receives the Push and logs it — the
+    // append is announced like any other processed Push.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let event = events.next_event("the sent push's append").await;
+        if event["type"] == "history_appended"
+            && event["subscription_id"] == *token_id
+            && event["entry"]["body"] == "sent-body"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sent push never landed: last {event}"
+        );
+    }
+
+    // A send the server refuses: the verdict is verbatim — code and
+    // message — never a paraphrase.
+    let response = post_json(
+        &running.base_url,
+        "/v1/push",
+        Some(&running.token),
+        serde_json::json!({
+            "subscription_id": token_id,
+            "device_key": "no-such-device-key",
+            "body": "lost",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let outcome: serde_json::Value = response.json().await.expect("the verdict");
+    assert_eq!(outcome["kind"], "rejected", "{outcome}");
+    assert_eq!(outcome["code"], 400);
+    assert!(
+        outcome["message"]
+            .as_str()
+            .expect("message")
+            .contains("device token"),
+        "the server's own words: {outcome}"
+    );
+
+    running.stop().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_channel_rotate_kills_the_token_and_every_session_instantly() {
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+    let cookie = sign_in(&running.base_url, &running.token).await;
+
+    // The rotation rides the daemon's own channel — exactly what the
+    // CLI's `management rotate` does when a daemon holds the lock.
+    let mut client = echo_ipc::Client::connect(&env.paths.ipc_endpoint())
+        .await
+        .expect("connect to the channel");
+    client.management_rotate().await.expect("rotate");
+
+    // The old token is dead at once; so is the session issued under it.
+    let response = get(&running.base_url, "/v1/status", Some(&running.token), None).await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the old token is dead"
+    );
+    let response = get(&running.base_url, "/v1/status", None, Some(&cookie)).await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the old session is dead"
+    );
+
+    // The new token — the one the store now holds, the one `management
+    // token` would print — works, and exchanges for a fresh session.
+    let new_token = match echo_daemon::management::stored_token(env.store.as_ref()) {
+        Ok(token) => token,
+        Err(err) => panic!("the rotated token is readable: {err}"),
+    };
+    assert_ne!(new_token, running.token, "the rotation replaced it");
+    let response = get(&running.base_url, "/v1/status", Some(&new_token), None).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    sign_in(&running.base_url, &new_token).await;
+
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn the_event_stream_refuses_a_cross_site_origin() {
+    let env = Env::empty();
+    let running = running_daemon_with_face(&env, false).await;
+
+    // EventSource rides the cookie — a cross-site Origin on the stream
+    // is refused like any other state-adjacent door.
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/events", running.base_url))
+        .header("X-Management-Token", &running.token)
+        .header("Origin", "http://evil.example")
+        .send()
+        .await
+        .expect("GET /v1/events with a foreign Origin");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = response.json().await.expect("the refusal");
+    assert_eq!(body["error"]["code"], "origin_rejected", "{body}");
+
+    running.stop().await;
+}
