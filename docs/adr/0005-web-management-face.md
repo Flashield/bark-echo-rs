@@ -47,17 +47,28 @@ all, and the phone need waits the whole time. Research (2026-11-15):
   is a thin vanilla-JS consumer (~2.7 KB measured), not htmx's fragment
   contract; no templating engine for a one-page face; `/v1` prefix and
   a stable JSON error shape.
-- Security posture (design pass: ticket #24): bind `127.0.0.1` by
-  default with LAN bind as an explicit opt-in; a management token
-  printed once at first enable, kept in the keyring, sent as a custom
-  header; Host header validation on by default; Origin/Referer checks
-  covering SSE (EventSource cannot send custom headers); state changes
-  are POST/JSON only; fixed default port, fail-loud on squatting.
+- Security posture (design pass: ticket #24; amended to the shipped
+  mechanics): bind `127.0.0.1` by default with LAN bind as an explicit
+  opt-in; one management token per install, minted silently at the
+  daemon's first start with the face and kept in the secret store —
+  `management token` re-prints it, `management rotate` replaces it and
+  kills every live session at once (issue #24's kill switch); the
+  browser exchanges the token at `POST /v1/session` for an HttpOnly
+  SameSite=Strict session cookie, so the page's JS never holds the
+  token after the sign-in; API clients send the token itself as a
+  custom header (`X-Management-Token`); Host header validation and
+  Origin/Referer checks run on every `/v1` request, the SSE stream
+  included (EventSource cannot send custom headers); state changes —
+  POST/JSON and `DELETE /v1/subscriptions/{id}` — additionally require
+  a custom header a cross-site fetch cannot pass preflight with; fixed
+  default port, fail-loud on squatting.
 - The tray stays native (tray-icon + muda) but its host becomes a bare
   winit/tao event loop with no windows; it inherits ADR-0004's
   spawn-if-absent duty from the GUI, and "open the Management Window"
   becomes "open the management face" — the default browser at the
-  face's address.
+  face's address. The tray owns quit: the daemon grows no shutdown
+  endpoint on the face — the channel's graceful stop is not reachable
+  over `/v1`.
 - ADR-0004 stands: the JSON Lines IPC Channel remains the CLI's face
   and the daemon stays the single writer; only the presentation layer
   changed. The web face reads daemon state in-process, so the channel's
