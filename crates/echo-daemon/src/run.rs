@@ -341,16 +341,8 @@ impl Manager {
         if label.trim().is_empty() {
             return Err(ApplyError::EmptyLabel);
         }
-        let source = match source {
-            echo_ipc::message::AddSource::Own => crate::subscribe::AddSource::Own,
-            echo_ipc::message::AddSource::DeviceKey { device_key } => {
-                crate::subscribe::AddSource::DeviceKey(device_key)
-            }
-        };
-        let auth = basic_auth.map(|credentials| echo_core::stream::BasicAuth {
-            user: credentials.user,
-            password: credentials.password,
-        });
+        let source = crate::subscribe::AddSource::from(source);
+        let auth = crate::subscribe::local_credentials(basic_auth);
         // The minting client carries the credentials the request gave —
         // or, when none rode the channel, the stored ones for that
         // server (story 18): a re-add on an already-configured server

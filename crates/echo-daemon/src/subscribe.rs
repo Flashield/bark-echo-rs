@@ -28,6 +28,55 @@ pub enum AddSource {
     DeviceKey(String),
 }
 
+/// The wire face of an add's source (the channel's `AddSource`, the
+/// web page's `{"kind": ...}` shape) — what `add_via_channel` sends.
+impl From<AddSource> for echo_ipc::message::AddSource {
+    fn from(source: AddSource) -> Self {
+        match source {
+            AddSource::Own => Self::Own,
+            AddSource::DeviceKey(device_key) => Self::DeviceKey { device_key },
+        }
+    }
+}
+
+/// The daemon face of the wire's source — what the single writer's
+/// `Manager::add` takes back. One mapping, both directions, so the two
+/// vocabularies cannot drift apart at one of the two call sites.
+impl From<echo_ipc::message::AddSource> for AddSource {
+    fn from(source: echo_ipc::message::AddSource) -> Self {
+        match source {
+            echo_ipc::message::AddSource::Own => Self::Own,
+            echo_ipc::message::AddSource::DeviceKey { device_key } => Self::DeviceKey(device_key),
+        }
+    }
+}
+
+/// The operator Basic Auth credentials (§1.4) in the channel's wire
+/// shape, from the daemon's (`echo_core::stream::BasicAuth`) — what
+/// `add_via_channel` sends. Plain functions, not `From` impls: both
+/// ends are foreign to this crate (the orphan rule); they live beside
+/// the `AddSource` conversions so the remap has one home.
+pub(crate) fn wire_credentials(
+    auth: Option<echo_core::stream::BasicAuth>,
+) -> Option<echo_ipc::message::BasicAuthCredentials> {
+    auth.map(|credentials| echo_ipc::message::BasicAuthCredentials {
+        user: credentials.user,
+        password: credentials.password,
+    })
+}
+
+/// The daemon's credentials shape from the channel's wire shape — what
+/// the single writer's `Manager::add` takes back (the counterpart of
+/// [`wire_credentials`]).
+pub(crate) fn local_credentials(
+    credentials: Option<echo_ipc::message::BasicAuthCredentials>,
+) -> Option<echo_core::stream::BasicAuth> {
+    credentials.map(|credentials| echo_core::stream::BasicAuth {
+        user: credentials.user,
+        password: credentials.password,
+    })
+}
+
 /// What one successful add produced: the persisted Subscription and the
 /// Device Key — the push target, shown to the user only here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,14 +244,8 @@ pub async fn add_via_channel(
     label: &str,
     auth: Option<echo_core::stream::BasicAuth>,
 ) -> Result<echo_ipc::message::AddedSubscription, ChannelError> {
-    let wire_source = match source {
-        AddSource::Own => echo_ipc::message::AddSource::Own,
-        AddSource::DeviceKey(device_key) => echo_ipc::message::AddSource::DeviceKey { device_key },
-    };
-    let wire_auth = auth.map(|credentials| echo_ipc::message::BasicAuthCredentials {
-        user: credentials.user,
-        password: credentials.password,
-    });
+    let wire_source = echo_ipc::message::AddSource::from(source);
+    let wire_auth = wire_credentials(auth);
     // The ride's budget, attempt cap, and retry shape are the shared
     // loop's (crate::channel::ride); what is left here is the request's
     // wire shape and the answer's fate.
