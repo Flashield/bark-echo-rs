@@ -84,6 +84,8 @@ pub fn spawn_detached_daemon(
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+
         // Platform fact (CODING_STANDARDS), verified against
         // Microsoft's CreateProcess flag table
         // (learn.microsoft.com/windows/win32/procthread/process-creation-flags):
