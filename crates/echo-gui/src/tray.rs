@@ -1,7 +1,7 @@
 //! The tray layer: the muda menu derived from the model, rebuilt when
 //! the model changes, and the icon that lives for the process lifetime.
 //! Rendering here is native (the OS draws the menu — CJK labels are the
-//! OS's business); egui enters later with the Management Window (#13).
+//! OS's business); egui renders the Management Window (#13) beside it.
 //!
 //! Threading facts (tray-icon's own platform notes, CODING_STANDARDS:
 //! name the platform reality): macOS requires the tray created on the
