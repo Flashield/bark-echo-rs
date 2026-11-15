@@ -730,7 +730,15 @@ async fn basic_auth_credentials_ride_alongside_the_stream_token() {
         appends: None,
     };
     let (handle, mut intents) = RealtimeStream::spawn(config);
-    common::wait_active_streams_with(&server, 1, Some((OPERATOR_USER, OPERATOR_PASSWORD))).await;
+    common::wait_active_streams_with(
+        &server,
+        1,
+        Some(BasicAuth {
+            user: OPERATOR_USER.to_owned(),
+            password: OPERATOR_PASSWORD.to_owned(),
+        }),
+    )
+    .await;
 
     push_with_basic_auth(&server, &device_key, "behind Basic Auth").await;
     let intent = next_intent(&mut intents).await;
