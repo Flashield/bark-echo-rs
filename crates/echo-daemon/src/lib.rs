@@ -23,3 +23,4 @@ pub mod state;
 pub mod status;
 pub mod subscribe;
 pub mod toast_activation;
+pub mod tray_host;

@@ -32,6 +32,29 @@ time = { workspace = true }
 # receive loop's backoff jitter uses.
 rand = { workspace = true }
 
+# The Tray Menu host (issue #30): tray-icon draws the icon, muda the
+# menu — the pair from the 2026-11-14 framework research (§10, both
+# Tauri-team crates, version-synced). tray-icon re-exports muda as its
+# `menu` module; the direct muda dependency pins the pair's versions so
+# a future tray-icon bump that jumps muda cannot slip past us silently.
+# Linux runs the KSNI backend — its D-Bus service works on its own
+# thread and needs no GTK system libraries, which keeps the "one
+# binary, no installer" promise on Linux (the default libappindicator
+# backend needs GTK3 installed).
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+muda = { version = "0.21", default-features = false }
+# The tray host's bare event loop (issue #30): one winit loop, no
+# windows. Chosen over the Tauri fork tao (0.37) per platform facts:
+# tao hard-depends on gtk 0.18 on Linux — linked, not dlopened — which
+# would reintroduce exactly the GTK system-library burden the KSNI
+# backend choice above avoids; winit on Linux is X11 through x11-dl
+# (dlopened at runtime) and Wayland through the pure-Rust wayland
+# client. The x11 + wayland features are the explicit opt-in winit 0.30
+# requires on Linux (with neither, the Linux build fails at compile
+# time); elsewhere they are no-ops. tray-icon 0.26's own dev-dependencies
+# exercise exactly this winit 0.30 pairing, on the main thread.
+winit = { version = "0.30", features = ["x11", "wayland"] }
+
 # Windows toast activation (ticket #17): AUMID registration + COM
 # INotificationActivationCallback — the plumbing notify-rust's Windows
 # backend cannot express. Features stay per API group to keep the
