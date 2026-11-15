@@ -515,8 +515,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // done (the clean exit code rides on this returning Ok).
             // The daemon's config and secret store stay out of the
             // host — the spawned `bark-echo run` reads them itself
-            // (ADR-0004: the GUI never touched secrets either).
-            echo_daemon::tray_host::run(&paths, cli.plain_secrets)?;
+            // (ADR-0004: the GUI never touched secrets either). Only
+            // the already-loaded `[management]` bind rides along, so
+            // Manage opens the face where this daemon serves it.
+            echo_daemon::tray_host::run(&paths, cli.plain_secrets, &config.management.bind)?;
         }
         Command::Status => {
             let report = status::report(&paths, &config, store.as_ref()).await?;

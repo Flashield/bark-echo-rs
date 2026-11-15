@@ -45,19 +45,26 @@ use echo_ipc::Endpoint;
 use crate::lifecycle::{SpawnOutcome, spawn_if_absent};
 use crate::paths::Paths;
 use crate::tray_host::connection::{UiMsg, spawn_connection_loop};
-use crate::tray_host::face::{MANAGEMENT_FACE_URL, open_in_default_browser};
+use crate::tray_host::face::{management_face_url, open_in_default_browser};
 use crate::tray_host::model::TrayModel;
 use crate::tray_host::shutdown::{QUIT_BUDGET, QuitOutcome, spawn_quit};
 use crate::tray_host::tray::TrayMenu;
 
 /// Run the tray host until Quit: bring the daemon up if it is absent
 /// (probe-then-spawn, ADR-0004), watch the channel, serve the Tray
-/// Menu. Returns when the user quits — with a clean exit code riding
+/// Menu. `management_bind` is the configured `[management] bind`
+/// (config.toml, ticket #31's key) the launcher passes along — the
+/// Manage item opens the face at the address the daemon actually
+/// serves. Returns when the user quits — with a clean exit code riding
 /// on the caller (`Ok`), or the error that kept the host from ever
 /// serving (a tray that could not be built, a spawn that could not
 /// happen). The daemon's own stop is the Quit exchange's business; a
 /// daemon silent past its budget never holds this host hostage.
-pub fn run(paths: &Paths, plain_secrets: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    paths: &Paths,
+    plain_secrets: bool,
+    management_bind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn-if-absent (ADR-0004): probe the single-instance lock, spawn
     // a detached `bark-echo run` beside this binary when it is idle,
     // attach when held — never a second daemon attempt. The
@@ -104,6 +111,7 @@ pub fn run(paths: &Paths, plain_secrets: bool) -> Result<(), Box<dyn std::error:
         ui_rx: Some(ui_rx),
         ui_tx,
         endpoint: paths.ipc_endpoint(),
+        face_url: management_face_url(management_bind),
         stop,
         quitting: false,
         dirty: false,
@@ -147,6 +155,9 @@ struct TrayHost {
     ui_tx: Sender<UiMsg>,
     /// The daemon endpoint, for Quit's own one-shot connection.
     endpoint: Endpoint,
+    /// The management face's URL, from the `[management]` bind the
+    /// launcher read out of config — where Manage opens the browser.
+    face_url: String,
     /// Stops the connection loop once Quit has been clicked — the
     /// watcher's job ends with the process.
     stop: Arc<AtomicBool>,
@@ -270,7 +281,7 @@ impl TrayHost {
         } else if clicked_manage {
             // Best effort: a failed handoff is named, never fatal —
             // the face stays reachable, only the shortcut is missing.
-            if let Err(err) = open_in_default_browser(MANAGEMENT_FACE_URL) {
+            if let Err(err) = open_in_default_browser(&self.face_url) {
                 eprintln!("bark-echo: cannot open the browser: {err}");
             }
         }
