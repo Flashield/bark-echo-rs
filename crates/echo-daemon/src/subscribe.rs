@@ -9,10 +9,9 @@
 //! single writer and applies the change hot. Without a daemon, the
 //! caller keeps today's direct-write path.
 
-use std::time::{Duration, Instant};
-
 use echo_core::server::{ServerClient, ServerError};
 
+use crate::channel;
 use crate::config::{Config, Subscription};
 use crate::paths::Paths;
 use crate::secrets::{SecretError, SecretKey, SecretKind, SecretStore};
@@ -135,15 +134,6 @@ fn device_hint(device_key: &str) -> String {
     format!("{}...", &device_key[..device_key.len().min(8)])
 }
 
-/// How long a channel ride waits for the daemon to answer: long enough
-/// to absorb a starting daemon (the lock is held a beat before the
-/// endpoint is bound), short enough to stay snappy — the budget
-/// `status` rides with, and one attempt's cap so a wedged daemon
-/// cannot wedge the command.
-const CHANNEL_BUDGET: Duration = Duration::from_secs(2);
-const CHANNEL_ATTEMPT: Duration = Duration::from_secs(1);
-const CHANNEL_RETRY: Duration = Duration::from_millis(50);
-
 /// Why a channel ride failed (ticket #14). The daemon's own refusals
 /// come through as [`IpcError::Rejected`] carrying its message — the
 /// actionable part, printed as-is.
@@ -184,23 +174,28 @@ pub async fn add_via_channel(
         user: credentials.user,
         password: credentials.password,
     });
-    let endpoint = paths.ipc_endpoint();
-    let deadline = Instant::now() + CHANNEL_BUDGET;
-    loop {
-        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
-            let mut client = echo_ipc::Client::connect(&endpoint).await?;
+    // The ride's budget, attempt cap, and retry shape are the shared
+    // loop's (crate::channel::ride); what is left here is the request's
+    // wire shape and the answer's fate.
+    let answer = channel::ride(paths, |mut client| {
+        let source = wire_source.clone();
+        let credentials = wire_auth.clone();
+        async move {
             client
-                .subscribe_add(server, wire_source.clone(), label, wire_auth.clone())
+                .subscribe_add(server, source, label, credentials)
                 .await
-        });
-        match attempt.await {
-            Ok(Ok(added)) => return Ok(added),
-            // The daemon refused and said why (a bad Device Key, a
-            // refused label, ...): retrying cannot change the answer.
-            Ok(Err(err @ echo_ipc::IpcError::Rejected(_))) => return Err(err.into()),
-            _ if Instant::now() >= deadline => return Err(ChannelError::Unreachable),
-            _ => tokio::time::sleep(CHANNEL_RETRY).await,
         }
+    })
+    .await;
+    match answer {
+        Ok(added) => Ok(added),
+        // The daemon refused and said why (a bad Device Key, a refused
+        // label, ...): retrying cannot change the answer.
+        Err(err @ echo_ipc::IpcError::Rejected(_)) => Err(err.into()),
+        // The budget was spent without an answer: never fall through
+        // to the direct write (it would race the single writer) —
+        // Unreachable, the caller's actionable failure.
+        Err(_) => Err(ChannelError::Unreachable),
     }
 }
 
@@ -211,18 +206,13 @@ pub async fn remove_via_channel(
     paths: &Paths,
     id: &str,
 ) -> Result<echo_ipc::message::RemovedSubscription, ChannelError> {
-    let endpoint = paths.ipc_endpoint();
-    let deadline = Instant::now() + CHANNEL_BUDGET;
-    loop {
-        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
-            let mut client = echo_ipc::Client::connect(&endpoint).await?;
-            client.subscribe_remove(id).await
-        });
-        match attempt.await {
-            Ok(Ok(removed)) => return Ok(removed),
-            Ok(Err(err @ echo_ipc::IpcError::Rejected(_))) => return Err(err.into()),
-            _ if Instant::now() >= deadline => return Err(ChannelError::Unreachable),
-            _ => tokio::time::sleep(CHANNEL_RETRY).await,
-        }
+    let answer = channel::ride(paths, |mut client| async move {
+        client.subscribe_remove(id).await
+    })
+    .await;
+    match answer {
+        Ok(removed) => Ok(removed),
+        Err(err @ echo_ipc::IpcError::Rejected(_)) => Err(err.into()),
+        Err(_) => Err(ChannelError::Unreachable),
     }
 }

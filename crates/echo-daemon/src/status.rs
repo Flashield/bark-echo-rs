@@ -5,48 +5,26 @@
 //! HTTP. Whether the daemon is alive is answered by the single-instance
 //! lock itself.
 
-use std::time::{Duration, Instant};
-
 use echo_core::server::{ServerClient, ServerInfo};
+use echo_ipc::IpcError;
 use echo_ipc::message::StatusSnapshot;
-use echo_ipc::{Client, IpcError};
 
 use crate::auth;
+use crate::channel;
 use crate::config::Config;
 use crate::lock::{DaemonLock, LockError};
 use crate::paths::Paths;
 use crate::secrets::SecretStore;
 use crate::state::{StateError, StateFile, StreamState};
 
-/// How long `status` tries the channel before falling back to the state
-/// file: long enough to absorb a starting daemon (the lock is held a
-/// beat before the endpoint is bound), short enough to stay snappy.
-const CHANNEL_BUDGET: Duration = Duration::from_secs(2);
-/// One connect-handshake-status attempt's cap, so a wedged daemon
-/// cannot wedge `status`.
-const CHANNEL_ATTEMPT: Duration = Duration::from_secs(1);
-const CHANNEL_RETRY: Duration = Duration::from_millis(50);
-
 /// The daemon's live snapshot over the IPC Channel (ADR-0004): the
 /// daemon's in-memory answer, fresher than or equal to the state file's
-/// last write. [`IpcError::Closed`] means the budget was spent without
-/// a live answer — the caller falls back to the state file either way.
+/// last write, riding the shared deadline-retry loop
+/// ([`crate::channel::ride`]). [`IpcError::Closed`] means the budget was
+/// spent without a live answer — the caller falls back to the state file
+/// either way.
 async fn ride_the_channel(paths: &Paths) -> Result<StatusSnapshot, IpcError> {
-    let endpoint = paths.ipc_endpoint();
-    let deadline = Instant::now() + CHANNEL_BUDGET;
-    loop {
-        let attempt = tokio::time::timeout(CHANNEL_ATTEMPT, async {
-            let mut client = Client::connect(&endpoint).await?;
-            client.status().await
-        });
-        if let Ok(Ok(snapshot)) = attempt.await {
-            return Ok(snapshot);
-        }
-        if Instant::now() >= deadline {
-            return Err(IpcError::Closed);
-        }
-        tokio::time::sleep(CHANNEL_RETRY).await;
-    }
+    channel::ride(paths, |mut client| async move { client.status().await }).await
 }
 
 /// Why the status report could not be assembled.
