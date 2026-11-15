@@ -35,6 +35,12 @@ is [`GLOSSARY.md`](GLOSSARY.md).
 - **Push from scripts**: `push` sends through the server's V2 JSON route;
   any Ext Param (`--url`, `--group`, `--sound`, …) rides through, so
   anything scriptable against the server is scriptable from the desktop.
+- **Management face served by the daemon** (ADR-0005): `run` also serves
+  a web page over the same state the CLI drives — Subscriptions managed
+  (add/list/remove), Realtime Stream state watched, History Logs
+  browsed, Pushes composed — behind a keyring-held management token,
+  localhost-only by default. `bark-echo tray` adds the desktop's Tray
+  Menu presence on top.
 - **Several Subscriptions per machine**: mirror your own Stream Device and
   any number of other Devices (a family iPad, …); each holds its own
   labelled Stream Token, revocable independently.
@@ -65,7 +71,9 @@ device key: htXq7Fm9SPTkYw3hZbLc2A
 subscription e9351ee91c837988 added (label: workstation, token hint: st_31gpMA4IqFoX...)
 
 # 2. Hold the Subscription's Realtime Stream open and render each Push as
-#    a desktop notification. Stops on Ctrl-C.
+#    a desktop notification. Also serves the management face at
+#    http://127.0.0.1:8081 (token: `bark-echo management token` — see
+#    Management face below). Stops on Ctrl-C.
 $ bark-echo run
 ```
 
@@ -100,13 +108,16 @@ $ bark-echo log --follow
 | `bark-echo subscribe add --device-key KEY --server URL [--auth-user U --auth-password P]` | Mirror an existing Device (an iPhone, another machine) instead |
 | `bark-echo subscribe list` | List Subscriptions (id, server, label, token hint) |
 | `bark-echo subscribe rm ID` | Remove one Subscription and delete its secrets |
-| `bark-echo run` | The daemon: hold every stream open, render notifications (Ctrl-C stops; a second run refuses on the single-instance lock) |
+| `bark-echo run` | The daemon: hold every stream open, render notifications, serve the management face (Ctrl-C stops; a second run refuses on the single-instance lock) |
+| `bark-echo tray` | The Tray Menu host: each Subscription's stream state at a glance, Manage opens the management face in the default browser, Quit stops the daemon gracefully; brings the daemon up when it is not running |
 | `bark-echo status` | Per-Subscription stream state plus the server's live `/info` statistics |
 | `bark-echo log [--tail N] [--follow] [--sub LABEL]` | Read a Subscription's History Log; `--follow` streams new lines live |
 | `bark-echo pull [--cursor 0] [--sub LABEL] [--user U --password P]` | One-shot replay of retained Messages into the History Log, silently; `--cursor 0` replays everything retained |
 | `bark-echo push --server URL --device-key KEY --title T [--subtitle S] [--body B] [--key value …]` | Send one Push; unknown `--key value` pairs ride through as Ext Params, exactly like the server's V2 JSON route |
 | `bark-echo token list --server URL --device-key KEY [--user U --password P]` | List a Device's Stream Tokens (id, hint, label, revoked state) — never the secrets |
 | `bark-echo token revoke --server URL --device-key KEY --token-id ID [--user U --password P]` | Revoke one Stream Token by its public id; takes effect immediately |
+| `bark-echo management token` | Print the management token — the web face's sign-in credential (reads the secret store; no daemon needed) |
+| `bark-echo management rotate` | Replace the management token and invalidate every browser session the face issued under the old one |
 | `bark-echo --plain-secrets <command>` | Run with secrets in a 0600 plain file instead of the OS keyring |
 
 With several Subscriptions held, `--sub LABEL` (long form
@@ -120,6 +131,57 @@ $ bark-echo push --server http://192.168.1.10:8080 \
       --url "https://ci.example.org/runs/42" \
       --group "ci" --sound bell
 ```
+
+## Management face
+
+The daemon serves its management face over HTTP (ADR-0005): a web page
+riding the same single-writer state the CLI does — add and remove
+Subscriptions, watch each Realtime Stream's live state (the page
+updates without reload), browse a Subscription's History Log, and
+compose and send Pushes from the Push Composer. It ships inside
+`bark-echo run` — no second process, no install step — and the CLI
+keeps working exactly as before. `bark-echo tray` is the desktop
+presence on top: a system-tray icon showing each Subscription's stream
+state at a glance, a Manage item that opens the face in the default
+browser, and Quit, which asks the daemon for a graceful shutdown and
+exits once confirmed (autostart samples for the tray host live in
+[`docs/autostart.md`](docs/autostart.md)).
+
+- **Bind**: `127.0.0.1:8081` by default — localhost-only until you say
+  otherwise (bark-server owns 8080). `[management] bind` in config.toml
+  moves it; `run --bind-lan` (or `[management] bind_lan = true`) binds
+  all interfaces for the phone recipe below. A squatted port fails loud
+  at startup, naming the key.
+- **The management token is the root credential**: 32 random bytes,
+  auto-generated into the OS keyring at the daemon's first start with
+  the face. `bark-echo management token` prints it; `bark-echo
+  management rotate` replaces it and invalidates every session issued
+  under the old one at once — the one-command kill switch. The browser
+  trades the token for an HttpOnly, SameSite=Strict session cookie at
+  the sign-in gate and never holds the token again; state changes also
+  require the face's custom header (CSRF defense in depth), and
+  repeated wrong tokens meet a growing delay.
+- **The LAN posture is everything-token-gated**: on a LAN bind every
+  request — the HTML page included — requires the token; there is no
+  anonymous view. The face speaks plain HTTP by design (spec Out of
+  Scope: no HTTPS), so the encrypted paths are the ones needing no new
+  machinery: an SSH tunnel (`ssh -L 8081:127.0.0.1:8081 desktop`) or a
+  tailnet reach the default localhost bind from anywhere, token in
+  hand.
+
+### Phone on the same LAN
+
+1. On the desktop, widen the bind once:
+   `bark-echo run --bind-lan` — or set `[management] bind_lan = true`
+   in config.toml and let the autostart entry do it every boot.
+2. Print the token once: `bark-echo management token`.
+3. On the phone, open `http://<desktop's LAN address>:8081`, paste the
+   token at the gate, and stay signed in (the session cookie carries
+   it).
+4. Manage from the couch: the Subscription list, the History Logs, and
+   the Push Composer all work from the phone's browser — CJK input
+   included (the browser's native IME carries it), and the layout
+   holds at phone widths.
 
 ## Configuration and credentials
 
@@ -136,8 +198,12 @@ Inside it:
 - `config.toml` — the Subscription list (ADR-0001): per Subscription the
   server URL, label, token id, and the non-secret token/device hints, plus
   optional per-server Basic Auth entries holding the user and a
-  stored-password marker only. No secrets here.
-- Stream Tokens, Device Keys, and Basic Auth passwords — the OS keyring
+  stored-password marker only. The `[management]` section (ADR-0005)
+  holds the management face's `bind` address and the `bind_lan`
+  opt-in — still no secrets here: the management token lives in the
+  keyring with the rest.
+- Stream Tokens, Device Keys, Basic Auth passwords, and the management
+  token — the OS keyring
   under the service name `bark-echo` (macOS Keychain / Windows Credential
   Manager / Linux Secret Service); Basic Auth passwords are keyed by
   server, the Subscription secrets by server + token id. With
@@ -176,8 +242,9 @@ platforms.
 
 Contributors: start with [`GLOSSARY.md`](GLOSSARY.md) (the vocabulary
 authority) and the ADRs in [`docs/adr/`](docs/adr/) — they explain the why
-behind the Subscription-list config model (ADR-0001) and the daemon-owns-
-streams runtime (ADR-0002). The client contract in the server repo's
+behind the Subscription-list config model (ADR-0001), the daemon-owns-
+streams runtime (ADR-0002), and the web management face (ADR-0005). The
+client contract in the server repo's
 [`docs/protocol.md`](https://github.com/Flashield/bark-server-rs/blob/main/docs/protocol.md)
 is consumed, never changed.
 

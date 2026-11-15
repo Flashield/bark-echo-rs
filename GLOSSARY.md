@@ -25,18 +25,20 @@ History Log without notifications.
 _Avoid_: sync, backfill, fetch
 
 **Tray Menu**:
-The GUI's always-available system-tray presence: a glance at each
+The always-available system-tray presence: a glance at each
 Subscription's stream state plus the quick actions (open the Management
-Window, quit).
+Face in the browser, quit). Its shell is the tray host process, which
+also brings the daemon up when it is not running.
 _Avoid_: status icon, systray app, quick menu
 
-**Management Window**:
-The GUI window for managing Subscriptions (add/list/remove), watching
-each Realtime Stream's live state, and browsing a Subscription's
-History Log.
-_Avoid_: dashboard, main window, settings panel
+**Management Face**:
+The daemon-served web UI for managing Subscriptions (add/list/remove),
+watching each Realtime Stream's live state, browsing a Subscription's
+History Log, and composing Pushes — reachable from the desktop's
+browser or a phone's.
+_Avoid_: dashboard, main window, settings panel, Management Window
 
 **Push Composer**:
-The GUI form that sends a Push, mirroring the `push` command's fields
-and its Ext Param passthrough.
+The Management Face's section that sends a Push, mirroring the `push`
+command's fields and its Ext Param passthrough.
 _Avoid_: send dialog, push form, quick send
