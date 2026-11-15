@@ -214,7 +214,7 @@ pub struct Harness {
 impl Harness {
     pub fn new() -> Self {
         Harness {
-            home: tempfile::tempdir().expect("temp home"),
+            home: short_temp_home(),
         }
     }
 
@@ -254,6 +254,34 @@ impl Harness {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bark-echo"));
         command.env("APPDATA", self.home.path().join("AppData/Roaming"));
         command
+    }
+}
+
+/// The harness home: a temp dir deliberately rooted short. Platform
+/// fact: a Unix domain socket's path is stored in `sockaddr_un` and
+/// must be shorter than the OS's `SUN_LEN` — 104 bytes on macOS — and
+/// the daemon's socket path is the config dir plus `daemon.ipc`
+/// (`~/Library/Application Support/bark-echo/daemon.ipc` on macOS,
+/// ticket #27). macOS's own per-user temp root (`/var/folders/…/T/`)
+/// spends ~50 of those bytes before the dir name even starts, so a
+/// temp HOME there pushes the daemon's IPC bind over the limit
+/// ("path must be shorter than SUN_LEN"); `/tmp` — the one short
+/// absolute root every unix guarantees — keeps the whole path well
+/// under it. The desktop production path is far shorter and never
+/// approaches the limit. Windows needs none of this: its channel
+/// endpoint is a named pipe named by a hash of the config path
+/// (echo-ipc's `Endpoint`), not a filesystem path.
+fn short_temp_home() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("bark-echo-home-")
+            .tempdir_in("/tmp")
+            .expect("short temp home under /tmp")
+    }
+    #[cfg(windows)]
+    {
+        tempfile::tempdir().expect("temp home")
     }
 }
 
