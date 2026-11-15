@@ -335,36 +335,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // A daemon holding the lock is the single writer
                 // (ADR-0004): the change rides the channel and takes
                 // effect without a restart. Without a daemon, today's
-                // direct-write path stands (spec story 21).
-                if DaemonLock::probe(paths.lock_file())? {
-                    let added =
-                        subscribe::add_via_channel(&paths, &server, source, &label, auth).await?;
-                    println!("device key: {}", added.device_key);
-                    println!(
-                        "subscription {} added (label: {}, token hint: {})",
-                        added.id, added.label, added.token_hint
-                    );
-                } else {
-                    let client = ServerClient::new(&server);
-                    let client = match (&auth_user, &auth_password) {
-                        (None, None) => client,
-                        (user, password) => client.with_basic_auth(
-                            user.clone().unwrap_or_default(),
-                            password.clone().unwrap_or_default(),
-                        ),
-                    };
-                    let added =
-                        subscribe::add(&mut config, store.as_ref(), &client, source, &label, auth)
-                            .await?;
-                    config.save(&paths.config_file())?;
-                    println!("device key: {}", added.device_key);
-                    println!(
-                        "subscription {} added (label: {}, token hint: {})",
-                        added.subscription.id,
-                        added.subscription.label,
-                        added.subscription.token_hint
-                    );
-                }
+                // direct-write path stands (spec story 21). Both faces
+                // answer the wire's AddedSubscription, so the
+                // confirmation prints once from the fork's outcome.
+                let added: echo_ipc::message::AddedSubscription = fork_on_lock(
+                    &paths,
+                    async || {
+                        Ok(subscribe::add_via_channel(&paths, &server, source.clone(), &label, auth.clone()).await?)
+                    },
+                    async || {
+                        let client = ServerClient::new(&server);
+                        let client = match (&auth_user, &auth_password) {
+                            (None, None) => client,
+                            (user, password) => client.with_basic_auth(
+                                user.clone().unwrap_or_default(),
+                                password.clone().unwrap_or_default(),
+                            ),
+                        };
+                        let added = subscribe::add(
+                            &mut config,
+                            store.as_ref(),
+                            &client,
+                            source.clone(),
+                            &label,
+                            auth.clone(),
+                        )
+                        .await?;
+                        config.save(&paths.config_file())?;
+                        Ok(added.into())
+                    },
+                )
+                .await?;
+                println!("device key: {}", added.device_key);
+                println!(
+                    "subscription {} added (label: {}, token hint: {})",
+                    added.id, added.label, added.token_hint
+                );
             }
             SubscribeCommand::List => {
                 let subscriptions = subscribe::list(&config);
@@ -384,21 +390,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             SubscribeCommand::Rm { id } => {
                 // The same lock-held fork as `add` (ADR-0004): the
                 // daemon applies the removal hot when it holds the
-                // lock; the direct write otherwise.
-                if DaemonLock::probe(paths.lock_file())? {
-                    let removed = subscribe::remove_via_channel(&paths, &id).await?;
-                    println!(
-                        "subscription {} removed (label: {})",
-                        removed.id, removed.label
-                    );
-                } else {
-                    let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
-                    config.save(&paths.config_file())?;
-                    println!(
-                        "subscription {} removed (label: {})",
-                        removed.id, removed.label
-                    );
-                }
+                // lock; the direct write otherwise. Both faces answer
+                // the wire's RemovedSubscription, so the confirmation
+                // prints once from the fork's outcome.
+                let removed: echo_ipc::message::RemovedSubscription = fork_on_lock(
+                    &paths,
+                    async || Ok(subscribe::remove_via_channel(&paths, &id).await?),
+                    async || {
+                        let removed = subscribe::remove(&mut config, store.as_ref(), &id)?;
+                        config.save(&paths.config_file())?;
+                        Ok(removed.into())
+                    },
+                )
+                .await?;
+                println!(
+                    "subscription {} removed (label: {})",
+                    removed.id, removed.label
+                );
             }
         },
         Command::Token { command } => match command {
@@ -445,14 +453,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // channel — the single writer stores the fresh token and
                 // the running face drops its sessions at once (#24's
                 // kill switch); without one, the store is written
-                // directly and no sessions exist to invalidate.
-                if DaemonLock::probe(paths.lock_file())? {
-                    echo_daemon::management::rotate_via_channel(&paths).await?;
+                // directly and no sessions exist to invalidate. The fork
+                // reports which face ran; the confirmation says so.
+                let rode_channel = fork_on_lock(
+                    &paths,
+                    async || {
+                        echo_daemon::management::rotate_via_channel(&paths).await?;
+                        Ok(true)
+                    },
+                    async || {
+                        echo_daemon::management::rotate(store.as_ref())?;
+                        Ok(false)
+                    },
+                )
+                .await?;
+                if rode_channel {
                     println!(
                         "management token rotated; every session under the old one is invalidated"
                     );
                 } else {
-                    echo_daemon::management::rotate(store.as_ref())?;
                     println!(
                         "management token rotated (no daemon is running; the face picks the new token up at its next start)"
                     );
@@ -679,6 +698,24 @@ async fn run_push(
     };
     client.send(&push).await?;
     Ok(())
+}
+
+/// The lock-held fork (ADR-0004): a daemon holding the single-instance
+/// lock is the single writer, so `ride` sends the change through the
+/// IPC Channel and it applies hot; without one, `direct` writes the
+/// files itself (spec story 21). The command prints once from the
+/// outcome the taken face returns — `add` and `rm` answer the wire's
+/// typed outcome either way, `rotate` reports which face ran.
+async fn fork_on_lock<R>(
+    paths: &Paths,
+    ride: impl AsyncFnOnce() -> Result<R, Box<dyn std::error::Error>>,
+    direct: impl AsyncFnOnce() -> Result<R, Box<dyn std::error::Error>>,
+) -> Result<R, Box<dyn std::error::Error>> {
+    if DaemonLock::probe(paths.lock_file())? {
+        ride().await
+    } else {
+        direct().await
+    }
 }
 
 /// The server client the `token` subcommands talk through, carrying the
