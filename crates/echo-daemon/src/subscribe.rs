@@ -156,9 +156,11 @@ pub enum ChannelError {
 
 /// `subscribe add` when a daemon holds the lock (ticket #14): the
 /// request rides the IPC Channel and the daemon — the single writer —
-/// applies it hot, answering once the supervisor is up. The wire shape
-/// is the CLI flags' exact face (`--own` / `--device-key`, the label,
-/// the optional Basic Auth credentials).
+/// applies it hot, answering once the stream's supervisor is spawned —
+/// the new line starts at `starting` and its flip to running arrives
+/// as an event announcement (ADR-0004). The wire shape is the CLI
+/// flags' exact face (`--own` / `--device-key`, the label, the
+/// optional Basic Auth credentials).
 pub async fn add_via_channel(
     paths: &Paths,
     server: &str,
