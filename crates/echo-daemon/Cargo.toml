@@ -12,9 +12,6 @@ path = "src/main.rs"
 [dependencies]
 # The push subcommand is the send module's first consumer (issue #6).
 echo-core = { workspace = true }
-# The `gui` subcommand is the Tray Menu's entry (ticket #11); the crate
-# is the GUI stage's home (ADR-0003).
-echo-gui = { workspace = true }
 # The IPC Channel the daemon serves beside its lock (ADR-0004).
 echo-ipc = { workspace = true }
 clap = { workspace = true }

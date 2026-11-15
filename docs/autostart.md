@@ -27,13 +27,13 @@ All three samples rely on the same facts about the daemon:
   headless direct write (no daemon up, the CLI writing the files
   directly) takes effect at the daemon's next start.
 
-With the GUI installed, these facts do more work, not less. Starting
-the Tray Menu (`bark-echo gui`) brings the daemon up when the
-single-instance lock is idle (spawn-if-absent); the Tray Menu's Quit
-asks the daemon for a graceful shutdown — the daemon exits with code 0,
-which none of the samples above resurrect (`Restart=on-failure` and
-`KeepAlive SuccessfulExit=false` leave a clean stop alone). Relaunch
-the GUI to bring the daemon back.
+The daemon's graceful stop is a supervisor fact on its own: a clean
+stop — a Shutdown request over the IPC Channel, or ctrl-C — exits with
+code 0, which none of the samples above resurrect (`Restart=on-failure`
+and `KeepAlive SuccessfulExit=false` leave a clean stop alone). The
+Tray Menu that used to drive that stop is dormant with the egui face
+(ADR-0005); its bare-host replacement inherits the spawn-if-absent
+launch and this Quit exchange in a later milestone.
 
 ## Linux: systemd user unit
 
