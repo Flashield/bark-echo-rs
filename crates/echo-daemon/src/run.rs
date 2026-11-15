@@ -421,6 +421,14 @@ pub async fn run(
     // line each; a client further behind than this is dropped by `serve`
     // and re-snapshots on reconnect — never served stale.
     let (event_hub, _unused_receiver) = tokio::sync::broadcast::channel::<echo_ipc::Event>(256);
+    // The channel-side stop trigger (ticket #12): a Shutdown request
+    // pulls the same graceful stop the owner's future pulls — one stop,
+    // one vocabulary of "quit".
+    let shutdown_requested = Arc::new(tokio::sync::Notify::new());
+    let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    // The handler's own clone: the original stays with this function —
+    // the select below waits on the same Notify.
+    let handler_notify = shutdown_requested.clone();
     // The single writer's world (ADR-0004): the config the CRUD handlers
     // mutate and the supervisor set they start and stop by id.
     let manager = Arc::new(Manager {
@@ -446,7 +454,6 @@ pub async fn run(
         }
     }
 
-    let (channel_stop_tx, channel_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let channel_manager = manager.clone();
     let mut channel = tokio::spawn(echo_ipc::serve(
         server,
@@ -456,11 +463,25 @@ pub async fn run(
         event_hub.clone(),
         move |request| {
             let manager = channel_manager.clone();
+            let shutdown_requested = handler_notify.clone();
             async move {
                 match request {
                     echo_ipc::Request::Status => echo_ipc::Response::Status {
                         snapshot: manager.state.snapshot(),
                     },
+                    // The Tray Menu's Quit (ticket #12): the answer
+                    // leaves first, then the stop begins — the asking
+                    // client reads the channel closing behind this
+                    // response as the stop's announcement. The trigger
+                    // lands in the same select the owner's future waits
+                    // in: streams fenced, state persisted, the lock
+                    // released, exit 0 — the clean code no
+                    // `Restart=on-failure` / `KeepAlive
+                    // SuccessfulExit=false` supervisor resurrects.
+                    echo_ipc::Request::Shutdown => {
+                        shutdown_requested.notify_one();
+                        echo_ipc::Response::ShuttingDown
+                    }
                     // The CRUD face (ticket #14): each apply runs to
                     // completion under the single writer before its
                     // typed answer goes out; a refusal is an error
@@ -491,6 +512,22 @@ pub async fn run(
                             message: err.to_string(),
                         },
                     },
+                    // The History Log plane (ticket #15): the daemon
+                    // reads its own daemon-private log — for the config
+                    // as the single writer holds it NOW (hot CRUD may
+                    // have changed it since startup).
+                    echo_ipc::Request::HistorySnapshot {
+                        subscription_id,
+                        tail,
+                    } => {
+                        let core = manager.core.lock().await;
+                        history_snapshot_response(
+                            &manager.paths,
+                            &core.config,
+                            &subscription_id,
+                            tail,
+                        )
+                    }
                     // Only post-handshake requests arrive here; an
                     // unknown request is answered, never fatal.
                     other => echo_ipc::Response::Error {
@@ -501,14 +538,24 @@ pub async fn run(
         },
     ));
 
-    // Hold the runtime until the owner lets go (ctrl-C in production, a
-    // fence in tests). The channel ending early does not end the run:
-    // mirroring streams is the daemon's core job, and `status` falls
-    // back to the state file — but the failure is logged loudly, and
-    // the owner still decides when the run is over.
+    // Hold the runtime until the owner lets go — ctrl-C's future (the
+    // headless run) or a Shutdown request over the channel (the Tray
+    // Menu's Quit, ticket #12); both land in the same graceful stop.
+    // The channel ending early does not end the run: mirroring streams
+    // is the daemon's core job, and `status` falls back to the state
+    // file — but the failure is logged loudly, and the owner still
+    // decides when the run is over. Both stop sources are cancel-safe,
+    // so the fallback select after a dead channel can keep waiting on
+    // the same futures.
     tokio::pin!(shutdown);
+    // Created here, after the handler exists: a Shutdown request that
+    // slipped in during setup left a permit on the Notify, and this
+    // future consumes it — no request can be lost to a race with setup.
+    let requested = shutdown_requested.notified();
+    tokio::pin!(requested);
     tokio::select! {
         _ = &mut shutdown => {}
+        _ = &mut requested => {}
         served = &mut channel => {
             match served {
                 Ok(Ok(())) => {}
@@ -519,8 +566,12 @@ pub async fn run(
                     "the IPC channel task failed: {join_error}; `status` falls back to the state file"
                 ),
             }
-            // The owner has not spoken yet; the run holds until it does.
-            (&mut shutdown).await;
+            // Neither stop source has spoken yet; the run holds until
+            // one does — the owner's future or a Shutdown request.
+            tokio::select! {
+                _ = &mut shutdown => {}
+                _ = &mut requested => {}
+            }
         }
     }
 
@@ -543,6 +594,43 @@ pub async fn run(
         Manager::stop_stream(stream).await;
     }
     Ok(())
+}
+
+/// Answer a [`echo_ipc::Request::HistorySnapshot`] (ticket #15): the
+/// daemon reads its own daemon-private History Log for the Subscription
+/// (ADR-0004 — the GUI never touches a file) and answers with the
+/// content semantics of the CLI's `log --tail N`: all complete entries,
+/// oldest last, the last `tail` of them. A Subscription the daemon does
+/// not hold is refused, not answered with a silently empty log — so no
+/// path outside its own Subscription logs is ever served, whatever a
+/// client puts in the id.
+fn history_snapshot_response(
+    paths: &Paths,
+    config: &Config,
+    subscription_id: &str,
+    tail: u32,
+) -> echo_ipc::Response {
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|held| held.id == subscription_id)
+    else {
+        return echo_ipc::Response::Error {
+            message: format!("no Subscription with id `{subscription_id}`"),
+        };
+    };
+    let log = HistoryLog::new(paths.history_log(&subscription.id));
+    match log.entries() {
+        Ok(entries) => {
+            let start = entries.len().saturating_sub(tail as usize);
+            echo_ipc::Response::HistorySnapshot {
+                entries: entries[start..].to_vec(),
+            }
+        }
+        Err(err) => echo_ipc::Response::Error {
+            message: format!("cannot read the History Log: {err}"),
+        },
+    }
 }
 
 /// One Subscription's runtime: forward the stream's intents into the

@@ -11,8 +11,8 @@ use crate::connection::Connection;
 use crate::error::IpcError;
 use crate::handshake;
 use crate::message::{
-    AddSource, AddedSubscription, BasicAuthCredentials, Event, RemovedSubscription, Request,
-    RequestFrame, Response, ResponseFrame, StatusSnapshot,
+    AddSource, AddedSubscription, BasicAuthCredentials, Event, NotificationIntent,
+    RemovedSubscription, Request, RequestFrame, Response, ResponseFrame, StatusSnapshot,
 };
 use crate::transport::{self, ClientStream, Endpoint};
 
@@ -153,6 +153,47 @@ impl Client {
             Response::SubscriptionRemoved { id, label } => Ok(RemovedSubscription { id, label }),
             other => Err(IpcError::Protocol(format!(
                 "unexpected response to a subscribe-remove request: {other:?}"
+            ))),
+        }
+    }
+
+    /// Ask the daemon for a graceful shutdown (ticket #12): the answer
+    /// is the acceptance, not the completion — the daemon answers
+    /// before it begins stopping, and its graceful stop closes every
+    /// connection. The client's next read after [`Client::shutdown`]
+    /// therefore ends in [`IpcError::Closed`] when the daemon is
+    /// healthy; a client that must observe the lock release or the
+    /// process exit polls the files (the daemon's IPC seam tests do).
+    pub async fn shutdown(&mut self) -> Result<(), IpcError> {
+        match self.call(Request::Shutdown).await? {
+            Response::ShuttingDown => Ok(()),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a shutdown request: {other:?}"
+            ))),
+        }
+    }
+
+    /// The recent tail of one Subscription's History Log (ticket #15):
+    /// the daemon reads its own daemon-private files (ADR-0004) and
+    /// answers with at most `tail` entries, oldest last — the content
+    /// semantics of the CLI's `log --tail N`, over the channel. Events
+    /// broadcast while the answer is in flight queue for
+    /// [`Client::next_event`] as with any exchange.
+    pub async fn history_snapshot(
+        &mut self,
+        subscription_id: &str,
+        tail: u32,
+    ) -> Result<Vec<NotificationIntent>, IpcError> {
+        match self
+            .call(Request::HistorySnapshot {
+                subscription_id: subscription_id.to_owned(),
+                tail,
+            })
+            .await?
+        {
+            Response::HistorySnapshot { entries } => Ok(entries),
+            other => Err(IpcError::Protocol(format!(
+                "unexpected response to a History Log snapshot request: {other:?}"
             ))),
         }
     }

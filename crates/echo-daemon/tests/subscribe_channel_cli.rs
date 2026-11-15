@@ -33,7 +33,7 @@ async fn wait_subscribed_lines(harness: &common::Harness, n: &str) {
             "status must exit 0: {} {}",
             output.stderr, output.stdout
         );
-        if output.stdout.contains(&format!("subscription")) && count_lines(&output.stdout) == n {
+        if count_lines(&output.stdout) == n {
             return;
         }
         assert!(

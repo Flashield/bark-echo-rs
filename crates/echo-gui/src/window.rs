@@ -1,20 +1,25 @@
-//! The Management Window (GLOSSARY, ticket #13): the model holds the
-//! echo-ipc client's view of the daemon reduced to what the window
-//! lists — each Subscription's label, server URL, and token hint (the
-//! snapshot's public identity, never the secrets behind it) with its
-//! Realtime Stream's live state — and the render function lays that
-//! picture out. The same thin split as the tray (model owns every word,
-//! paint owns none): the data arrives as the connection loop's
-//! snapshot-then-events stream — the opening snapshot rides every
+//! The Management Window (GLOSSARY, tickets #13 and #15): the model
+//! holds the echo-ipc client's view of the daemon reduced to what the
+//! window lists — each Subscription's label, server URL, and token hint
+//! (the snapshot's public identity, never the secrets behind it) with
+//! its Realtime Stream's live state — and the render function lays that
+//! picture out, with the picked Subscription's History Log view (ticket
+//! #15) beneath the list: its label is the pick, the click becomes one
+//! ask over the channel. The same thin split as the tray (model owns
+//! every word, paint owns none): the data arrives as the connection
+//! loop's snapshot-then-events stream — the opening snapshot rides every
 //! (re)connect and the daemon's events keep the rows current whether
 //! the window is open or not, so showing it reveals the current picture
 //! — and a broken link is named outright instead of left as a stale
 //! picture or a silent blank.
 
 use std::collections::BTreeMap;
+use std::sync::mpsc::Sender;
 
 use echo_ipc::message::{Event, StatusSnapshot, StreamState};
 
+use crate::connection::ClientAsk;
+use crate::history_view::{self, HistoryView};
 use crate::model::LinkState;
 
 /// One Subscription's row: the snapshot's public identity plus the
@@ -132,6 +137,14 @@ impl WindowModel {
         self.link = LinkState::Reconnecting;
     }
 
+    /// Quit clicked (ticket #12): the banner names the stop — the tray
+    /// header's own word, one shared state (`LinkState::Quitting`) —
+    /// and every row's last-known state loses its freshness claim,
+    /// exactly as when the link broke. Idempotent.
+    pub fn quitting(&mut self) {
+        self.link = LinkState::Quitting;
+    }
+
     /// The link's state, for the render's color choice.
     pub fn link(&self) -> LinkState {
         self.link.clone()
@@ -144,6 +157,7 @@ impl WindowModel {
             LinkState::Connecting => "Daemon: connecting…".to_owned(),
             LinkState::Connected => "Daemon: connected".to_owned(),
             LinkState::Reconnecting => "Daemon: reconnecting…".to_owned(),
+            LinkState::Quitting => "Daemon: shutting down…".to_owned(),
         }
     }
 
@@ -183,54 +197,88 @@ impl WindowModel {
                 }
                 StreamState::Failed { detail } => format!("stopped — {detail}"),
             },
-            LinkState::Connecting | LinkState::Reconnecting => "unknown (daemon away)".to_owned(),
+            LinkState::Connecting | LinkState::Reconnecting | LinkState::Quitting => {
+                "unknown (daemon away)".to_owned()
+            }
         }
     }
 }
 
-/// The Management Window's face: the model's picture laid out. Thin by
-/// contract — the words come from the model; this only arranges them.
-/// Called by the shell's `ui` for the visible window; while the window
-/// is hidden eframe runs no paint pass at all (App::logic only), so
-/// nothing here costs anything until the user opens it.
-/// Returns the ids of the Subscriptions whose Remove button was
-/// clicked this frame — the shell hands them to the CRUD model, whose
-/// confirmation asks before anything is sent (ticket #14).
-pub fn render(ui: &mut egui::Ui, model: &WindowModel) -> Vec<String> {
+/// The Management Window's face: the model's picture laid out, with the
+/// picked Subscription's History Log view beneath the list (ticket #15).
+/// Thin by contract — the words come from the models; this only
+/// arranges them. A click on a Subscription's label becomes one ask on
+/// `asks` (the connection loop serves it over its own client); the
+/// viewer's content is the answer, never a file read. Returns the ids
+/// of the Subscriptions whose Remove button was clicked this frame —
+/// the shell hands them to the CRUD model, whose confirmation asks
+/// before anything is sent (ticket #14). Called by the shell's `ui`
+/// for the visible window; while the window is hidden eframe runs no
+/// paint pass at all (App::logic only), so nothing here costs anything
+/// until the user opens it.
+pub fn render(
+    ui: &mut egui::Ui,
+    model: &WindowModel,
+    history: &mut HistoryView,
+    asks: &Sender<ClientAsk>,
+) -> Vec<String> {
     // The daemon banner: the link's truth first, colored when it is not
     // the quiet "connected" — the absence is a state, never a blank.
     let mut header = egui::RichText::new(model.status_line()).strong();
     header = match model.link() {
         LinkState::Connected => header,
-        LinkState::Connecting => header.color(egui::Color32::YELLOW),
+        // Transitional states get the warm color; the absence gets red.
+        // Quitting is transitional too — the stop is underway, and the
+        // window is on its way out with the process.
+        LinkState::Connecting | LinkState::Quitting => header.color(egui::Color32::YELLOW),
         LinkState::Reconnecting => header.color(egui::Color32::LIGHT_RED),
     };
     ui.label(header);
     ui.separator();
 
     let mut remove_clicked = Vec::new();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let rows = model.rows();
-        if rows.is_empty() {
-            // Worth saying only when the daemon had its say; while the
-            // link is down the banner above already names the absence.
-            if model.link() == LinkState::Connected {
-                ui.label("No Subscriptions yet — add one below.");
+    // The Subscription list: bounded height, so the History Log view
+    // below always keeps its ground even with several Subscriptions.
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .show(ui, |ui| {
+            let rows = model.rows();
+            if rows.is_empty() {
+                // Worth saying only when the daemon had its say; while
+                // the link is down the banner above already names the
+                // absence.
+                if model.link() == LinkState::Connected {
+                    ui.label("No Subscriptions yet — add one below.");
+                }
+                return;
             }
-            return;
-        }
-        for row in rows {
-            ui.add_space(4.0);
-            ui.strong(&row.label);
-            ui.label(format!("Server: {}", row.server));
-            ui.label(format!("Token hint: {}", row.token_hint));
-            ui.label(format!("Realtime Stream: {}", row.state));
-            if ui.button("Remove").clicked() {
-                remove_clicked.push(row.id.clone());
+            for row in rows {
+                ui.add_space(4.0);
+                // The label is the pick: clicking it opens that
+                // Subscription's History Log below. Re-picking the one
+                // already followed asks for nothing (the view says so).
+                let picked = history.selected_id() == Some(row.id.as_str());
+                if ui
+                    .selectable_label(picked, egui::RichText::new(&row.label).strong())
+                    .clicked()
+                    && let Some(id) = history.select(&row.id, &row.label)
+                {
+                    let _ = asks.send(ClientAsk::HistorySnapshot {
+                        subscription_id: id,
+                    });
+                }
+                ui.label(format!("Server: {}", row.server));
+                ui.label(format!("Token hint: {}", row.token_hint));
+                ui.label(format!("Realtime Stream: {}", row.state));
+                if ui.button("Remove").clicked() {
+                    remove_clicked.push(row.id.clone());
+                }
+                ui.separator();
             }
-            ui.separator();
-        }
-    });
+        });
+    // The picked Subscription's History Log (ticket #15): its own
+    // scroll, newest last, stuck to the bottom.
+    history_view::render(ui, history);
     remove_clicked
 }
 
@@ -366,6 +414,27 @@ mod tests {
         );
         assert_eq!(rows[0].server, "http://127.0.0.1:8080");
         assert_eq!(rows[0].token_hint, "abcdef123456...");
+    }
+
+    #[test]
+    fn quitting_names_the_stop_and_dethrones_stale_states() {
+        // Ticket #12: during Quit's bounded wait the banner names what
+        // is happening — the tray header's own word, one shared state —
+        // and the rows lose their freshness claim the same way they do
+        // when the link breaks. Nothing updates the window after this.
+        let mut model = WindowModel::connecting();
+        model.apply_snapshot(&snapshot_with_state(StreamState::Running));
+        model.quitting();
+        assert_eq!(
+            model.status_line(),
+            "Daemon: shutting down…",
+            "the banner names the stop while the exchange waits"
+        );
+        let rows = model.rows();
+        assert_eq!(
+            rows[0].state, "unknown (daemon away)",
+            "a last-known running never poses as current during the stop"
+        );
     }
 
     #[test]

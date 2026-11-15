@@ -12,7 +12,9 @@ pub mod app;
 pub mod connection;
 pub mod crud;
 pub mod fonts;
+pub mod history_view;
 pub mod model;
+pub mod shutdown;
 pub mod tray;
 pub mod window;
 

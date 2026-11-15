@@ -108,10 +108,12 @@ enum Command {
     Status,
     /// The Tray Menu (GLOSSARY): the GUI's always-present tray presence,
     /// each Subscription's label with its live stream state, updating
-    /// from the daemon's pushed events (issue #11). Runs until Quit;
-    /// shows the daemon's absence as the reconnecting state instead of
-    /// silence. The Management Window (#13) and the daemon-shutdown
-    /// wiring in Quit (#12) come with their tickets.
+    /// from the daemon's pushed events (issue #11). Launches the daemon
+    /// when the single-instance lock is idle (spawn-if-absent, ticket
+    /// #12); Quit asks the daemon for a graceful shutdown before
+    /// exiting. Shows the daemon's absence as the reconnecting state
+    /// instead of silence. The Management Window (#13) comes with its
+    /// ticket.
     Gui,
 }
 
@@ -303,7 +305,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // (ADR-0004): the change rides the channel and takes
                 // effect without a restart. Without a daemon, today's
                 // direct-write path stands (spec story 21).
-                if DaemonLock::probe(&paths.lock_file())? {
+                if DaemonLock::probe(paths.lock_file())? {
                     let added =
                         subscribe::add_via_channel(&paths, &server, source, &label, auth).await?;
                     println!("device key: {}", added.device_key);
@@ -352,7 +354,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // The same lock-held fork as `add` (ADR-0004): the
                 // daemon applies the removal hot when it holds the
                 // lock; the direct write otherwise.
-                if DaemonLock::probe(&paths.lock_file())? {
+                if DaemonLock::probe(paths.lock_file())? {
                     let removed = subscribe::remove_via_channel(&paths, &id).await?;
                     println!(
                         "subscription {} removed (label: {})",
@@ -420,6 +422,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", report.render());
         }
         Command::Gui => {
+            // Lifecycle (ticket #12, ADR-0004): spawn-if-absent — an
+            // idle lock spawns a detached `bark-echo run` beside this
+            // executable; a held lock means a daemon is running (or
+            // starting) and the Tray Menu attaches to it. Never a
+            // second daemon attempt. A spawn failure is fatal and names
+            // itself: the launch owed the user a daemon, and silence
+            // would leave the tray guessing.
+            match echo_daemon::lifecycle::spawn_if_absent(&paths, cli.plain_secrets)? {
+                echo_daemon::lifecycle::SpawnOutcome::AlreadyRunning => {
+                    println!("daemon already running; the Tray Menu attaches to it");
+                }
+                echo_daemon::lifecycle::SpawnOutcome::Spawned { mut child } => {
+                    println!(
+                        "daemon spawned (pid {}); the Tray Menu attaches as it comes up",
+                        child.id()
+                    );
+                    // Reap the child whenever it ends, so an early
+                    // daemon death leaves no zombie behind the GUI
+                    // (dropping the handle would not reap). The daemon
+                    // is detached; its death is not the GUI's business
+                    // beyond this tidy-up.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+            }
             // The event loop owns this thread, and the thread is the
             // main one (eframe/winit and macOS's tray requirement). The
             // channel work runs on the GUI crate's own thread, so no

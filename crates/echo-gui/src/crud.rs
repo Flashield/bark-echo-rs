@@ -69,6 +69,12 @@ pub struct CrudModel {
     error: Option<String>,
 }
 
+impl Default for CrudModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CrudModel {
     /// The idle model the shell starts with.
     pub fn new() -> Self {
@@ -402,7 +408,6 @@ mod tests {
     fn the_add_form_composes_the_own_command_when_the_required_words_are_there() {
         let mut crud = CrudModel::new();
         crud.open_add();
-        let mut crud = crud;
         if let CrudState::Adding(form) = &mut crud.state {
             *form = own_form();
         }

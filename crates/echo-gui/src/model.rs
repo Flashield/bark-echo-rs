@@ -22,6 +22,10 @@ pub enum LinkState {
     /// A live connection broke (or a connect attempt failed after
     /// having been connected before); the reconnect loop is retrying.
     Reconnecting,
+    /// Quit has asked the daemon to stop (ticket #12): the tray's last
+    /// picture, under a header naming what is happening. Nothing
+    /// updates it further — the process is on its way out.
+    Quitting,
 }
 
 /// One Subscription's line the tray derives from the model.
@@ -44,9 +48,9 @@ pub struct TrayModel {
 }
 
 /// One row of the tray menu. Subscription rows are informational (the
-/// read-only tray of ticket #11); the two actions are placeholders —
-/// "open Management Window" is wired by ticket #13, and Quit only exits
-/// the GUI process here (the daemon shutdown is ticket #12).
+/// read-only tray of ticket #11); of the two actions, "open Management
+/// Window" is still #13's placeholder, and Quit asks the daemon for a
+/// graceful shutdown before leaving (ticket #12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
     /// A non-interactive line: the daemon link's state.
@@ -59,7 +63,8 @@ pub enum MenuItem {
     Separator,
     /// "Open Management Window" (GLOSSARY) — placeholder.
     OpenManagementWindow,
-    /// Quit — this ticket: exits the GUI process.
+    /// Quit — asks the daemon for a graceful shutdown, waits a bounded
+    /// while for its confirmation, then exits (ticket #12).
     Quit,
 }
 
@@ -130,6 +135,14 @@ impl TrayModel {
         self.link = LinkState::Reconnecting;
     }
 
+    /// Quit clicked (ticket #12): the header names the stop while the
+    /// Quit exchange waits its bounded while, and every line's
+    /// last-known state loses its freshness claim. Idempotent — a
+    /// second Quit click is the same instruction, not a new one.
+    pub fn quitting(&mut self) {
+        self.link = LinkState::Quitting;
+    }
+
     /// The menu the tray renders, derived fresh on every call.
     pub fn menu_items(&self) -> Vec<MenuItem> {
         let mut items = vec![MenuItem::Header(self.header_text())];
@@ -155,6 +168,7 @@ impl TrayModel {
             LinkState::Connecting => "Daemon: connecting…".to_owned(),
             LinkState::Connected => "Daemon: connected".to_owned(),
             LinkState::Reconnecting => "Daemon: reconnecting…".to_owned(),
+            LinkState::Quitting => "Daemon: shutting down…".to_owned(),
         }
     }
 
@@ -165,7 +179,9 @@ impl TrayModel {
     fn state_text(&self, line: &SubscriptionLine) -> String {
         match self.link {
             LinkState::Connected => line.state.as_str().to_owned(),
-            LinkState::Connecting | LinkState::Reconnecting => "unknown (daemon away)".to_owned(),
+            LinkState::Connecting | LinkState::Reconnecting | LinkState::Quitting => {
+                "unknown (daemon away)".to_owned()
+            }
         }
     }
 }
@@ -303,6 +319,31 @@ mod tests {
                 text: "desktop — unknown (daemon away)".to_owned(),
             },
             "a last-known running never poses as current"
+        );
+    }
+
+    #[test]
+    fn quitting_names_the_state_and_dethrones_stale_lines() {
+        // Ticket #12: during Quit's bounded wait the tray names what is
+        // happening — and the lines lose their freshness claim, the way
+        // they do when the daemon is away. Nothing updates the tray
+        // after this: the process is on its way out.
+        let mut model = TrayModel::connecting();
+        model.apply_snapshot(&snapshot_with("tok", "desktop", StreamState::Running));
+        model.quitting();
+        let items = model.menu_items();
+        assert_eq!(
+            items[0],
+            MenuItem::Header("Daemon: shutting down…".to_owned()),
+            "the header names the stop while the exchange waits"
+        );
+        assert_eq!(
+            items[1],
+            MenuItem::Subscription {
+                id: "tok".to_owned(),
+                text: "desktop — unknown (daemon away)".to_owned(),
+            },
+            "a last-known running never poses as current during the stop"
         );
     }
 
