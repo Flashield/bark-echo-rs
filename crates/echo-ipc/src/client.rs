@@ -103,10 +103,11 @@ impl Client {
 
     /// Add a Subscription (ticket #14): the daemon registers/mints on
     /// the server, stores the secrets, writes the config, and starts
-    /// the Realtime Stream hot — the answer means the supervisor is up.
-    /// [`IpcError::Rejected`] carries the daemon's reason (an unknown
-    /// Device Key, a refused label, ...); a refused add never
-    /// half-applied.
+    /// the Realtime Stream hot — the answer means the stream's
+    /// supervisor is spawned (the new line starts at `starting`; its
+    /// flip arrives as an event announcement). [`IpcError::Rejected`]
+    /// carries the daemon's reason (an unknown Device Key, a refused
+    /// label, ...); a refused add never half-applied.
     pub async fn subscribe_add(
         &mut self,
         server: &str,
