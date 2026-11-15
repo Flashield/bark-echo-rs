@@ -5,7 +5,8 @@
 //! platform provides), so this suite runs unchanged on Linux, macOS,
 //! and Windows — the same rule the protocol suite obeys.
 
-use std::collections::BTreeMap;
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,30 +16,7 @@ use std::time::{Duration, Instant};
 use echo_ipc::message::{
     Event, NotificationIntent, Request, RequestFrame, Response, ResponseFrame, StreamState,
 };
-use echo_ipc::{Client, Endpoint, IpcError, IpcServer, PROTOCOL_VERSION, connect_raw, serve};
-
-type BoxedHandler =
-    Box<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync + 'static>;
-
-fn canned_snapshot_response() -> Response {
-    Response::Status {
-        snapshot: echo_ipc::message::StatusSnapshot {
-            pid: 4242,
-            started_at: 1_700_000_000,
-            subscriptions: BTreeMap::from([(
-                "tok".to_owned(),
-                echo_ipc::message::SubscriptionRuntime {
-                    label: "desktop".to_owned(),
-                    state: StreamState::Running,
-                    last_message_id: None,
-                    updated_at: 1_700_000_042,
-                    server: "http://127.0.0.1:8080".to_owned(),
-                    token_hint: "abcdef123456...".to_owned(),
-                },
-            )]),
-        },
-    }
-}
+use echo_ipc::{Client, PROTOCOL_VERSION, connect_raw};
 
 fn stream_state_event(state: StreamState) -> Event {
     Event::StreamState {
@@ -63,60 +41,17 @@ fn appended_event(id: i64, body: &str) -> Event {
     }
 }
 
-/// Bind the channel on a fresh endpoint and serve with `handler`, with
-/// `hub` as the event source every connection hears from. The temp dir
-/// must be held by the caller — the endpoint lives inside it.
-async fn serving(
-    handler: BoxedHandler,
-    hub: tokio::sync::broadcast::Sender<Event>,
-) -> (
-    tempfile::TempDir,
-    Endpoint,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<Result<(), IpcError>>,
-) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let endpoint = Endpoint::in_config_dir(dir.path());
-    let server = IpcServer::bind(&endpoint).expect("bind");
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = tokio::spawn(serve(
-        server,
-        async move {
-            let _ = stop_rx.await;
-        },
-        hub,
-        handler,
-    ));
-    (dir, endpoint, stop_tx, handle)
-}
-
-fn canned_handler() -> BoxedHandler {
-    Box::new(|_request| Box::pin(async { canned_snapshot_response() }))
-}
-
-/// Shut the server down and assert it ended cleanly.
-async fn shutdown_cleanly(
-    stop_tx: tokio::sync::oneshot::Sender<()>,
-    handle: tokio::task::JoinHandle<Result<(), IpcError>>,
-) {
-    let _ = stop_tx.send(());
-    let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("serve ends after shutdown")
-        .expect("serve task joined");
-    assert!(outcome.is_ok(), "serve must end cleanly: {outcome:?}");
-}
-
 #[tokio::test]
 async fn an_event_reaches_a_connected_client_without_being_asked() {
     let (hub, _keep_open) = tokio::sync::broadcast::channel::<Event>(16);
-    let (_dir, endpoint, stop_tx, serve_task) = serving(canned_handler(), hub.clone()).await;
+    let (_dir, endpoint, stop_tx, serve_task) =
+        common::serving_with_hub(common::canned_handler(), hub.clone()).await;
 
     let mut client = Client::connect(&endpoint).await.expect("connect");
     // The request/response face works as always.
     assert_eq!(
         client.call(Request::Status).await.expect("call"),
-        canned_snapshot_response()
+        common::canned_snapshot_response()
     );
 
     // An event pushed while the connection sits idle arrives unsolicited.
@@ -128,7 +63,7 @@ async fn an_event_reaches_a_connected_client_without_being_asked() {
         .expect("the event is heard");
     assert_eq!(event, stream_state_event(StreamState::Running));
 
-    shutdown_cleanly(stop_tx, serve_task).await;
+    common::shutdown_cleanly(stop_tx, serve_task).await;
 }
 
 #[tokio::test]
@@ -136,7 +71,8 @@ async fn the_event_frame_carries_no_id_on_the_wire() {
     // ADR-0004: requests and responses carry an id, daemon-pushed events
     // carry none. A raw peer reads the exact bytes to pin that shape.
     let (hub, _keep_open) = tokio::sync::broadcast::channel::<Event>(16);
-    let (_dir, endpoint, stop_tx, serve_task) = serving(canned_handler(), hub.clone()).await;
+    let (_dir, endpoint, stop_tx, serve_task) =
+        common::serving_with_hub(common::canned_handler(), hub.clone()).await;
 
     let mut raw = connect_raw(&endpoint).await.expect("raw connect");
     raw.send(&RequestFrame {
@@ -174,7 +110,7 @@ async fn the_event_frame_carries_no_id_on_the_wire() {
     assert_eq!(frame["entry"]["id"], 41, "{frame}");
     assert_eq!(frame["entry"]["body"], "the push landed", "{frame}");
 
-    shutdown_cleanly(stop_tx, serve_task).await;
+    common::shutdown_cleanly(stop_tx, serve_task).await;
 }
 
 #[tokio::test]
@@ -192,11 +128,12 @@ async fn an_event_arriving_while_a_request_is_in_flight_does_not_confuse_the_ans
             if !arrived.swap(true, Ordering::SeqCst) {
                 release.notified().await;
             }
-            canned_snapshot_response()
+            common::canned_snapshot_response()
         }) as Pin<Box<dyn Future<Output = Response> + Send>>
     });
     let (hub, _keep_open) = tokio::sync::broadcast::channel::<Event>(16);
-    let (_dir, endpoint, stop_tx, serve_task) = serving(handler, hub.clone()).await;
+    let (_dir, endpoint, stop_tx, serve_task) =
+        common::serving_with_hub(handler, hub.clone()).await;
 
     let mut client = Client::connect(&endpoint).await.expect("connect");
     let answer = tokio::spawn(async move { client.call(Request::Status).await.map(|_| client) });
@@ -225,13 +162,14 @@ async fn an_event_arriving_while_a_request_is_in_flight_does_not_confuse_the_ans
         "the event survived the request/response exchange: {event:?}"
     );
 
-    shutdown_cleanly(stop_tx, serve_task).await;
+    common::shutdown_cleanly(stop_tx, serve_task).await;
 }
 
 #[tokio::test]
 async fn every_connected_client_hears_the_events_in_order() {
     let (hub, _keep_open) = tokio::sync::broadcast::channel::<Event>(16);
-    let (_dir, endpoint, stop_tx, serve_task) = serving(canned_handler(), hub.clone()).await;
+    let (_dir, endpoint, stop_tx, serve_task) =
+        common::serving_with_hub(common::canned_handler(), hub.clone()).await;
 
     let mut client_a = Client::connect(&endpoint).await.expect("connect a");
     let mut client_b = Client::connect(&endpoint).await.expect("connect b");
@@ -259,7 +197,7 @@ async fn every_connected_client_hears_the_events_in_order() {
         assert_eq!(third, appended_event(8, "second push"), "{name}");
     }
 
-    shutdown_cleanly(stop_tx, serve_task).await;
+    common::shutdown_cleanly(stop_tx, serve_task).await;
 }
 
 #[tokio::test]
@@ -268,7 +206,8 @@ async fn a_connection_that_lags_the_event_stream_is_dropped_not_served_stale() {
     // silently miss events — stale state instead of fresh. The connection
     // ends instead; the client's reconnect re-snapshots (its own rule).
     let (hub, _keep_open) = tokio::sync::broadcast::channel::<Event>(1);
-    let (_dir, endpoint, stop_tx, serve_task) = serving(canned_handler(), hub.clone()).await;
+    let (_dir, endpoint, stop_tx, serve_task) =
+        common::serving_with_hub(common::canned_handler(), hub.clone()).await;
 
     let mut client = Client::connect(&endpoint).await.expect("connect");
 
@@ -296,5 +235,5 @@ async fn a_connection_that_lags_the_event_stream_is_dropped_not_served_stale() {
         "a lagging connection is closed, not served stale: {outcome:?}"
     );
 
-    shutdown_cleanly(stop_tx, serve_task).await;
+    common::shutdown_cleanly(stop_tx, serve_task).await;
 }
