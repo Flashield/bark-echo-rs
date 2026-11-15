@@ -44,6 +44,14 @@ impl Endpoint {
             // so the endpoint can literally sit beside the lock — the
             // config dir plus a fixed name. Desktop users get the
             // socket file's permissions as the channel's access control.
+            //
+            // Platform fact (path length): the socket path rides in
+            // `sockaddr_un`, capped by the OS's `SUN_LEN` — 104 bytes on
+            // macOS. The desktop path here (`~/Library/Application
+            // Support/bark-echo/daemon.ipc`) stays far under it; deep
+            // scratch trees (a test harness's temp root) can not, so
+            // tests must provision the config dir short (see
+            // echo-daemon's tests/common Harness).
             let path = config_dir.as_ref().join("daemon.ipc");
             Endpoint {
                 address: path.to_string_lossy().into_owned(),
